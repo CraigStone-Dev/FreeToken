@@ -23,7 +23,9 @@ def _make_mxfp8(N: int, K: int, seed: int = 0):
     return w8, codes
 
 
-@pytest.mark.parametrize("M", [1, 2, 8, 16, 300])
+# 1 = m1 kernel; 2/8/16/17/33/64 = dot GEMV across its M_TILE buckets {16,32,64}
+# (17/33 exercise row-padding masks); 65/300 = dequant+cuBLAS past _GEMV_MAX_M.
+@pytest.mark.parametrize("M", [1, 2, 8, 16, 17, 33, 64, 65, 300])
 @pytest.mark.parametrize("N,K", [(512, 6144), (9216, 6144), (640, 6144)])
 def test_mxfp8_linear_matches_dequant_reference(M: int, N: int, K: int):
     from freetoken.kernel.triton.mxfp8_linear import mxfp8_dequant, mxfp8_linear

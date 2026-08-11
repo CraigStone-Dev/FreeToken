@@ -137,8 +137,10 @@ def load_args(text_config: Any, num_layers: int, *, sparse_enabled: bool) -> Min
     beta = float(getattr(text_config, "swiglu_beta", 1.0))
     assert beta == 1.0, f"swigluoai implementations hardcode beta=1.0, got {beta}"
     # Plain-rope only: silently ignoring a variant checkpoint's rope_scaling would
-    # mis-position every token past the scaling boundary.
-    scaling = getattr(text_config, "rope_scaling", None) or {}
+    # mis-position every token past the scaling boundary. Newer HF configs spell
+    # the key `rope_parameters`; check both so a renamed config still trips this.
+    scaling = (getattr(text_config, "rope_scaling", None)
+               or getattr(text_config, "rope_parameters", None) or {})
     rope_type = scaling.get("rope_type", scaling.get("type", "default")) if scaling else "default"
     assert rope_type in (None, "default"), (
         f"MiniMax-M3 support implements plain rope only, got rope_scaling={scaling!r}"

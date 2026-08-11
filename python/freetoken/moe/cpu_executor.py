@@ -153,6 +153,20 @@ class CpuMoeExecutor:
             )
         if activation not in _ACT_IDS:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
+        # ABI probe: act ids past the original silu/gelu family are computed by the
+        # extension's GENERIC epilogue for non-mxfp4 formats ("gpt_oss_swiglu" rides
+        # inside the mxfp4 kernel and predates the marker). A stale prebuilt
+        # _cpu_moe.so accepts newer ids without error and silently computes the
+        # wrong activation -- fail loudly with the rebuild instruction instead.
+        if _ACT_IDS[activation] >= 3 and fmt != "mxfp4_triton":
+            supported = getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
+            if _ACT_IDS[activation] > supported:
+                raise RuntimeError(
+                    f"the compiled _cpu_moe extension predates activation "
+                    f"{activation!r} (max generic act id {supported}); rebuild it "
+                    "with `python setup.py build_ext --inplace` (or reinstall the "
+                    "wheel) before serving this model on the cpu/hybrid backend."
+                )
 
         self.num_layers = int(cache.num_layers)
         self.num_experts = int(cache.num_experts)

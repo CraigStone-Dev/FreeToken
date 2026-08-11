@@ -224,6 +224,31 @@ def test_cpu_decode_nvfp4_swigluoai_matches_dequant_reference(bs):
     assert rel < 3e-2, f"nvfp4 swigluoai bs={bs} rel err {rel.item()}"
 
 
+def test_stale_extension_rejected_for_swigluoai(monkeypatch):
+    """A prebuilt _cpu_moe.so from before ACT_SWIGLUOAI accepts act id 3 without
+    error and silently computes the wrong activation in the generic epilogue
+    (PR#110 review hit this: 52% rel error until a manual rebuild). The executor
+    probes the extension's `max_generic_act_id` marker -- absent on stale builds
+    -- and must fail loudly with the rebuild instruction instead."""
+    from freetoken.kernel import _cpu_moe
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    monkeypatch.delattr(_cpu_moe, "max_generic_act_id")
+    cache = _make_nvfp4_cache(1, 4, 256, 128)
+    with pytest.raises(RuntimeError, match="rebuild"):
+        CpuMoeExecutor(
+            cache, top_k=2, activation="swigluoai",
+            apply_router_weight_on_input=False, num_threads=0, max_tokens=1,
+            device=torch.device("cuda"), swiglu_alpha=1.702, swiglu_limit=7.0,
+        )
+    # silu predates the marker and must keep working on a stale build.
+    CpuMoeExecutor(
+        cache, top_k=2, activation="silu",
+        apply_router_weight_on_input=False, num_threads=0, max_tokens=1,
+        device=torch.device("cuda"),
+    )
+
+
 def _pack_mxfp4_transposed(codes: torch.Tensor) -> torch.Tensor:
     """Pack [S, K, N] codes -> transposed blocks [S, K//2, N] (low nibble = even K)."""
     lo = codes[:, 0::2, :]

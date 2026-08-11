@@ -65,15 +65,20 @@ def mxfp8_dequant(weight: torch.Tensor, scale_codes: torch.Tensor,
 
 
 # ======================================================================================
-# Decode (M <= 16) split-K GEMV: weight-bandwidth bound, so a small decode batch
-# rides the SAME single weight pass -- one [M_TILE, BLOCK_K] activation tile joins
-# the fp8 tile in a tensor-core dot (the pow2-descaled fp8 weight is bf16-exact).
-# Without this, bs=2-8 decode fell into the M>1 dequant+cuBLAS path, which
-# materializes the whole bf16 weight per projection per step (~13x slower).
-# The e8m0 scale is loaded once per (BLOCK_N, BLOCK_K//32) tile and broadcast in
-# registers -- a per-(n,k)-element gather + exp2 costs ~3x the whole GEMV.
+# Small-M (<= 64) split-K GEMV: weight-bandwidth bound, so a small batch rides the
+# SAME single weight pass -- one [M_TILE, BLOCK_K] activation tile joins the fp8
+# tile in a tensor-core dot (the pow2-descaled fp8 weight is bf16-exact). Without
+# this, bs=2-8 decode fell into the M>1 dequant+cuBLAS path, which materializes
+# the whole bf16 weight per projection per step (~13x slower), and short
+# extend-prefills (a radix-cached chat turn appending 20-60 tokens) paid the same
+# transient on every projection of the step. The e8m0 scale is loaded once per
+# (BLOCK_N, BLOCK_K//32) tile and broadcast in registers -- a per-(n,k)-element
+# gather + exp2 costs ~3x the whole GEMV.
 # ======================================================================================
-_GEMV_MAX_M = 16  # one tl.dot tile; larger batches amortize the dequant transient
+# Above this, dequant + cuBLAS wins (the bf16 transient amortizes over enough
+# rows). At the boundary the transient path is ~10-20x slower per call, so the
+# cap errs high: M_TILE buckets {16, 32, 64} keep tl.dot register tiles bounded.
+_GEMV_MAX_M = 64
 
 
 @triton.jit
@@ -82,9 +87,14 @@ def _mxfp8_gemv_m1_splitk_kernel(
     stride_ak, stride_wn, stride_wk, stride_sn, stride_sk, stride_pk, stride_pn,
     BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    """M == 1 specialization: a plain fp32 multiply-reduce (no tensor-core tile,
-    whose 16-row padding costs ~30% at M=1 -- the single-stream decode hot path
-    stays on this kernel; 2 <= M <= 16 rides the dot kernel below)."""
+    """M == 1 specialization: a plain fp32 multiply-reduce (no tensor-core tile;
+    2 <= M <= 64 rides the dot kernel below).
+
+    Architecture note (PR#110 follow-up review): the dot tile's 16-row padding
+    costs ~30% at M=1 on RTX PRO 6000 / RTX 5090 measurements, which is why this
+    kernel exists -- but on H100 the dot kernel at M=1 is ~26% FASTER than this
+    one. If sm_90 becomes a serving target, benchmark both there and dispatch by
+    arch (or drop this kernel and route M=1 through the dot tile)."""
     KB32: tl.constexpr = BLOCK_K // 32
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -221,12 +231,17 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
             BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=1,
         )
     else:
+        # M_TILE buckets to the next pow2 >= 16 (tl.dot minimum); the whole batch
+        # rides one weight pass regardless of bucket, so the only cost of a bigger
+        # tile is row padding, amortized with proportionally more warps.
+        m_tile = max(16, triton.next_power_of_2(M))
         _mxfp8_gemv_splitk_kernel[(n_tiles, split_k)](
             a, weight, scale_codes, part, M, N, K, n_kb, kb_per,
             a.stride(0), a.stride(1), weight.stride(0), weight.stride(1),
             scale_codes.stride(0), scale_codes.stride(1),
             part.stride(0), part.stride(1), part.stride(2),
-            M_TILE=16, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=1,
+            M_TILE=m_tile, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            num_warps=m_tile // 16,
         )
     out = torch.empty((M, N), dtype=out_dtype, device=a.device)
     _splitk_reduce_kernel[(triton.cdiv(N, 256), M)](
@@ -242,8 +257,8 @@ def mxfp8_linear(
     x: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``y = x @ dequant(weight, scale_codes)^T``. Decode-sized batches
-    (M <= 16) -> split-K GEMV (one pass over the fp8 weight); larger M -> bf16
+    """``y = x @ dequant(weight, scale_codes)^T``. Small batches
+    (M <= 64) -> split-K GEMV (one pass over the fp8 weight); larger M -> bf16
     dequant + cuBLAS (see the module docstring). ``weight`` [N, K] fp8-e4m3;
     ``scale_codes`` [N, K//32] uint8 e8m0 exponent codes (dequant multiplier
     ``2**(code - 127)``)."""

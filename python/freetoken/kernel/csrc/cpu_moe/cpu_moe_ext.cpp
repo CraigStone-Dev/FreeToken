@@ -2140,4 +2140,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("ready_addr"), py::arg("slot"));
   m.def("memop_sync", &cumemop_sync, py::arg("stream"), py::arg("done_addr"),
         py::arg("slot"));
+  // ABI capability marker: the highest ActKind this build implements in the
+  // GENERIC epilogue. CpuMoeExecutor.__init__ probes it before requesting an act
+  // id the epilogue must handle -- a prebuilt .so from before ACT_SWIGLUOAI
+  // accepts id 3 without error and silently computes the wrong activation
+  // (act_apply falls through to gelu_tanh); the probe turns a stale extension
+  // into a loud rebuild instruction instead of wrong model outputs.
+  m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLUOAI); });
 }
