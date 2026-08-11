@@ -425,9 +425,11 @@ class MiniMaxM3ReasoningParser(BaseReasoningParser):
     starts with a bare ``</mm:think>`` written by the model itself ("thinking
     off for this turn"). Without special handling that literal marker would
     stream into content on the DEFAULT gear's most common path, so a single
-    leading closer (position 0 only; later closers stay visible) is stripped in
-    both one-shot and streaming modes -- never when ``force_reasoning`` is set,
-    where the closer genuinely terminates the template-opened think block.
+    leading closer (whitespace-tolerant head: the detokenizer may open with a
+    newline before the marker; anything else before a closer keeps it visible)
+    is stripped in both one-shot and streaming modes -- never when
+    ``force_reasoning`` is set, where the closer genuinely terminates the
+    template-opened think block.
     """
 
     THINK_START = "<mm:think>"
@@ -447,15 +449,17 @@ class MiniMaxM3ReasoningParser(BaseReasoningParser):
         self._head_buffer = ""
 
     def detect_and_parse(self, text: str) -> ReasoningParseResult:
-        if not self.force_reasoning and text.startswith(self.think_end_token):
-            text = text[len(self.think_end_token) :]
-            return ReasoningParseResult(normal_text=text.strip())
+        if not self.force_reasoning and text.lstrip().startswith(self.think_end_token):
+            head = text.lstrip()[len(self.think_end_token) :]
+            return ReasoningParseResult(normal_text=head.strip())
         return super().detect_and_parse(text)
 
     def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
         if self._leading_closer_pending:
             self._head_buffer += new_text
-            head = self._head_buffer
+            # Whitespace-tolerant head: the detokenizer may open with a newline
+            # before the model's bare closer.
+            head = self._head_buffer.lstrip()
             if head.startswith(self.think_end_token):
                 # Bare leading closer: strip it once, everything after is content.
                 self._leading_closer_pending = False
@@ -467,12 +471,13 @@ class MiniMaxM3ReasoningParser(BaseReasoningParser):
                     if rest
                     else ReasoningParseResult()
                 )
-            if self.think_end_token.startswith(head):
-                return ReasoningParseResult()  # still a prefix: keep holding
-            # Diverged: not a leading closer -- replay the held head as normal.
+            if not head or self.think_end_token.startswith(head):
+                return ReasoningParseResult()  # still a (whitespace+) prefix: hold
+            # Diverged: not a leading closer -- replay the held head as normal
+            # (whitespace included; it was real output).
+            replay, self._head_buffer = self._head_buffer, ""
             self._leading_closer_pending = False
-            self._head_buffer = ""
-            return super().parse_streaming_increment(head)
+            return super().parse_streaming_increment(replay)
         return super().parse_streaming_increment(new_text)
 
     def flush(self) -> ReasoningParseResult:

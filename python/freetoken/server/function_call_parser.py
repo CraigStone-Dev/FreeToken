@@ -2464,7 +2464,15 @@ class MiniMaxM3Detector(BaseFormatDetector):
         tag is stepped over, and an UNTERMINATED trailing element stops the scan
         with every complete sibling already collected (truncation salvage).
         Same-name nesting is depth-matched so an ``<item>`` containing ``<item>``
-        closes correctly."""
+        closes correctly.
+
+        Accepted risk of the leniency: a LEAF value that itself quotes wire
+        syntax (``<city>see NS<foo>x NS</foo>``) parses as structure, and a
+        malformed tag's dangling closer truncates the scan. Both are the cost of
+        the strict alternative -- where ONE stray character voided every
+        parameter that did parse -- and the model never emits either shape in
+        well-formed turns.
+        """
         items: List[tuple] = []
         pos, n = 0, len(text)
         while pos < n:

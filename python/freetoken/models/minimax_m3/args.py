@@ -136,6 +136,13 @@ def load_args(text_config: Any, num_layers: int, *, sparse_enabled: bool) -> Min
     # that changes swiglu_beta needs all four updated.
     beta = float(getattr(text_config, "swiglu_beta", 1.0))
     assert beta == 1.0, f"swigluoai implementations hardcode beta=1.0, got {beta}"
+    # Plain-rope only: silently ignoring a variant checkpoint's rope_scaling would
+    # mis-position every token past the scaling boundary.
+    scaling = getattr(text_config, "rope_scaling", None) or {}
+    rope_type = scaling.get("rope_type", scaling.get("type", "default")) if scaling else "default"
+    assert rope_type in (None, "default"), (
+        f"MiniMax-M3 support implements plain rope only, got rope_scaling={scaling!r}"
+    )
     scoring = getattr(text_config, "scoring_func", "sigmoid")
     assert scoring == "sigmoid", (
         f"MiniMax-M3 routing implements sigmoid scoring only, got {scoring!r}"

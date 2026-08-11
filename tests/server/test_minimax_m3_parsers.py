@@ -252,6 +252,23 @@ def test_reasoning_adaptive_leading_bare_closer_streaming_split():
     assert normal == "Hello, world!"
 
 
+def test_reasoning_leading_closer_after_whitespace():
+    # The detokenizer may open with a newline before the model's bare closer;
+    # the whitespace-tolerant head still strips it (one-shot and streaming).
+    p = MiniMaxM3ReasoningParser(force_reasoning=False)
+    r = p.detect_and_parse("\n</mm:think>Here is the answer.")
+    assert r.reasoning_text == "" and r.normal_text == "Here is the answer."
+
+    p = MiniMaxM3ReasoningParser(force_reasoning=False)
+    normal = ""
+    for chunk in ["\n", "</mm:think>", "Hi."]:
+        out = p.parse_streaming_increment(chunk)
+        assert out.reasoning_text == ""
+        normal += out.normal_text
+    normal += p.flush().normal_text
+    assert normal == "Hi."
+
+
 def test_reasoning_later_closer_stays_visible():
     # Only a position-0 closer is stripped; one appearing later is content.
     p = MiniMaxM3ReasoningParser(force_reasoning=False)
