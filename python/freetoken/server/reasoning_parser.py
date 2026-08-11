@@ -411,6 +411,30 @@ class ThinkReasoningParser(BaseReasoningParser):
         )
 
 
+class MiniMaxM3ReasoningParser(BaseReasoningParser):
+    """Reasoning parser for MiniMax-M3's ``<mm:think>...</mm:think>`` protocol.
+
+    M3's template has three thinking modes: "enabled" pre-opens ``<mm:think>`` at
+    the generation prompt (the model emits only the closing tag -- the caller
+    passes ``force_reasoning=True``), "adaptive" leaves the model to open the tag
+    itself, and "disabled" pre-closes it (no reasoning). The tool block's
+    namespaced opener ends reasoning when a (malformed) turn skips
+    ``</mm:think>`` and runs straight into a tool call (dsv4 precedent).
+    """
+
+    THINK_START = "<mm:think>"
+    THINK_END = "</mm:think>"
+
+    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+        super().__init__(
+            think_start_token=self.THINK_START,
+            think_end_token=self.THINK_END,
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="]<]minimax[>[<tool_call>",
+        )
+
+
 class GemmaThoughtReasoningParser(BaseReasoningParser):
     """Reasoning parser for Gemma-4's thought channel: the model emits its thought,
     then a closing ``<channel|>`` marker, then the visible answer. The opening
@@ -435,6 +459,7 @@ class ReasoningParser:
         "qwen3": ThinkReasoningParser,
         "glm": ThinkReasoningParser,
         "minimax": ThinkReasoningParser,
+        "minimax_m3": MiniMaxM3ReasoningParser,
         "gemma4": GemmaThoughtReasoningParser,
     }
 

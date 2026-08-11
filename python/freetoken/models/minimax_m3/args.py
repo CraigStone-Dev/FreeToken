@@ -1,0 +1,161 @@
+"""MiniMax-M3 (``minimax_m3``) hyperparameters.
+
+MiniMax-M3 is a 428B-A23B multimodal MoE (FreeToken serves the text tower; the
+``vision_tower.`` stack is skipped like every other checkpoint's). The text tower is
+GQA (64 q heads / 4 kv heads / head_dim 128) with per-head Gemma-style (1+w) q/k
+norms and partial NeoX RoPE (rotary_dim 64); the first ``sparse_attention_freq==0``
+layers run dense attention + a dense SwiGLU-OAI MLP, every later layer runs
+**block-sparse attention** (a lightning indexer scores 128-token blocks and each
+query attends only its top-``topk_blocks`` blocks, per KV head) + a sigmoid-routed
+MoE (128 NVFP4 experts, top-4, + 1 MXFP8 shared expert).
+
+This payload carries the sparse-indexer geometry and the swigluoai/dense-MLP scalars
+the model module and the ``m3_sparse`` attention backend need; it is stashed on
+``ModelConfig.m3_args`` (opaque to the engine). The MoE/router knobs live on
+``ModelConfig`` directly (shared with the glm4_moe/glm_moe_dsa path).
+
+Semantics pinned against the vLLM reference implementation
+(``vllm/models/minimax_m3/``, vendored under ``scratch/m3_ref/`` for study):
+
+* index heads == KV heads (4): each index head selects top-k blocks for ITS kv
+  head's whole GQA group -- there is no cross-head score reduction.
+* one shared index KEY head (``index_k_proj`` is ``[index_dim, hidden]``).
+* block score = max over the block's 128 positions of ``dot(index_q, index_k)``
+  (``sparse_score_type == "max"``), causal-masked, NO softmax scale (only the
+  ordering is consumed).
+* the newest ``local_blocks`` (1) blocks are force-selected; ``init_blocks`` (0)
+  leading blocks would be too. Selection always includes the query's own block.
+* index q/k get the same per-head Gemma norm + partial NeoX RoPE as the main q/k.
+* ``sparse_disable_index_value`` is 1 on every sparse layer: the indexer is
+  score-only (no index value/output projections exist in the checkpoint).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Tuple
+
+
+@dataclass(frozen=True)
+class MiniMaxM3Args:
+    hidden_size: int
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    norm_eps: float
+    # RoPE (partial NeoX; shared by the main q/k and the indexer q/k)
+    rotary_dim: int
+    rope_theta: float
+    max_position: int
+    # SwiGLU-OAI scalars (routed experts, shared experts and the dense MLPs)
+    swiglu_alpha: float
+    swiglu_limit: float
+    dense_intermediate_size: int
+    shared_intermediate_size: int
+    # Block-sparse attention (all zeros / empty when serving the dense ablation)
+    index_dim: int
+    num_index_heads: int
+    topk_blocks: int
+    block_size: int
+    init_blocks: int
+    local_blocks: int
+    sparse_layer_ids: Tuple[int, ...]
+    # Layers whose FFN is the sparse MoE block (the rest run the dense MLP)
+    moe_layer_ids: Tuple[int, ...]
+
+    @property
+    def use_sparse(self) -> bool:
+        return bool(self.sparse_layer_ids) and self.index_dim > 0 and self.topk_blocks > 0
+
+    def is_sparse_layer(self, layer_id: int) -> bool:
+        return self.use_sparse and layer_id in self.sparse_layer_ids
+
+    def sparse_slot(self, layer_id: int) -> int:
+        """Index-key slab slot for a sparse layer (slot order = sparse-layer order)."""
+        return self.sparse_layer_ids.index(layer_id)
+
+
+def _freq_ids(freq, num_layers: int) -> Tuple[int, ...]:
+    if not freq:
+        return tuple(range(num_layers))
+    return tuple(i for i, f in enumerate(freq[:num_layers]) if f)
+
+
+def load_args(text_config: Any, num_layers: int, *, sparse_enabled: bool) -> MiniMaxM3Args:
+    """Build the payload from the HF ``text_config`` (already unwrapped), resolving
+    the sparse-attention switch ONCE here (``sparse_enabled`` folds FREETOKEN_M3_SPARSE
+    in parse_config): the pool factory, the KV cost model, the backend and the model
+    modules all read the resolved payload / group spec, never the env."""
+    sparse_cfg = dict(getattr(text_config, "sparse_attention_config", None) or {})
+    use_sparse = sparse_enabled and bool(sparse_cfg.get("use_sparse_attention", False))
+
+    if use_sparse:
+        score_type = sparse_cfg.get("sparse_score_type", "max")
+        assert score_type == "max", (
+            f"MiniMax-M3 sparse attention only implements sparse_score_type='max', "
+            f"got {score_type!r}"
+        )
+        sparse_layer_ids = _freq_ids(sparse_cfg.get("sparse_attention_freq"), num_layers)
+        # Score-only indexer: the checkpoint ships no index value/output projections.
+        disable_value = sparse_cfg.get("sparse_disable_index_value")
+        if disable_value is not None:
+            assert all(
+                bool(disable_value[i]) for i in sparse_layer_ids if i < len(disable_value)
+            ), "MiniMax-M3 sparse layers must be score-only (sparse_disable_index_value)"
+    else:
+        sparse_layer_ids = ()
+
+    assert not bool(getattr(text_config, "attention_output_gate", False)), (
+        "MiniMax-M3 attention_output_gate is not supported (M3 ships it disabled)"
+    )
+    assert getattr(text_config, "qk_norm_type", "per_head") == "per_head"
+    assert bool(getattr(text_config, "use_gemma_norm", True)), (
+        "MiniMax-M3 support assumes Gemma-style (1+w) RMSNorm (use_gemma_norm)"
+    )
+
+    head_dim = getattr(text_config, "head_dim", None) or (
+        text_config.hidden_size // text_config.num_attention_heads
+    )
+    rotary_dim = getattr(text_config, "rotary_dim", None)
+    if rotary_dim is None:
+        rotary_dim = int(head_dim * getattr(text_config, "partial_rotary_factor", 1.0))
+
+    num_index_heads = int(sparse_cfg.get("sparse_num_index_heads", 0)) if use_sparse else 0
+    if use_sparse:
+        # Per-KV-head selection: each index head feeds one kv head's GQA group.
+        assert num_index_heads == text_config.num_key_value_heads, (
+            f"expected sparse_num_index_heads == num_key_value_heads, got "
+            f"{num_index_heads} != {text_config.num_key_value_heads}"
+        )
+
+    return MiniMaxM3Args(
+        hidden_size=text_config.hidden_size,
+        num_heads=text_config.num_attention_heads,
+        num_kv_heads=text_config.num_key_value_heads,
+        head_dim=head_dim,
+        norm_eps=text_config.rms_norm_eps,
+        rotary_dim=rotary_dim,
+        rope_theta=float(getattr(text_config, "rope_theta", 10000.0)),
+        max_position=text_config.max_position_embeddings,
+        swiglu_alpha=float(getattr(text_config, "swiglu_alpha", 1.702)),
+        swiglu_limit=float(getattr(text_config, "swiglu_limit", 7.0)),
+        dense_intermediate_size=int(
+            getattr(text_config, "dense_intermediate_size", 0)
+            or text_config.intermediate_size
+        ),
+        shared_intermediate_size=int(
+            getattr(text_config, "shared_intermediate_size", 0)
+            or text_config.intermediate_size
+        ),
+        index_dim=int(sparse_cfg.get("sparse_index_dim", 0)) if use_sparse else 0,
+        num_index_heads=num_index_heads,
+        topk_blocks=int(sparse_cfg.get("sparse_topk_blocks", 0)) if use_sparse else 0,
+        block_size=int(sparse_cfg.get("sparse_block_size", 128)) if use_sparse else 0,
+        init_blocks=int(sparse_cfg.get("sparse_init_block", 0)) if use_sparse else 0,
+        local_blocks=int(sparse_cfg.get("sparse_local_block", 0)) if use_sparse else 0,
+        sparse_layer_ids=sparse_layer_ids,
+        moe_layer_ids=_freq_ids(getattr(text_config, "moe_layer_freq", None), num_layers),
+    )
+
+
+__all__ = ["MiniMaxM3Args", "load_args"]

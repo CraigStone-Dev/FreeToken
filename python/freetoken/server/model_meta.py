@@ -22,6 +22,10 @@ def think_spec(reasoning_parser: str | None) -> Tuple[Tuple[str, ...], str | Non
         return ("off", "on", "max"), "off"  # thinking on/off + a max-effort gear
     if reasoning_parser == "minimax":
         return ("on",), "on"  # template always opens a think block; no off path
+    if reasoning_parser == "minimax_m3":
+        # M3's template takes thinking_mode disabled/adaptive/enabled; adaptive
+        # (the template's own default) lets the model decide per turn.
+        return ("off", "adaptive", "on"), "adaptive"
     if reasoning_parser == "gemma4":
         return ("off", "on"), "off"  # gemma's template defaults thinking off
     if reasoning_parser in ("qwen3", "glm"):
@@ -41,6 +45,9 @@ def think_chat_template_kwargs(reasoning_parser: str | None, gear: str | None) -
         return {"enable_thinking": gear == "on"}
     if reasoning_parser == "minimax":
         return {}  # always thinks; its template reads no knob
+    if reasoning_parser == "minimax_m3":
+        mode = {"off": "disabled", "adaptive": "adaptive", "on": "enabled"}[gear]
+        return {"thinking_mode": mode}
     return {"enable_thinking": gear == "on"}  # qwen3, glm, gemma4
 
 

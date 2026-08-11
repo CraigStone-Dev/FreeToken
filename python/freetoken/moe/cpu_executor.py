@@ -54,9 +54,11 @@ _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
 # just keeps the host-func path for the extra combos.
 _FLAG_SLOTS_PER_LAYER = 16
 
-# Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. "gpt_oss_swiglu"
-# is handled entirely inside the mxfp4 kernel (clamped swiglu + bias), so its id is a
-# placeholder that act_apply never sees.
+# Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. Id 3 is the
+# clamped (up + 1) swiglu: "swigluoai" (MiniMax-M3 over the generic bf16/nvfp4/...
+# GEMV epilogue, with the executor's swiglu_alpha/swiglu_limit scalars) and
+# "gpt_oss_swiglu" (same math, fused inside the mxfp4 kernel with its bias add --
+# act id 3 only reaches the generic epilogue for non-mxfp4 formats).
 _ACT_IDS = {
     "silu": 0,
     "swish": 0,
@@ -64,6 +66,7 @@ _ACT_IDS = {
     "gelu_tanh": 2,
     "gelu_pytorch_tanh": 2,
     "gpt_oss_swiglu": 3,
+    "swigluoai": 3,
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.

@@ -87,12 +87,20 @@ class FlashInferBackend(BaseAttnBackend):
         self.config = config
         self.kvcache = get_global_ctx().kv_cache
         self.device = self.kvcache.device
-        # 256 MiB: fa2 split-KV prefill needs num_qo_heads * padded_batch_size *
-        # cta_tile_q * head_dim * 4 bytes of tmp_v scratch. For head_dim=256 models
-        # (e.g. Qwen3.5/3.6 MoE), a short extend-prefill over a long cached prefix
-        # splits KV into many chunks and overflows the previous 128 MiB buffer.
+        # fa2 split-KV prefill needs num_qo_heads * padded_batch_size * cta_tile_q *
+        # head_dim * 4 bytes of tmp_v scratch (plus tmp_s/merge slack). For
+        # head_dim=256 models (e.g. Qwen3.5/3.6 MoE), a short extend-prefill over a
+        # long cached prefix splits KV into many chunks and overflowed the original
+        # 128 MiB buffer; MiniMax-M3's 64-head dense layers overflowed the flat
+        # 256 MiB (an 8K-token chunk wants 64 * 8192 * 128 * 4 B = 256 MiB of tmp_v
+        # alone). Scale by the model's qo_heads x head_dim row cost over an 8K-token
+        # chunk with headroom for the sibling buffers, floored at the old 256 MiB.
+        workspace_bytes = max(
+            256 * 1024 * 1024,
+            config.num_qo_heads * config.head_dim * 4 * 8192 + 128 * 1024 * 1024,
+        )
         self.float_workspace_buffer = torch.empty(
-            256 * 1024 * 1024, dtype=torch.uint8, device=self.device
+            workspace_bytes, dtype=torch.uint8, device=self.device
         )
         self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
             self.float_workspace_buffer,

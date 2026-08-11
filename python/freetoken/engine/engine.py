@@ -125,6 +125,8 @@ def _resolve_auto_attention_backend(
         candidates.append(("dsv4_sparse", True))
     if required & {AttnType.MLA, AttnType.DSA}:
         candidates.append(("dsa", True))
+    if AttnType.BSA in required:
+        candidates.append(("m3_sparse", True))
     if AttnType.SWA in required:
         candidates.append(("triton", True))
     if AttnType.FULL in required:
@@ -173,7 +175,7 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
         if missing:
             valid = [
                 name
-                for name in ("fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse")
+                for name in ("fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "m3_sparse")
                 if required <= attention_backend_info(name).supported_types
             ]
             missing_names = "/".join(sorted(t.value for t in missing))
@@ -253,6 +255,11 @@ def _make_dummy_weight_state_dict(
             state_dict[key] = t
         elif param.dtype.is_floating_point or param.dtype.is_complex:
             state_dict[key] = torch.randn(param.shape, dtype=param.dtype, device=device)
+        elif param.dtype == torch.uint8:
+            # uint8 buffers are packed/quantization codes (MXFP8 e8m0 scale codes,
+            # NVFP4 nibbles). 127 is e8m0 for 1.0 and a benign FP4 nibble pair;
+            # zeros would collapse every MXFP8 scale to 2^-127 and zero the model.
+            state_dict[key] = torch.full(param.shape, 127, dtype=param.dtype, device=device)
         else:
             state_dict[key] = torch.zeros(param.shape, dtype=param.dtype, device=device)
     return state_dict
@@ -1166,6 +1173,28 @@ def _adjust_config(config: EngineConfig):
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts
         override("moe_cache_size", math.ceil(total_experts * config.moe_cache_rate))
 
+    # The CPU MoE executor supports the silu/gelu family plus the clamped
+    # swigluoai (csrc ActKind; "gpt_oss_swiglu" rides inside the mxfp4 kernel and
+    # swigluoai the generic GEMV epilogue). A model with any other expert
+    # activation cannot decode on the CPU: reject an explicit cpu/hybrid pick at
+    # config time, and keep auto from upgrading offload -> hybrid off the profile.
+    _cpu_moe_acts = (
+        "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
+    )
+    _cpu_moe_act_ok = getattr(model_config, "hidden_act", "silu") in _cpu_moe_acts or (
+        getattr(model_config, "moe_weight_format", None) == "mxfp4_triton"
+    )
+    if (
+        is_moe
+        and not _cpu_moe_act_ok
+        and (config.moe_backend in ("cpu", "hybrid") or config.moe_cpu_layers)
+    ):
+        raise ValueError(
+            f"--moe-backend {config.moe_backend!r}: the CPU MoE executor does not support "
+            f"this model's expert activation {getattr(model_config, 'hidden_act', None)!r}; "
+            "use --moe-backend offload (GPU-side dequant) instead."
+        )
+
     if is_moe and config.moe_backend == "auto":
         # A MoE model always defaults to the offload family: experts stream from pinned host
         # banks into an auto-sized GPU slot cache, which is the only default that serves a model
@@ -1188,10 +1217,17 @@ def _adjust_config(config: EngineConfig):
 
         gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
         if load_backend_recommendation(bench_fmt, gpu_name=gpu_name) == "hybrid":
-            default_backend = "hybrid"
-            logger.info_rank0(
-                f"benchbw profile recommends hybrid for {bench_fmt!r} experts on this GPU"
-            )
+            if _cpu_moe_act_ok:
+                default_backend = "hybrid"
+                logger.info_rank0(
+                    f"benchbw profile recommends hybrid for {bench_fmt!r} experts on this GPU"
+                )
+            else:
+                logger.info_rank0(
+                    f"benchbw profile recommends hybrid, but the CPU MoE executor does not "
+                    f"support this model's expert activation "
+                    f"{getattr(model_config, 'hidden_act', None)!r}; staying on offload"
+                )
         override("moe_backend", default_backend)
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
 

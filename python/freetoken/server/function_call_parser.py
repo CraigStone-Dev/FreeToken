@@ -62,6 +62,7 @@ TOOLS_TAG_LIST = [
     "<function=",
     "<tool_call>",
     "<minimax:tool_call>",
+    "]<]minimax[>[<tool_call>",
     "<|python_tag|>",
     "[TOOL_CALLS]",
     "<｜DSML｜function_calls>",
@@ -2386,6 +2387,231 @@ class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
 
 
 
+class MiniMaxM3Detector(BaseFormatDetector):
+    """FreeToken serving adapter for MiniMax-M3 namespace-delimited XML tool calls.
+
+    M3 is NOT M2 with renamed tags (vLLM's Rust ``MinimaxM3ToolParser`` grammar is
+    the reference): every structural tag is prefixed with the ``]<]minimax[>[``
+    namespace marker, one wrapper block holds multiple ``<invoke>`` tags, and the
+    arguments are parameter-NAME XML elements rendered recursively -- objects nest
+    tags, arrays repeat ``<item>``::
+
+        ]<]minimax[>[<tool_call>
+        ]<]minimax[>[<invoke name="create_order">
+        ]<]minimax[>[<user_id>42]<]minimax[>[</user_id>
+        ]<]minimax[>[<shipping>
+        ]<]minimax[>[<city>Singapore]<]minimax[>[</city>
+        ]<]minimax[>[</shipping>
+        ]<]minimax[>[</invoke>
+        ]<]minimax[>[</tool_call>
+
+    Top-level leaf parameters are typed from the tool schema
+    (``_convert_param_value``); nested leaves fall back to loose-JSON typing.
+
+    Streaming: text outside the wrapper streams live (holding back a partial
+    marker suffix); inside the wrapper each completed ``</invoke>`` emits its call
+    in one piece (name announcement + the full arguments JSON as one fragment) --
+    the recursive grammar has no prefix-stable partial-arguments rendering, so
+    fragments trivially satisfy ``args_fragments_prefix_stable``.
+    """
+
+    NS = "]<]minimax[>["
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = self.NS + "<tool_call>"
+        self.eot_token = self.NS + "</tool_call>"
+        self.invoke_open_re = re.compile(
+            re.escape(self.NS) + r'<invoke\s+name="([^"]+)"\s*>'
+        )
+        self._invoke_close = self.NS + "</invoke>"
+        self._m3_in_block = False
+
+    def has_tool_call(self, text: str) -> bool:
+        return self.bot_token in text
+
+    def _partial_marker_suffix(self, buffer: str) -> int:
+        """Length of the LONGEST buffer suffix that is a proper prefix of the
+        wrapper opener. The base ``_ends_with_partial_token`` returns the shortest
+        match, which under-holds for this marker: ``]`` recurs inside
+        ``]<]minimax[>[...``, so a buffer ending ``]<]`` would hold only 1 char and
+        leak ``]<`` as content, breaking the marker forever."""
+        for i in range(min(len(buffer), len(self.bot_token) - 1), 0, -1):
+            if self.bot_token.startswith(buffer[-i:]):
+                return i
+        return 0
+
+    # ---- recursive parameter-XML parsing -------------------------------------------
+    def _try_parse_elements(self, text: str) -> List[tuple] | None:
+        """Parse ``text`` as a sequence of ``NS<k>...NS</k>`` elements; returns
+        ``[(name, raw_inner), ...]`` or None when the body is a leaf value (no
+        well-formed child elements). Matches same-name nesting depth so an
+        ``<item>`` containing ``<item>`` closes correctly."""
+        items: List[tuple] = []
+        pos, n = 0, len(text)
+        while True:
+            while pos < n and text[pos] in " \t\r\n":
+                pos += 1
+            if pos >= n:
+                break
+            if not text.startswith(self.NS + "<", pos) or text.startswith(
+                self.NS + "</", pos
+            ):
+                return None  # stray text between elements -> treat body as a leaf
+            tag_start = pos + len(self.NS) + 1
+            gt = text.find(">", tag_start)
+            if gt == -1:
+                return None
+            name = text[tag_start:gt]
+            if not name or any(c in name for c in ' "<>/'):
+                return None
+            open_tag = self.NS + "<" + name + ">"
+            close_tag = self.NS + "</" + name + ">"
+            depth, search, inner_end = 1, gt + 1, -1
+            while depth:
+                cpos = text.find(close_tag, search)
+                if cpos == -1:
+                    return None  # unterminated element -> not well-formed
+                opos = text.find(open_tag, search)
+                if opos != -1 and opos < cpos:
+                    depth += 1
+                    search = opos + len(open_tag)
+                else:
+                    depth -= 1
+                    inner_end = cpos
+                    search = cpos + len(close_tag)
+            items.append((name, text[gt + 1 : inner_end]))
+            pos = search
+        return items
+
+    def _nested_value(self, raw: str) -> Any:
+        nested = self._try_parse_elements(raw)
+        if nested is None:
+            return _parse_loose_json_value(raw.strip("\n"))
+        if nested and all(k == "item" for k, _ in nested):
+            return [self._nested_value(v) for _, v in nested]
+        return {k: self._nested_value(v) for k, v in nested}
+
+    def _parse_invoke_args(self, func_name: str, body: str, tools: List[Tool]) -> Dict:
+        config = self._get_param_config(func_name, tools)
+        items = self._try_parse_elements(body) or []
+        args: Dict[str, Any] = {}
+        for key, raw in items:
+            nested = self._try_parse_elements(raw)
+            if nested is not None:
+                args[key] = self._nested_value(raw)
+            elif key in config:
+                args[key] = self._convert_param_value(
+                    raw.strip("\n"), key, config, func_name
+                )
+            else:
+                args[key] = _parse_loose_json_value(raw.strip("\n"))
+        return args
+
+    # ---- one-shot -------------------------------------------------------------------
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        idx = text.find(self.bot_token)
+        normal_text = text[:idx].strip() if idx != -1 else text
+        if idx == -1:
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        block = text[idx:]
+        end = block.find(self.eot_token)
+        if end != -1:
+            block = block[:end]
+        tool_indices = self._get_tool_indices(tools)
+        calls: List[ToolCallItem] = []
+        for m in self.invoke_open_re.finditer(block):
+            close = block.find(self._invoke_close, m.end())
+            if close == -1:
+                continue  # truncated trailing invoke
+            func_name = m.group(1)
+            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
+                logger.warning(f"Model attempted to call undefined function: {func_name}")
+                continue
+            args = self._parse_invoke_args(func_name, block[m.end() : close], tools)
+            calls.append(
+                ToolCallItem(
+                    tool_index=len(calls),
+                    name=func_name,
+                    parameters=json.dumps(args, ensure_ascii=False),
+                )
+            )
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    # ---- streaming ------------------------------------------------------------------
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        self._buffer += new_text
+        calls: List[ToolCallItem] = []
+        normal_parts: List[str] = []
+
+        if not self._m3_in_block:
+            buf = self._buffer
+            pos = buf.find(self.bot_token)
+            if pos == -1:
+                hold = self._partial_marker_suffix(buf)
+                release = buf[: len(buf) - hold] if hold else buf
+                self._buffer = buf[len(release) :]
+                return StreamingParseResult(normal_text=release, calls=[])
+            if pos > 0:
+                normal_parts.append(buf[:pos])
+            self._buffer = buf[pos + len(self.bot_token) :]
+            self._m3_in_block = True
+
+        tool_indices = self._get_tool_indices(tools)
+        while self._m3_in_block:
+            m = self.invoke_open_re.search(self._buffer)
+            end_pos = self._buffer.find(self.eot_token)
+            if m is not None and (end_pos == -1 or m.start() < end_pos):
+                close = self._buffer.find(self._invoke_close, m.end())
+                if close == -1:
+                    break  # invoke still streaming
+                func_name = m.group(1)
+                body = self._buffer[m.end() : close]
+                self._buffer = self._buffer[close + len(self._invoke_close) :]
+                if func_name not in tool_indices and not _should_forward_unknown_tool(
+                    func_name
+                ):
+                    logger.warning(
+                        f"Model attempted to call undefined function: {func_name}"
+                    )
+                    continue
+                args = self._parse_invoke_args(func_name, body, tools)
+                args_json = json.dumps(args, ensure_ascii=False)
+                self.current_tool_id += 1
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
+                self.prev_tool_call_arr[self.current_tool_id] = {
+                    "name": func_name,
+                    "arguments": args,
+                }
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id, name=func_name, parameters=""
+                    )
+                )
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id, name=None, parameters=args_json
+                    )
+                )
+                self.streamed_args_for_tool[self.current_tool_id] = args_json
+                continue
+            if end_pos != -1:
+                # Wrapper closed: drop the block residue, resume live text after it.
+                self._buffer = self._buffer[end_pos + len(self.eot_token) :]
+                self._m3_in_block = False
+                if self._buffer:
+                    normal_parts.append(self._buffer)
+                    self._buffer = ""
+                break
+            break  # inside the block, nothing complete yet -> hold
+
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+
 class GptOssDetector(BaseFormatDetector):
     """FreeToken serving adapter for Harmony ``to=functions.*`` tool calls.
 
@@ -2591,6 +2817,7 @@ class FunctionCallParser:
         "glm47": Glm47Detector,
         "llama3": Llama32Detector,
         "minimax": MiniMaxDetector,
+        "minimax_m3": MiniMaxM3Detector,
         "mistral": MistralDetector,
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
