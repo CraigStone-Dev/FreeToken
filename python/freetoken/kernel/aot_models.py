@@ -272,6 +272,9 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         # Routed experts are NVFP4 with swigluoai, which restricts the expert GEMM
         # to the Triton kernels -- but the banks keep the native "nvfp4" layout,
         # so its bank rows are what fast_index_copy sees.
+        # The upstream MiniMaxAI/MiniMax-M3 alias covers the attention/embedding
+        # shapes only: its experts are MXFP8, which has no expert-bank provider on
+        # main -- the NVFP4 release is the servable offload path (M2.5 precedent).
         name="nvidia/MiniMax-M3-NVFP4",
         architecture="MiniMaxM3SparseForConditionalGeneration",
         hidden_size=6144,

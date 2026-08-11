@@ -82,9 +82,12 @@ class GemmaPlusOneRMSNorm(BaseOP):
     format exists to keep). Used by MiniMax-M3 (``use_gemma_norm``) for the decoder
     layernorms, the per-head q/k norms, and the indexer q/k norms.
 
-    ``forward_inplace`` accepts 3D strided views (per-head norm on a fused-QKV
-    slice); only the norm axis must be unit-stride -- the flashinfer and Triton
-    kernels both honor that contract.
+    Per-head 3D inputs are collapsed to 2D before the kernel call: flashinfer's
+    ``gemma_rmsnorm`` CUDA binding is CHECK_DIM(2) (it rejects 3D outright on
+    wheels without the CuTe path), and the per-head weight makes the 2D view
+    exactly equivalent. The M3 call sites pass contiguous buffers, so the views
+    are free; a non-contiguous 3D input is rejected rather than silently copied
+    (an in-place norm on a copy would be dropped).
     """
 
     def __init__(self, size: int, eps: float) -> None:
@@ -96,14 +99,22 @@ class GemmaPlusOneRMSNorm(BaseOP):
             from freetoken.kernel.triton.norm import gemma_rmsnorm
 
         self.eps = eps
+        self.size = size
         self.weight = torch.empty(size)
         self.gemma_rmsnorm = gemma_rmsnorm
 
+    def _flat(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            return x
+        assert x.is_contiguous(), "per-head gemma norm needs a contiguous buffer"
+        return x.view(-1, self.size)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.gemma_rmsnorm(x, self.weight, self.eps)
+        return self.gemma_rmsnorm(self._flat(x), self.weight, self.eps).view(x.shape)
 
     def forward_inplace(self, x: torch.Tensor) -> None:
-        self.gemma_rmsnorm(x, self.weight, self.eps, out=x)
+        flat = self._flat(x)
+        self.gemma_rmsnorm(flat, self.weight, self.eps, out=flat)
 
 
 class GemmaPlusOneRMSNormFused(BaseOP):

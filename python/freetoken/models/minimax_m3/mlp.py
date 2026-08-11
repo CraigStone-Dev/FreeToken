@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     import torch
 
 
-def _make_proj(quant: str, in_features: int, out_features: int) -> BaseOP:
+def make_proj(quant: str, in_features: int, out_features: int) -> BaseOP:
     """A resident projection in the model's resolved quant mode: ``"mxfp8"`` (W8A16,
     the checkpoint's native block-32 e8m0 format -- see weight.py) or bf16."""
     if quant == "mxfp8":
@@ -45,8 +45,8 @@ class MiniMaxM3MLP(BaseOP):
         alpha: float,
         limit: float,
     ):
-        self.gate_up_proj = _make_proj(quant, hidden_size, 2 * intermediate_size)
-        self.down_proj = _make_proj(quant, intermediate_size, hidden_size)
+        self.gate_up_proj = make_proj(quant, hidden_size, 2 * intermediate_size)
+        self.down_proj = make_proj(quant, intermediate_size, hidden_size)
         self._alpha = alpha
         self._limit = limit
 
@@ -59,4 +59,4 @@ class MiniMaxM3MLP(BaseOP):
         return self.down_proj.forward(y)
 
 
-__all__ = ["MiniMaxM3MLP", "_make_proj"]
+__all__ = ["MiniMaxM3MLP", "make_proj"]

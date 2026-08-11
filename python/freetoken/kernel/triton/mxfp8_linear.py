@@ -8,16 +8,24 @@ the dequant multiplier is ``2**(code - 127)``, matching vLLM's
 ``modelopt`` MXFP8 semantics -- ``_mxfp8_e4m3_quantize_torch`` computes
 ``descale = exp2(code - 127)`` and ``w_bf16 = w_fp8 * descale``).
 
-Keeping the weight MXFP8 and reading it directly in a W8A16 kernel (bf16 activation,
-fp8 weight, scales applied in-kernel) halves the decode weight traffic vs a bf16
-dequant at load -- decode is weight-bandwidth bound, same motivation as
-``fp8_pertensor_linear``. Structure mirrors that module: a split-K GEMV for M==1
-decode and a tensor-core GEMM for prefill; the only delta is the block-32 scale
-(loaded per K-tile and applied before the reduce/dot -- ``fp8 * 2**k`` is exact in
-bf16, so the tensor-core operand upcast stays lossless).
+Keeping the weight MXFP8 and reading it directly in a W8A16 GEMV halves the decode
+weight traffic vs a bf16 dequant at load -- decode is weight-bandwidth bound, same
+motivation as ``fp8_pertensor_linear``, whose split-K structure the M==1 kernel
+mirrors. The block-32 scale is loaded ONCE per (BLOCK_N, BLOCK_K//32) tile and
+broadcast in registers -- a per-(n,k)-element scale gather + exp2 costs ~3x the
+whole GEMV (PR#110 review: 424-768 GB/s vs ~2 TB/s for the same-structure
+per-tensor-fp8 kernel).
 
-Numerics: fp8->f32 with the pow2 scale applied in fp32; the GEMV accumulates in fp32,
-the GEMM accumulates the scaled-bf16 operands' tensor-core dot in fp32.
+Prefill / batched forward (M > 1) does NOT use a custom GEMM: it dequantizes the
+weight to bf16 (``fp8 * 2**k`` is exact in bf16) and runs cuBLAS, the same
+dequant-then-matmul precedent as the NVFP4 prefill path. The materialized weight is
+a per-call transient; a fused inline-dequant GEMM never came within 30x of cuBLAS
+on these shapes (PR#110 review), so the transient's extra HBM round-trip is the
+fast option by a wide margin.
+
+Numerics: the GEMV dequants fp8->f32 with the pow2 scale in fp32 and accumulates in
+fp32; the M>1 path multiplies in bf16 via cuBLAS with fp32 accumulate (identical to
+serving every other bf16 projection).
 """
 
 from __future__ import annotations
@@ -35,18 +43,19 @@ FP8 = torch.float8_e4m3fn
 MXFP8_BLOCK = 32
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
-# Escape hatch: FREETOKEN_DEBUG_MXFP8_REF=1 swaps the triton kernels for a pure-torch
+# Escape hatch: FREETOKEN_DEBUG_MXFP8_REF=1 swaps the kernels for a pure-torch
 # dequant matmul (numeric reference / A-B debugging). Evaluated once.
 _USE_REF = os.environ.get("FREETOKEN_DEBUG_MXFP8_REF") == "1"
 
 
 def mxfp8_dequant(weight: torch.Tensor, scale_codes: torch.Tensor,
                   dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    """Reference dequant: ``w[n, k] * 2**(codes[n, k//32] - 127)`` -> ``dtype``.
+    """Dequant: ``w[n, k] * 2**(codes[n, k//32] - 127)`` -> ``dtype``.
 
-    Used by the load-time bf16 ablation path (``FREETOKEN_M3_*_MXFP8=0``) and as the
-    kernels' numeric reference in tests. ``weight`` ``[..., N, K]`` fp8-e4m3;
-    ``scale_codes`` ``[..., N, K//32]`` uint8 e8m0 exponent codes.
+    Serves the M>1 forward (dequant + cuBLAS), the load-time bf16 ablation path
+    (``FREETOKEN_M3_*_MXFP8=0``) and the kernels' numeric reference in tests.
+    ``weight`` ``[..., N, K]`` fp8-e4m3; ``scale_codes`` ``[..., N, K//32]`` uint8
+    e8m0 exponent codes.
     """
     assert weight.shape[-1] % MXFP8_BLOCK == 0
     assert scale_codes.shape[-1] == weight.shape[-1] // MXFP8_BLOCK
@@ -56,7 +65,8 @@ def mxfp8_dequant(weight: torch.Tensor, scale_codes: torch.Tensor,
 
 
 # ======================================================================================
-# Decode (M==1) split-K GEMV: fp8 x bf16 reduction in fp32, block-32 scale in the loop.
+# Decode (M==1) split-K GEMV: fp8 x bf16 reduction in fp32; the e8m0 scale is loaded
+# once per (BLOCK_N, BLOCK_K//32) tile and broadcast in registers.
 # ======================================================================================
 @triton.jit
 def _mxfp8_gemv_splitk_kernel(
@@ -66,11 +76,14 @@ def _mxfp8_gemv_splitk_kernel(
 ):
     """Each (pid_n, pid_k) computes the partial sum over ``kb_per`` BLOCK_K chunks for a
     BLOCK_N slice of outputs. BLOCK_K is a multiple of 32, so each chunk covers
-    ``BLOCK_K // 32`` whole scale blocks; the e8m0 descale folds into the fp32 product."""
+    ``BLOCK_K // 32`` whole scale blocks: one ``[BLOCK_N, KB32]`` code load + exp2 per
+    tile, broadcast over the 32-wide inner axis via a 3D register view."""
+    KB32: tl.constexpr = BLOCK_K // 32
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
+    off_kb32 = tl.arange(0, KB32)
     kb_start = pid_k * kb_per
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
     for i in range(kb_per):
@@ -90,10 +103,14 @@ def _mxfp8_gemv_splitk_kernel(
                     mask=n_mask[:, None] & k_mask[None, :], other=0,
                 ))
             codes = tl.load(
-                s_ptr + offs_n[:, None] * stride_sn + (offs_k[None, :] // 32) * stride_sk,
-                mask=n_mask[:, None] & k_mask[None, :], other=127,
-            ).to(tl.float32)
-            acc += tl.sum(w * tl.exp2(codes - 127.0) * a[None, :], axis=1)
+                s_ptr + offs_n[:, None] * stride_sn
+                + (kb * KB32 + off_kb32[None, :]) * stride_sk,
+                mask=n_mask[:, None] & ((kb * KB32 + off_kb32[None, :]) * 32 < K),
+                other=127,
+            ).to(tl.float32)  # [BLOCK_N, KB32]
+            scale = tl.exp2(codes - 127.0)
+            prod = tl.reshape(w * a[None, :], (BLOCK_N, KB32, 32))
+            acc += tl.sum(tl.sum(prod, axis=2) * scale, axis=1)
     tl.store(part_ptr + pid_k * stride_pk + offs_n * stride_pn, acc, mask=n_mask)
 
 
@@ -139,87 +156,27 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
     return out
 
 
-# ======================================================================================
-# Prefill (M>1) W8A16 GEMM: fp8 weight read from HBM, block-32 descale applied in fp32,
-# then cast to the activation dtype for the tensor-core dot (pow2 scaling is lossless).
-# ======================================================================================
-@triton.jit
-def _mxfp8_gemm_kernel(
-    a_ptr, w_ptr, s_ptr, c_ptr, M, N, K,
-    stride_am, stride_ak, stride_wn, stride_wk, stride_sn, stride_sk,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    compute_type: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-    m_mask = offs_m < M
-    n_mask = offs_n < N
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
-    s_ptrs = s_ptr + offs_n[:, None] * stride_sn + (offs_k[None, :] // 32) * stride_sk
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(tl.cdiv(K, BLOCK_K)):
-        k_rem = K - k * BLOCK_K
-        a = tl.load(a_ptrs, mask=m_mask[:, None] & (offs_k[None, :] < k_rem), other=0.0)
-        w_mask = n_mask[:, None] & (offs_k[None, :] < k_rem)
-        if e4m3_native_cx():
-            w = tl.load(w_ptrs, mask=w_mask, other=0.0).to(tl.float32)
-        else:
-            w = e4m3_u8_to_f32(tl.load(w_ptrs, mask=w_mask, other=0))
-        codes = tl.load(s_ptrs, mask=w_mask, other=127).to(tl.float32)
-        w = (w * tl.exp2(codes - 127.0)).to(a.dtype)
-        acc += tl.dot(a, tl.trans(w), out_dtype=tl.float32)
-        a_ptrs += BLOCK_K * stride_ak
-        w_ptrs += BLOCK_K * stride_wk
-        s_ptrs += (BLOCK_K // 32) * stride_sk
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    tl.store(c_ptrs, acc.to(compute_type), mask=m_mask[:, None] & n_mask[None, :])
-
-
-def _gemm(a: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
-          out_dtype: torch.dtype) -> torch.Tensor:
-    """M>1 W8A16 GEMM. ``a`` [M, K] bf16; ``weight`` [N, K] fp8; ``scale_codes``
-    [N, K//32] uint8."""
-    M, K = a.shape
-    N = weight.shape[0]
-    compute = out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16
-    out = torch.empty((M, N), dtype=compute, device=a.device)
-    BLOCK_M = 64 if M >= 64 else 32
-    BLOCK_N, BLOCK_K = 128, 64
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-    _mxfp8_gemm_kernel[grid](
-        a, weight, scale_codes, out, M, N, K,
-        a.stride(0), a.stride(1), weight.stride(0), weight.stride(1),
-        scale_codes.stride(0), scale_codes.stride(1), out.stride(0), out.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, compute_type=_TL_DTYPE[compute],
-        num_warps=8 if M >= 64 else 4, num_stages=3,
-    )
-    return out
-
-
 def mxfp8_linear(
     x: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``y = x @ dequant(weight, scale_codes)^T``. Decode (M=1) -> split-K GEMV;
-    prefill -> GEMM. ``weight`` [N, K] fp8-e4m3; ``scale_codes`` [N, K//32] uint8
-    e8m0 exponent codes (dequant multiplier ``2**(code - 127)``)."""
+    M>1 -> bf16 dequant + cuBLAS (see the module docstring). ``weight`` [N, K]
+    fp8-e4m3; ``scale_codes`` [N, K//32] uint8 e8m0 exponent codes (dequant
+    multiplier ``2**(code - 127)``)."""
     *lead, K = x.shape
     N = weight.shape[0]
     assert K % MXFP8_BLOCK == 0 and scale_codes.shape == (N, K // MXFP8_BLOCK)
     if _USE_REF:  # numeric-reference fallback (debug / A-B)
         w = mxfp8_dequant(weight, scale_codes, dtype=torch.float32)
         out = (x.reshape(-1, K).float() @ w.t()).to(x.dtype).reshape(*lead, N)
-    else:
+    elif x.numel() // K == 1:
         w8 = e4m3_kernel_view(weight)
-        if x.numel() // K == 1:
-            out = _gemv(x.reshape(K), w8, scale_codes, x.dtype).reshape(*lead, N)
-        else:
-            out = _gemm(x.reshape(-1, K), w8, scale_codes, x.dtype).reshape(*lead, N)
+        out = _gemv(x.reshape(K), w8, scale_codes, x.dtype).reshape(*lead, N)
+    else:
+        # Per-call bf16 transient (pow2 descale is lossless in bf16) + cuBLAS.
+        w = mxfp8_dequant(weight, scale_codes, dtype=x.dtype)
+        out = torch.nn.functional.linear(x.reshape(-1, K), w).reshape(*lead, N)
     if bias is not None:
         out = out + bias.to(out.dtype)
     return out

@@ -203,7 +203,11 @@ def iter_weights(
 
             if layer in args.moe_layer_ids:
                 m_src, m_dst = f"{src}.block_sparse_moe", f"{dst}.block_sparse_moe"
-                yield f"{m_dst}.gate.weight", reader.get(f"{m_src}.gate.weight")
+                # fp32 like the bias: both sit on the top-4 selection boundary.
+                yield (
+                    f"{m_dst}.gate.weight",
+                    reader.get(f"{m_src}.gate.weight").to(torch.float32),
+                )
                 # fp32 in the checkpoint AND the module (top-k selection boundary).
                 yield (
                     f"{m_dst}.e_score_correction_bias",

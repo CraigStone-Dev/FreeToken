@@ -15,7 +15,7 @@ the model module and the ``m3_sparse`` attention backend need; it is stashed on
 ``ModelConfig`` directly (shared with the glm4_moe/glm_moe_dsa path).
 
 Semantics pinned against the vLLM reference implementation
-(``vllm/models/minimax_m3/``, vendored under ``scratch/m3_ref/`` for study):
+(the vLLM tree's ``vllm/models/minimax_m3/``):
 
 * index heads == KV heads (4): each index head selects top-k blocks for ITS kv
   head's whole GQA group -- there is no cross-head score reduction.
@@ -89,6 +89,9 @@ def load_args(text_config: Any, num_layers: int, *, sparse_enabled: bool) -> Min
     sparse_cfg = dict(getattr(text_config, "sparse_attention_config", None) or {})
     use_sparse = sparse_enabled and bool(sparse_cfg.get("use_sparse_attention", False))
 
+    head_dim_early = getattr(text_config, "head_dim", None) or (
+        text_config.hidden_size // text_config.num_attention_heads
+    )
     if use_sparse:
         score_type = sparse_cfg.get("sparse_score_type", "max")
         assert score_type == "max", (
@@ -102,8 +105,41 @@ def load_args(text_config: Any, num_layers: int, *, sparse_enabled: bool) -> Min
             assert all(
                 bool(disable_value[i]) for i in sparse_layer_ids if i < len(disable_value)
             ), "MiniMax-M3 sparse layers must be score-only (sparse_disable_index_value)"
+        # ---- geometry invariants the kernels/backend hardcode; fail a variant ----
+        # checkpoint at PARSE time instead of mis-addressing / mis-compiling at
+        # serve time.
+        blk = int(sparse_cfg.get("sparse_block_size", 128))
+        assert blk == 128, (
+            f"MiniMax-M3 kernels and the pinned KV page size assume 128-token "
+            f"sparse blocks, got sparse_block_size={blk}"
+        )
+        idx_dim = int(sparse_cfg.get("sparse_index_dim", 0))
+        assert idx_dim == head_dim_early, (
+            f"the indexer reuses the main rotary (rotary slices by head_dim); "
+            f"sparse_index_dim={idx_dim} != head_dim={head_dim_early}"
+        )
+        topk = int(sparse_cfg.get("sparse_topk_blocks", 0))
+        assert 0 < topk < 64, (
+            f"the decode top-k kernel's merge stage supports topk_blocks < 64, "
+            f"got {topk} (would fail Triton compile at serve time)"
+        )
+        local = int(sparse_cfg.get("sparse_local_block", 0))
+        assert local >= 1, (
+            "the attend kernels rely on the forced local block guaranteeing every "
+            f"query at least one visible position; got sparse_local_block={local}"
+        )
     else:
         sparse_layer_ids = ()
+
+    # swigluoai is implemented in four places (triton *_and_mul, fused_nvfp4, the
+    # CPU GEMV epilogue, eager) with the (up + 1) bias hardcoded; a checkpoint
+    # that changes swiglu_beta needs all four updated.
+    beta = float(getattr(text_config, "swiglu_beta", 1.0))
+    assert beta == 1.0, f"swigluoai implementations hardcode beta=1.0, got {beta}"
+    scoring = getattr(text_config, "scoring_func", "sigmoid")
+    assert scoring == "sigmoid", (
+        f"MiniMax-M3 routing implements sigmoid scoring only, got {scoring!r}"
+    )
 
     assert not bool(getattr(text_config, "attention_output_gate", False)), (
         "MiniMax-M3 attention_output_gate is not supported (M3 ships it disabled)"

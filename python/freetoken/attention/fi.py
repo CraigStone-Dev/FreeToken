@@ -87,18 +87,29 @@ class FlashInferBackend(BaseAttnBackend):
         self.config = config
         self.kvcache = get_global_ctx().kv_cache
         self.device = self.kvcache.device
-        # fa2 split-KV prefill needs num_qo_heads * padded_batch_size * cta_tile_q *
-        # head_dim * 4 bytes of tmp_v scratch (plus tmp_s/merge slack). For
-        # head_dim=256 models (e.g. Qwen3.5/3.6 MoE), a short extend-prefill over a
-        # long cached prefix splits KV into many chunks and overflowed the original
-        # 128 MiB buffer; MiniMax-M3's 64-head dense layers overflowed the flat
-        # 256 MiB (an 8K-token chunk wants 64 * 8192 * 128 * 4 B = 256 MiB of tmp_v
-        # alone). Scale by the model's qo_heads x head_dim row cost over an 8K-token
-        # chunk with headroom for the sibling buffers, floored at the old 256 MiB.
-        workspace_bytes = max(
-            256 * 1024 * 1024,
-            config.num_qo_heads * config.head_dim * 4 * 8192 + 128 * 1024 * 1024,
+        # fa2 split-KV prefill needs ``tmp_v <= qo_heads_local * padded_batch_size *
+        # cta_tile_q * head_dim * 4`` bytes of scratch, where flashinfer's scheduler
+        # caps ``padded_batch_size`` at ~``2 * SM / kv_heads_local`` and
+        # ``cta_tile_q`` is 128 (64 at head_dim >= 256); when the cap can't be met
+        # it disables split-KV and allocates no tmp_v at all. The original flat
+        # 128 MiB overflowed on head_dim=256 extend-prefills (Qwen3.5/3.6 MoE) and
+        # the flat 256 MiB on MiniMax-M3's 64-head dense layers (H100: 64 heads x
+        # 72 padded rows x 128 x 128 x 4 B = 288 MiB of tmp_v). Derive the bound
+        # from the model's TP-LOCAL geometry + this device's SM count, with slack
+        # for the tmp_s/merge siblings, floored at the old 256 MiB -- geometries
+        # that never exceeded the flat buffer (e.g. GLM-4.7's 96q/8kv) stay at it.
+        tp_size = get_tp_info().size
+        qo_local = div_even(config.num_qo_heads, tp_size)
+        kv_local = div_even(config.num_kv_heads, tp_size, allow_replicate=True)
+        sm_count = (
+            torch.cuda.get_device_properties(self.device).multi_processor_count
+            if self.device.type == "cuda"
+            else 128
         )
+        cta_tile_q = 64 if config.head_dim >= 256 else 128
+        padded_batch = -(-2 * sm_count // max(1, kv_local))
+        tmp_v_bound = qo_local * padded_batch * cta_tile_q * config.head_dim * 4
+        workspace_bytes = max(256 * 1024 * 1024, tmp_v_bound + 32 * 1024 * 1024)
         self.float_workspace_buffer = torch.empty(
             workspace_bytes, dtype=torch.uint8, device=self.device
         )

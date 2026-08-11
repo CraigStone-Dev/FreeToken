@@ -2407,12 +2407,24 @@ class MiniMaxM3Detector(BaseFormatDetector):
 
     Top-level leaf parameters are typed from the tool schema
     (``_convert_param_value``); nested leaves fall back to loose-JSON typing.
+    Element scanning is LENIENT: stray text between elements is skipped (never
+    rejecting the parameters that did parse), an empty element is the empty
+    string (not ``{}``), repeated sibling tags aggregate into a list, and a
+    truncated trailing element salvages every complete sibling before it --
+    which is what makes ``recover_truncated_call`` work for calls cut off by
+    max_tokens.
 
     Streaming: text outside the wrapper streams live (holding back a partial
     marker suffix); inside the wrapper each completed ``</invoke>`` emits its call
     in one piece (name announcement + the full arguments JSON as one fragment) --
     the recursive grammar has no prefix-stable partial-arguments rendering, so
-    fragments trivially satisfy ``args_fragments_prefix_stable``.
+    fragments trivially satisfy ``args_fragments_prefix_stable``. Wire order is
+    preserved (text arriving after a call in the same chunk defers to the next
+    increment), a closed wrapper loops back to the idle scan (a second block or a
+    split marker in the residue is handled, never leaked), and the buffer KEEPS
+    the wrapper opener while inside a block so the base ``finish_streaming``
+    suppresses truncated-markup residue and ``recover_truncated_call`` can
+    re-parse it.
     """
 
     NS = "]<]minimax[>["
@@ -2425,6 +2437,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
             re.escape(self.NS) + r'<invoke\s+name="([^"]+)"\s*>'
         )
         self._invoke_close = self.NS + "</invoke>"
+        # While True, self._buffer starts with bot_token (the retained opener).
         self._m3_in_block = False
 
     def has_tool_call(self, text: str) -> bool:
@@ -2441,37 +2454,41 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 return i
         return 0
 
-    # ---- recursive parameter-XML parsing -------------------------------------------
-    def _try_parse_elements(self, text: str) -> List[tuple] | None:
-        """Parse ``text`` as a sequence of ``NS<k>...NS</k>`` elements; returns
-        ``[(name, raw_inner), ...]`` or None when the body is a leaf value (no
-        well-formed child elements). Matches same-name nesting depth so an
-        ``<item>`` containing ``<item>`` closes correctly."""
+    # ---- lenient recursive parameter-XML scanning ------------------------------------
+    _TAG_BAD_CHARS = frozenset(' "<>/')
+
+    def _scan_elements(self, text: str) -> List[tuple]:
+        """Scan ``text`` for a sequence of ``NS<k>...NS</k>`` elements; returns
+        ``[(name, raw_inner), ...]``. Lenient by design (the model writes this
+        grammar free-form): stray text between elements is skipped, a malformed
+        tag is stepped over, and an UNTERMINATED trailing element stops the scan
+        with every complete sibling already collected (truncation salvage).
+        Same-name nesting is depth-matched so an ``<item>`` containing ``<item>``
+        closes correctly."""
         items: List[tuple] = []
         pos, n = 0, len(text)
-        while True:
-            while pos < n and text[pos] in " \t\r\n":
-                pos += 1
-            if pos >= n:
-                break
-            if not text.startswith(self.NS + "<", pos) or text.startswith(
-                self.NS + "</", pos
-            ):
-                return None  # stray text between elements -> treat body as a leaf
+        while pos < n:
+            nxt = text.find(self.NS + "<", pos)
+            if nxt == -1:
+                break  # trailing stray text: ignored
+            pos = nxt
+            if text.startswith(self.NS + "</", pos):
+                break  # a close tag we did not open leaked into this slice: stop
             tag_start = pos + len(self.NS) + 1
             gt = text.find(">", tag_start)
             if gt == -1:
-                return None
+                break  # truncated open tag
             name = text[tag_start:gt]
-            if not name or any(c in name for c in ' "<>/'):
-                return None
+            if not name or any(c in self._TAG_BAD_CHARS for c in name):
+                pos = gt + 1  # malformed tag (e.g. an <invoke ...> echo): step over
+                continue
             open_tag = self.NS + "<" + name + ">"
             close_tag = self.NS + "</" + name + ">"
             depth, search, inner_end = 1, gt + 1, -1
             while depth:
                 cpos = text.find(close_tag, search)
                 if cpos == -1:
-                    return None  # unterminated element -> not well-formed
+                    return items  # unterminated element: salvage what parsed
                 opos = text.find(open_tag, search)
                 if opos != -1 and opos < cpos:
                     depth += 1
@@ -2484,91 +2501,143 @@ class MiniMaxM3Detector(BaseFormatDetector):
             pos = search
         return items
 
+    def _leaf_value(self, raw: str) -> Any:
+        leaf = raw.strip("\n")
+        # An empty element is the empty STRING; loose-JSON would turn it into {}.
+        return "" if leaf.strip() == "" else _parse_loose_json_value(leaf)
+
     def _nested_value(self, raw: str) -> Any:
-        nested = self._try_parse_elements(raw)
-        if nested is None:
-            return _parse_loose_json_value(raw.strip("\n"))
-        if nested and all(k == "item" for k, _ in nested):
-            return [self._nested_value(v) for _, v in nested]
-        return {k: self._nested_value(v) for k, v in nested}
+        items = self._scan_elements(raw)
+        if not items:
+            return self._leaf_value(raw)
+        return self._structure(items)
+
+    def _structure(self, items: List[tuple]) -> Any:
+        names = {k for k, _ in items}
+        # Arrays: the template renders one <item> per element; repeated same-name
+        # siblings under any tag are also a list (never silently collapse to the
+        # last value).
+        if len(names) == 1 and (len(items) > 1 or next(iter(names)) == "item"):
+            return [self._nested_value(raw) for _, raw in items]
+        out: Dict[str, Any] = {}
+        for key, raw in items:
+            value = self._nested_value(raw)
+            if key in out:
+                prev = out[key]
+                out[key] = (prev if isinstance(prev, list) else [prev]) + [value]
+            else:
+                out[key] = value
+        return out
 
     def _parse_invoke_args(self, func_name: str, body: str, tools: List[Tool]) -> Dict:
         config = self._get_param_config(func_name, tools)
-        items = self._try_parse_elements(body) or []
         args: Dict[str, Any] = {}
-        for key, raw in items:
-            nested = self._try_parse_elements(raw)
-            if nested is not None:
-                args[key] = self._nested_value(raw)
+        for key, raw in self._scan_elements(body):
+            nested = self._scan_elements(raw)
+            if nested:
+                value: Any = self._structure(nested)
             elif key in config:
-                args[key] = self._convert_param_value(
-                    raw.strip("\n"), key, config, func_name
-                )
+                value = self._convert_param_value(raw.strip("\n"), key, config, func_name)
+                if raw.strip() == "" and isinstance(value, dict):
+                    value = ""  # empty leaf never becomes {}
             else:
-                args[key] = _parse_loose_json_value(raw.strip("\n"))
+                value = self._leaf_value(raw)
+            if key in args:
+                prev = args[key]
+                args[key] = (prev if isinstance(prev, list) else [prev]) + [value]
+            else:
+                args[key] = value
         return args
 
-    # ---- one-shot -------------------------------------------------------------------
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
-        if idx == -1:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
-
-        block = text[idx:]
-        end = block.find(self.eot_token)
-        if end != -1:
-            block = block[:end]
+    def _parse_block_invokes(
+        self, block: str, tools: List[Tool], calls: List[ToolCallItem], base_index: int
+    ) -> None:
+        """Append every invoke in ``block`` (the wrapper interior; possibly
+        truncated) to ``calls``. A truncated trailing invoke (no ``</invoke>``)
+        salvages its complete parameters -- the recover_truncated_call path."""
         tool_indices = self._get_tool_indices(tools)
-        calls: List[ToolCallItem] = []
         for m in self.invoke_open_re.finditer(block):
             close = block.find(self._invoke_close, m.end())
-            if close == -1:
-                continue  # truncated trailing invoke
+            body = block[m.end() : close] if close != -1 else block[m.end() :]
             func_name = m.group(1)
             if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
                 logger.warning(f"Model attempted to call undefined function: {func_name}")
                 continue
-            args = self._parse_invoke_args(func_name, block[m.end() : close], tools)
+            args = self._parse_invoke_args(func_name, body, tools)
             calls.append(
                 ToolCallItem(
-                    tool_index=len(calls),
+                    tool_index=base_index + len(calls),
                     name=func_name,
                     parameters=json.dumps(args, ensure_ascii=False),
                 )
             )
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+            if close == -1:
+                break  # truncated trailing invoke consumed everything
+
+    # ---- one-shot -------------------------------------------------------------------
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """Parse EVERY wrapper block (text between and after blocks stays content).
+        A block without ``</tool_call>`` (end-of-generation truncation) still
+        yields its parseable calls -- recover_truncated_call appends the closer
+        and re-enters here."""
+        calls: List[ToolCallItem] = []
+        normal_parts: List[str] = []
+        pos = 0
+        while True:
+            b = text.find(self.bot_token, pos)
+            if b == -1:
+                normal_parts.append(text[pos:])
+                break
+            normal_parts.append(text[pos:b])
+            e = text.find(self.eot_token, b + len(self.bot_token))
+            block = text[b + len(self.bot_token) : e if e != -1 else len(text)]
+            self._parse_block_invokes(block, tools, calls, base_index=0)
+            if e == -1:
+                break
+            pos = e + len(self.eot_token)
+        return StreamingParseResult(
+            normal_text="".join(normal_parts).strip(), calls=calls
+        )
 
     # ---- streaming ------------------------------------------------------------------
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         self._buffer += new_text
         calls: List[ToolCallItem] = []
         normal_parts: List[str] = []
-
-        if not self._m3_in_block:
-            buf = self._buffer
-            pos = buf.find(self.bot_token)
-            if pos == -1:
-                hold = self._partial_marker_suffix(buf)
-                release = buf[: len(buf) - hold] if hold else buf
-                self._buffer = buf[len(release) :]
-                return StreamingParseResult(normal_text=release, calls=[])
-            if pos > 0:
-                normal_parts.append(buf[:pos])
-            self._buffer = buf[pos + len(self.bot_token) :]
-            self._m3_in_block = True
-
         tool_indices = self._get_tool_indices(tools)
-        while self._m3_in_block:
-            m = self.invoke_open_re.search(self._buffer)
-            end_pos = self._buffer.find(self.eot_token)
+
+        while True:
+            if not self._m3_in_block:
+                pos = self._buffer.find(self.bot_token)
+                if pos == -1:
+                    hold = self._partial_marker_suffix(self._buffer)
+                    release = self._buffer[: len(self._buffer) - hold]
+                    if release and calls:
+                        break  # wire order: text after a call defers to the next step
+                    self._buffer = self._buffer[len(release) :]
+                    if release:
+                        normal_parts.append(release)
+                    break
+                if pos > 0:
+                    if calls:
+                        break  # wire order (text precedes a SECOND block)
+                    normal_parts.append(self._buffer[:pos])
+                    self._buffer = self._buffer[pos:]
+                self._m3_in_block = True
+                continue
+
+            # In-block: the buffer keeps the opener (finish_streaming suppression +
+            # recover_truncated_call re-parse both key off has_tool_call(buffer)).
+            body = self._buffer[len(self.bot_token) :]
+            m = self.invoke_open_re.search(body)
+            end_pos = body.find(self.eot_token)
             if m is not None and (end_pos == -1 or m.start() < end_pos):
-                close = self._buffer.find(self._invoke_close, m.end())
+                close = body.find(self._invoke_close, m.end())
                 if close == -1:
-                    break  # invoke still streaming
+                    break  # invoke still streaming -> hold (opener retained)
                 func_name = m.group(1)
-                body = self._buffer[m.end() : close]
-                self._buffer = self._buffer[close + len(self._invoke_close) :]
+                inner = body[m.end() : close]
+                self._buffer = self.bot_token + body[close + len(self._invoke_close) :]
                 if func_name not in tool_indices and not _should_forward_unknown_tool(
                     func_name
                 ):
@@ -2576,7 +2645,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
                         f"Model attempted to call undefined function: {func_name}"
                     )
                     continue
-                args = self._parse_invoke_args(func_name, body, tools)
+                args = self._parse_invoke_args(func_name, inner, tools)
                 args_json = json.dumps(args, ensure_ascii=False)
                 self.current_tool_id += 1
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -2600,13 +2669,12 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 self.streamed_args_for_tool[self.current_tool_id] = args_json
                 continue
             if end_pos != -1:
-                # Wrapper closed: drop the block residue, resume live text after it.
-                self._buffer = self._buffer[end_pos + len(self.eot_token) :]
+                # Wrapper closed: drop the block, loop back to the idle scan so the
+                # residue gets partial-marker holds and second-block detection
+                # instead of leaking raw.
+                self._buffer = body[end_pos + len(self.eot_token) :]
                 self._m3_in_block = False
-                if self._buffer:
-                    normal_parts.append(self._buffer)
-                    self._buffer = ""
-                break
+                continue
             break  # inside the block, nothing complete yet -> hold
 
         return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)

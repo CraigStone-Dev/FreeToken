@@ -36,8 +36,14 @@ class MiniMaxM3SparseMoeBlock(BaseOP):
         self.norm_topk_prob = config.norm_topk_prob
         self.routed_scaling_factor = config.routed_scaling_factor
 
+        # Router weights kept fp32 (vLLM stores them fp32 too): both the gate and
+        # the bias sit on the top-4 selection boundary, where a bf16 round can
+        # flip near-tie picks away from the reference. ~3 MB total for 57 layers.
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
-        # DeepSeek-style selection bias; fp32 in the checkpoint AND here (top-k boundary).
+        self.gate.weight = torch.empty(
+            config.num_experts, config.hidden_size, dtype=torch.float32
+        )
+        # DeepSeek-style selection bias; fp32 in the checkpoint AND here.
         self.e_score_correction_bias = torch.empty(config.num_experts, dtype=torch.float32)
 
         # The offload cache indexes experts by *MoE* layer (global layer minus
@@ -61,8 +67,8 @@ class MiniMaxM3SparseMoeBlock(BaseOP):
         )
 
     def _route(self, hidden_states: torch.Tensor) -> TopK:
-        # HF/vLLM compute the router logits in fp32; the gate is tiny so match exactly.
-        logits = F.linear(hidden_states.float(), self.gate.weight.float())
+        # HF/vLLM compute the router logits in fp32; the gate is stored fp32.
+        logits = F.linear(hidden_states.float(), self.gate.weight)
         scores = logits.sigmoid()
         scores_for_choice = scores + self.e_score_correction_bias
         _, topk_ids = torch.topk(scores_for_choice, self.top_k, dim=-1)

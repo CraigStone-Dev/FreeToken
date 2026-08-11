@@ -34,8 +34,11 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import Batch, get_global_ctx
+from freetoken.utils import init_logger
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
@@ -49,25 +52,66 @@ _PREFILL_SCORE_BYTES = 256 << 20
 _PREFILL_SCORE_CHUNK = 4096
 
 
-def _pick_inner_backend() -> str:
-    """FULL backend for the dense leading layers. Page-size agnostic candidates only
-    (trtllm pins page 16/32/64 and can't serve the 128-token pages); mirrors the
-    engine's FULL auto-tree otherwise: sm_90+ + sgl_kernel -> "fa,fi", flashinfer ->
-    "fi", else "triton". ``FREETOKEN_M3_INNER_BACKEND`` overrides (e.g. "triton" on a
-    box whose flashinfer JIT toolchain is broken)."""
+def _pick_inner_backend(block_size: int) -> str:
+    """FULL backend for the dense leading layers, resolved through the ENGINE's own
+    FULL auto-tree (``_resolve_auto_attention_backend`` -- one resolver, so the two
+    trees can never diverge again: a private copy once gated "fa,fi" on the
+    open-ended ``is_sm90_supported`` and crashed sm_12x boxes at construction),
+    then filtered for page-size compatibility: this pool serves 128-token pages,
+    so a candidate that pins other page sizes (trtllm: 16/32/64) is skipped.
+
+    ``FREETOKEN_M3_INNER_BACKEND`` overrides (e.g. "triton" on a box whose
+    flashinfer JIT toolchain is broken); the override is validated against the
+    capability matrix so a page-incompatible or non-FULL pick fails at
+    construction with a real message instead of mis-addressing the pool.
+    """
     import os
 
-    from freetoken.kernel.backend import is_flashinfer_installed, is_sgl_kernel_installed
-    from freetoken.utils.arch import is_sm90_supported
+    from freetoken.attention import attention_backend_info
+    from freetoken.attention.base import AttnType
+
+    def _page_ok(name: str) -> bool:
+        for part in name.split(","):
+            sizes = attention_backend_info(part).page_sizes
+            if sizes is not None and block_size not in sizes:
+                return False
+        return True
 
     override = os.getenv("FREETOKEN_M3_INNER_BACKEND")
     if override:
+        for part in override.split(","):
+            info = attention_backend_info(part)
+            if AttnType.FULL not in info.supported_types:
+                raise ValueError(
+                    f"FREETOKEN_M3_INNER_BACKEND={override!r}: {part!r} does not "
+                    "serve FULL attention (the dense leading layers)."
+                )
+        if not _page_ok(override):
+            raise ValueError(
+                f"FREETOKEN_M3_INNER_BACKEND={override!r} cannot address the "
+                f"{block_size}-token pages this model's pool uses."
+            )
+        logger.info(f"m3_sparse dense-layer backend: {override} (env override)")
         return override
-    if is_flashinfer_installed():
-        if is_sgl_kernel_installed() and is_sm90_supported():
-            return "fa,fi"
-        return "fi"
-    return "triton"
+
+    from freetoken.engine.engine import _resolve_auto_attention_backend
+
+    name = _resolve_auto_attention_backend(frozenset({AttnType.FULL}), False)
+    if not _page_ok(name):
+        # trtllm (the sm_100 first pick) pins 16/32/64-token pages; walk the rest
+        # of the SAME tree (same arch gates, same requirement probes) with the
+        # page filter applied.
+        from freetoken.engine.engine import _backend_requirements_met
+        from freetoken.utils.arch import is_sm90_family
+
+        for candidate, arch_ok in (("fa,fi", is_sm90_family()), ("fi", True), ("triton", True)):
+            if arch_ok and _page_ok(candidate) and _backend_requirements_met(candidate):
+                name = candidate
+                break
+        else:  # pragma: no cover - triton is unconditional
+            name = "triton"
+    logger.info(f"m3_sparse dense-layer backend: {name} (auto)")
+    return name
 
 
 @dataclass
@@ -82,6 +126,11 @@ class M3SparseMetadata(BaseAttnMetadata):
     # + live lengths, device-read. None on prefill / until staged.
     block_rows:     torch.Tensor | None = None
     kvlen:          torch.Tensor | None = None
+    # prefill addressing plan, built ONCE at the first sparse layer's forward and
+    # reused by all 57 (the tensors are layer-invariant): per request, its
+    # contiguous block-base rows plus per-query-chunk (slice, cu, seq, prefix,
+    # chunk_len) tuples. None until built / on decode.
+    prefill_plan:   list | None = None
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -114,12 +163,12 @@ class M3SparseAttnBackend(BaseAttnBackend):
             f"m3_sparse backend needs a BSA pool, got {type(self.kvcache).__name__}"
         )
         # layer -> index-slab slot (sparse-layer order; matches the pool's slots).
-        self._idx_slot = {lid: i for i, lid in enumerate(args.sparse_layer_ids)}
+        self._idx_slot = {lid: args.sparse_slot(lid) for lid in args.sparse_layer_ids}
 
         # Wrapped FULL backend for the dense leading layers.
         from freetoken.attention import create_attention_backend
 
-        self._inner_name = _pick_inner_backend()
+        self._inner_name = _pick_inner_backend(self.block_size)
         self.inner = create_attention_backend(self._inner_name, config)
 
         # decode staging (static buffers under CUDA graphs; eager decode builds
@@ -235,21 +284,17 @@ class M3SparseAttnBackend(BaseAttnBackend):
         return out
 
     # ----- prefill / extend (eager) -------------------------------------------------------
-    def _prefill(self, md, layer_id: int, slot: int, q, index_q, batch: Batch) -> torch.Tensor:
-        from freetoken.kernel.triton.minimax_m3_sparse import (
-            m3_index_score_prefill,
-            m3_index_topk_prefill,
-            m3_sparse_attn_prefill,
-        )
-
+    def _prefill_plan(self, md, batch: Batch) -> list:
+        """Per-request addressing plan, built ONCE per forward (layer-invariant --
+        rebuilding it per sparse layer cost ~3 H2D copies x chunks x 57 layers of
+        stream-serializing overhead): ``[(block_rows [1, n_blocks], kv_len,
+        [(slice, cu, seq, prefix, chunk_len), ...]), ...]``."""
+        if md.prefill_plan is not None:
+            return md.prefill_plan
         reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
         page_table = get_global_ctx().page_table
         qo = md.qo_indptr_cpu.tolist()
-        k_rows = self._k_rows(layer_id)
-        v_rows = self._v_rows(layer_id)
-        ik_rows = self.kvcache.index_k_cache(slot)
-        out = torch.empty_like(q)
-
+        plan = []
         for i, r in enumerate(reqs):
             m = qo[i + 1] - qo[i]
             if m == 0:
@@ -268,26 +313,47 @@ class M3SparseAttnBackend(BaseAttnBackend):
             # by max_position: 16 x 4 x (1M/128) x 4 B = 2 MB per chunk iteration).
             per_q = 4 * self.args.num_index_heads * max(n_blocks, 1)
             chunk = max(16, min(_PREFILL_SCORE_CHUNK, _PREFILL_SCORE_BYTES // per_q))
+            seq = torch.tensor([kv_len], dtype=torch.int32, device=self.device)
+            chunks = []
             for s0 in range(0, m, chunk):
                 s1 = min(s0 + chunk, m)
-                sl = slice(qo[i] + s0, qo[i] + s1)
-                cu = torch.tensor([0, s1 - s0], dtype=torch.int32, device=self.device)
-                seq = torch.tensor([kv_len], dtype=torch.int32, device=self.device)
-                prefix = torch.tensor(
-                    [r.cached_len + s0], dtype=torch.int32, device=self.device
-                )
+                chunks.append((
+                    slice(qo[i] + s0, qo[i] + s1),
+                    torch.tensor([0, s1 - s0], dtype=torch.int32, device=self.device),
+                    seq,
+                    torch.tensor([r.cached_len + s0], dtype=torch.int32, device=self.device),
+                    s1 - s0,
+                ))
+            plan.append((block_rows, kv_len, chunks))
+        md.prefill_plan = plan
+        return plan
+
+    def _prefill(self, md, layer_id: int, slot: int, q, index_q, batch: Batch) -> torch.Tensor:
+        from freetoken.kernel.triton.minimax_m3_sparse import (
+            m3_index_score_prefill,
+            m3_index_topk_prefill,
+            m3_sparse_attn_prefill,
+        )
+
+        k_rows = self._k_rows(layer_id)
+        v_rows = self._v_rows(layer_id)
+        ik_rows = self.kvcache.index_k_cache(slot)
+        out = torch.empty_like(q)
+
+        for block_rows, kv_len, chunks in self._prefill_plan(md, batch):
+            for sl, cu, seq, prefix, chunk_len in chunks:
                 score = m3_index_score_prefill(
                     index_q[sl], ik_rows, block_rows, cu, seq, prefix,
-                    s1 - s0, kv_len,
+                    chunk_len, kv_len,
                 )
                 topk_idx = m3_index_topk_prefill(
-                    score, cu, prefix, s1 - s0,
+                    score, cu, prefix, chunk_len,
                     self.topk_blocks, self.args.init_blocks, self.args.local_blocks,
                 )
                 del score
                 m3_sparse_attn_prefill(
                     q[sl], k_rows, v_rows, topk_idx, block_rows,
-                    cu, seq, prefix, s1 - s0, self.sm_scale, out[sl],
+                    cu, seq, prefix, chunk_len, self.sm_scale, out[sl],
                 )
         return out
 
@@ -303,21 +369,28 @@ class M3SparseAttnBackend(BaseAttnBackend):
         )
         self._kvlen_buf = torch.zeros(max_bs, dtype=torch.int32, device=self.device)
 
+    def _block_base_view(self) -> torch.Tensor:
+        """Every-``block_size``-th column of the page table: the per-block base
+        rows. A strided VIEW -- gathering rows through it materializes only the
+        [bs, W/128] result, never the full-width [bs, W] table snapshot (2 MiB/req
+        at a 512K-token table; the staging-width class this repo fixed for DSV4)."""
+        return get_global_ctx().page_table[:, :: self.block_size]
+
     def _decode_block_rows(self, batch: Batch) -> torch.Tensor:
         """This decode step's per-request block-base rows [bs, W/128], gathered off
         the scheduler-staged ``active_table_idx`` (a device tensor -- no host loop)."""
         assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
-        rows = get_global_ctx().page_table.index_select(
-            0, batch.active_table_idx.to(torch.int64)
+        return (
+            self._block_base_view()
+            .index_select(0, batch.active_table_idx.to(torch.int64))
+            .to(torch.int32)
         )
-        return rows[:, :: self.block_size].to(torch.int32).contiguous()
 
     def _stage_decode(self, batch: Batch, bs: int, table_idx: torch.Tensor) -> None:
         """Copy this step's addressing into the static graph buffers and point the
         metadata at them (restage-per-replay, dsa precedent)."""
         md = batch.attn_metadata
-        rows = get_global_ctx().page_table.index_select(0, table_idx)
-        self._block_rows_buf[:bs].copy_(rows[:, :: self.block_size])
+        self._block_rows_buf[:bs].copy_(self._block_base_view().index_select(0, table_idx))
         self._kvlen_buf[:bs].copy_(md.kv_len_cpu.to(self.device, non_blocking=True))
         md.block_rows = self._block_rows_buf[:bs]
         md.kvlen = self._kvlen_buf[:bs]

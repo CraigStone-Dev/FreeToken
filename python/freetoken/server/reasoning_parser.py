@@ -420,6 +420,14 @@ class MiniMaxM3ReasoningParser(BaseReasoningParser):
     itself, and "disabled" pre-closes it (no reasoning). The tool block's
     namespaced opener ends reasoning when a (malformed) turn skips
     ``</mm:think>`` and runs straight into a tool call (dsv4 precedent).
+
+    Adaptive quirk (matches vLLM / llama.cpp): a NON-thinking adaptive turn
+    starts with a bare ``</mm:think>`` written by the model itself ("thinking
+    off for this turn"). Without special handling that literal marker would
+    stream into content on the DEFAULT gear's most common path, so a single
+    leading closer (position 0 only; later closers stay visible) is stripped in
+    both one-shot and streaming modes -- never when ``force_reasoning`` is set,
+    where the closer genuinely terminates the template-opened think block.
     """
 
     THINK_START = "<mm:think>"
@@ -433,6 +441,53 @@ class MiniMaxM3ReasoningParser(BaseReasoningParser):
             stream_reasoning=stream_reasoning,
             tool_start_token="]<]minimax[>[<tool_call>",
         )
+        # Streaming state for the leading-bare-closer check: hold the head of the
+        # stream while it is still a prefix of ``</mm:think>``.
+        self._leading_closer_pending = not force_reasoning
+        self._head_buffer = ""
+
+    def detect_and_parse(self, text: str) -> ReasoningParseResult:
+        if not self.force_reasoning and text.startswith(self.think_end_token):
+            text = text[len(self.think_end_token) :]
+            return ReasoningParseResult(normal_text=text.strip())
+        return super().detect_and_parse(text)
+
+    def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
+        if self._leading_closer_pending:
+            self._head_buffer += new_text
+            head = self._head_buffer
+            if head.startswith(self.think_end_token):
+                # Bare leading closer: strip it once, everything after is content.
+                self._leading_closer_pending = False
+                self._head_buffer = ""
+                self._in_reasoning = False
+                rest = head[len(self.think_end_token) :]
+                return (
+                    super().parse_streaming_increment(rest)
+                    if rest
+                    else ReasoningParseResult()
+                )
+            if self.think_end_token.startswith(head):
+                return ReasoningParseResult()  # still a prefix: keep holding
+            # Diverged: not a leading closer -- replay the held head as normal.
+            self._leading_closer_pending = False
+            self._head_buffer = ""
+            return super().parse_streaming_increment(head)
+        return super().parse_streaming_increment(new_text)
+
+    def flush(self) -> ReasoningParseResult:
+        if self._leading_closer_pending and self._head_buffer:
+            # Stream ended while the head was still a closer prefix (e.g. "</mm:t"):
+            # it was never a bare closer, replay it before the base flush.
+            head, self._head_buffer = self._head_buffer, ""
+            self._leading_closer_pending = False
+            first = super().parse_streaming_increment(head)
+            rest = super().flush()
+            return ReasoningParseResult(
+                reasoning_text=first.reasoning_text + rest.reasoning_text,
+                normal_text=first.normal_text + rest.normal_text,
+            )
+        return super().flush()
 
 
 class GemmaThoughtReasoningParser(BaseReasoningParser):

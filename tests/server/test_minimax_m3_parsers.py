@@ -229,6 +229,158 @@ def test_auto_selection_picks_minimax_m3():
     assert args.reasoning_parser == "minimax_m3"
 
 
+# ---------------------------------------------------------------------------
+# PR #110 review regressions
+# ---------------------------------------------------------------------------
+def test_reasoning_adaptive_leading_bare_closer_one_shot():
+    # Adaptive non-thinking turns START with a bare </mm:think> written by the
+    # model; it must never leak into content (position 0 only).
+    p = MiniMaxM3ReasoningParser(force_reasoning=False)
+    r = p.detect_and_parse("</mm:think>Here is the answer.")
+    assert r.reasoning_text == ""
+    assert r.normal_text == "Here is the answer."
+
+
+def test_reasoning_adaptive_leading_bare_closer_streaming_split():
+    p = MiniMaxM3ReasoningParser(force_reasoning=False)
+    normal = ""
+    for chunk in ["</mm:th", "ink>Hello,", " world!"]:
+        r = p.parse_streaming_increment(chunk)
+        assert r.reasoning_text == ""
+        normal += r.normal_text
+    normal += p.flush().normal_text
+    assert normal == "Hello, world!"
+
+
+def test_reasoning_later_closer_stays_visible():
+    # Only a position-0 closer is stripped; one appearing later is content.
+    p = MiniMaxM3ReasoningParser(force_reasoning=False)
+    r = p.detect_and_parse("The tag </mm:think> is literal here.")
+    assert "</mm:think>" in r.normal_text
+
+
+def test_reasoning_forced_mode_closer_not_stripped():
+    # thinking_mode=enabled: the template pre-opened the block, so a leading
+    # closer legitimately ends (empty) reasoning -- content follows.
+    p = MiniMaxM3ReasoningParser(force_reasoning=True)
+    r = p.detect_and_parse("</mm:think>answer")
+    assert r.reasoning_text == "" and r.normal_text == "answer"
+
+
+def test_reasoning_streaming_head_prefix_replayed_on_divergence():
+    p = MiniMaxM3ReasoningParser(force_reasoning=False)
+    out = p.parse_streaming_increment("</mm")  # closer prefix: held
+    assert out.normal_text == "" and out.reasoning_text == ""
+    out = p.parse_streaming_increment("ory says hi")  # diverges: replayed
+    assert out.normal_text == "</mmory says hi"
+
+
+def test_streaming_wire_order_trailing_text_defers():
+    # "text + block + trailing text" in ONE chunk: the trailing text must not be
+    # emitted in the same increment as (i.e. wire-ahead of) the tool call.
+    det = MiniMaxM3Detector()
+    chunk = (
+        "Before. "
+        + _block(f'{NS}<invoke name="get_weather">{NS}<city>Paris{NS}</city>{NS}</invoke>\n')
+        + " After."
+    )
+    r1 = det.parse_streaming_increment(chunk, _tools())
+    assert r1.normal_text == "Before. "
+    assert [c.name for c in r1.calls if c.name] == ["get_weather"]
+    r2 = det.parse_streaming_increment("", _tools())
+    assert r2.normal_text == " After." and r2.calls == []
+
+
+def test_streaming_second_block_in_same_chunk():
+    det = MiniMaxM3Detector()
+    one = _block(f'{NS}<invoke name="get_weather">{NS}<city>Paris{NS}</city>{NS}</invoke>\n')
+    two = _block(f'{NS}<invoke name="get_weather">{NS}<city>Tokyo{NS}</city>{NS}</invoke>\n')
+    calls = []
+    calls += det.parse_streaming_increment(one + two, _tools()).calls
+    calls += det.parse_streaming_increment("", _tools()).calls
+    args = [json.loads(c.parameters) for c in calls if c.name is None and c.parameters]
+    assert args == [{"city": "Paris"}, {"city": "Tokyo"}]
+
+
+def test_streaming_residue_after_close_holds_partial_marker():
+    # After a closed wrapper, a split second-block marker in the residue must be
+    # held (idle-path hold), never leaked as content.
+    det = MiniMaxM3Detector()
+    one = _block(f'{NS}<invoke name="get_weather">{NS}<city>Paris{NS}</city>{NS}</invoke>\n')
+    r1 = det.parse_streaming_increment(one + "]<]mini", _tools())
+    assert "]<]mini" not in r1.normal_text
+    r2 = det.parse_streaming_increment(
+        f'max[>[<tool_call>\n{NS}<invoke name="get_weather">{NS}<city>Rome{NS}</city>'
+        f"{NS}</invoke>\n{NS}</tool_call>",
+        _tools(),
+    )
+    frags = [c.parameters for c in r2.calls if c.name is None and c.parameters]
+    assert json.loads(frags[-1]) == {"city": "Rome"}
+
+
+def test_streaming_truncated_call_suppressed_and_recovered():
+    # Generation cut mid-invoke (max_tokens): finish_streaming must not leak the
+    # raw markup, and recover_truncated_call must salvage the complete params.
+    from freetoken.server.function_call_parser import FunctionCallParser
+
+    parser = FunctionCallParser(_tools(), "minimax_m3")
+    det = parser.detector
+    truncated = (
+        "Let me order. " + NS + "<tool_call>\n"
+        + f'{NS}<invoke name="create_order">{NS}<user_id>42{NS}</user_id>{NS}<note>hi'
+    )
+    normal = ""
+    for i in range(0, len(truncated), 11):
+        r = det.parse_streaming_increment(truncated[i : i + 11], _tools())
+        normal += r.normal_text
+        assert not r.calls
+    assert normal == "Let me order. "
+    # Serving order (generation.py): recover first (consumes the buffer on
+    # success), then finish_stream drains what's left.
+    recovered = parser.recover_truncated_call()
+    assert [c.name for c in recovered] == ["create_order"]
+    args = json.loads(recovered[0].parameters)
+    assert args["user_id"] == 42  # the complete param survives; truncated one dropped
+    assert det.finish_streaming() == ""  # raw markup never reaches the client
+
+
+def test_args_stray_text_keeps_parsed_params():
+    det = MiniMaxM3Detector()
+    body = f"{NS}<city>Paris{NS}</city>zzz-stray"
+    text = _block(f'{NS}<invoke name="get_weather">{body}{NS}</invoke>\n')
+    res = det.detect_and_parse(text, _tools())
+    assert json.loads(res.calls[0].parameters) == {"city": "Paris"}
+
+
+def test_args_empty_value_is_empty_string():
+    det = MiniMaxM3Detector()
+    text = _block(f'{NS}<invoke name="get_weather">{NS}<city>{NS}</city>{NS}</invoke>\n')
+    res = det.detect_and_parse(text, _tools())
+    assert json.loads(res.calls[0].parameters) == {"city": ""}
+
+
+def test_args_repeated_siblings_become_list():
+    det = MiniMaxM3Detector()
+    body = (
+        f"{NS}<items>{NS}<sku>a{NS}</sku>{NS}<sku>b{NS}</sku>{NS}</items>"
+        f"{NS}<note>x{NS}</note>{NS}<note>y{NS}</note>"
+    )
+    text = _block(f'{NS}<invoke name="create_order">{body}{NS}</invoke>\n')
+    res = det.detect_and_parse(text, _tools())
+    args = json.loads(res.calls[0].parameters)
+    assert args["items"] == ["a", "b"]  # same-name siblings aggregate
+    assert args["note"] == ["x", "y"]  # repeated top-level params too
+
+
+def test_detect_and_parse_multiple_wrappers_and_inter_block_text():
+    det = MiniMaxM3Detector()
+    one = _block(f'{NS}<invoke name="get_weather">{NS}<city>Paris{NS}</city>{NS}</invoke>\n')
+    two = _block(f'{NS}<invoke name="get_weather">{NS}<city>Rome{NS}</city>{NS}</invoke>\n')
+    res = det.detect_and_parse("A. " + one + " middle " + two + " B.", _tools())
+    assert [json.loads(c.parameters)["city"] for c in res.calls] == ["Paris", "Rome"]
+    assert "middle" in res.normal_text and "A." in res.normal_text and "B." in res.normal_text
+
+
 @pytest.mark.parametrize(
     "gear,mode", [("off", "disabled"), ("adaptive", "adaptive"), ("on", "enabled")]
 )

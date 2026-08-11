@@ -471,7 +471,8 @@ class OffloadMoELayer(MoELayer):
             # and are ignored by the plain *_and_mul activations.
             act_alpha = getattr(self, "hidden_act_alpha", 1.702)
             act_limit = getattr(self, "swiglu_limit", None)
-            act_limit = 7.0 if act_limit is None else act_limit
+            # None == "no clamp" everywhere else in the repo (mxfp4 maps it to +inf).
+            act_limit = float("inf") if act_limit is None else act_limit
             if is_prefill:
                 from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
 

@@ -640,7 +640,9 @@ def test_empty_arguments_call_emitted_exactly_once(tool, block):
 
 
 @pytest.mark.parametrize(
-    "family", ["qwen25", "qwen3_coder", "glm47", "gemma4", "minimax", "deepseekv32", "gpt_oss"]
+    "family",
+    ["qwen25", "qwen3_coder", "glm47", "gemma4", "minimax", "minimax_m3",
+     "deepseekv32", "gpt_oss"],
 )
 def test_call_then_trailing_text_in_one_chunk_keeps_order(family):
     # Worst case: the whole generation arrives as ONE chunk. Text after the call

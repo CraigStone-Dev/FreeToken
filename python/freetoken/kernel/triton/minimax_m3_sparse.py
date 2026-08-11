@@ -1,9 +1,8 @@
 """Triton kernels for MiniMax-M3 block-sparse GQA attention (indexer + attend).
 
 Ported from the vLLM reference implementation
-(``vllm/models/minimax_m3/common/ops/{index_topk,sparse_attn}.py``, vendored under
-``scratch/m3_ref/`` -- the semantics source of truth), adapted to FreeToken's
-storage model:
+(``vllm/models/minimax_m3/common/ops/{index_topk,sparse_attn}.py`` in the vLLM
+tree -- the semantics source of truth), adapted to FreeToken's storage model:
 
 * FreeToken's page table is page_size=1 semantics (one physical TOKEN row per
   column) and the allocator hands out page-aligned runs, so with page_size == the
@@ -156,7 +155,10 @@ def _index_block_score_kernel(
         base = tl.maximum(base, 0)
         pos = i + off_k
         # No masked load: pages are whole 128-row runs, so rows base..base+127
-        # exist; positions past seq_len are masked in qk below.
+        # exist, and the index-key slab is ZERO-INITIALIZED by BSAKVCache (unlike
+        # the K/V slabs) -- unwritten tail rows contribute a finite 0-dot that the
+        # qk causal mask below discards. If that zero-init invariant ever changes,
+        # this load (and the decode score kernel's) must gain a pos mask.
         k = tl.load(
             ik_ptr
             + (base + off_k[None, :]) * stride_ik_r
@@ -338,6 +340,9 @@ def _decode_index_score_kernel(
         base = tl.maximum(base, 0)
         pos = blk * BLOCK_SIZE_K + off_k
         pos_mask = pos[:, None] < kv_len
+        # No masked load: the index-key slab is ZERO-INITIALIZED by BSAKVCache
+        # (unlike the K/V slabs), so unwritten tail rows dot to a finite 0 that
+        # the pos_mask below discards. If that invariant changes, mask this load.
         k = tl.load(
             ik_ptr
             + (base + off_k[:, None]) * stride_ik_r
@@ -363,7 +368,7 @@ def _decode_index_score_kernel(
 # spec-decode query-length math (kv_len == seq_lens[req]).
 # ---------------------------------------------------------------------------
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
-@triton.jit(do_not_specialize=["chunk_blocks"])
+@triton.jit
 def _topk_index_partial_kernel(
     s_ptr,  # score: [num_idx_heads, num_reqs, max_block]
     ts_partial_ptr,  # partial scores out: [chunks, num_idx_heads, num_reqs, T]
@@ -371,7 +376,6 @@ def _topk_index_partial_kernel(
     seq_lens,  # [num_reqs]
     block_size: tl.constexpr,  # sparse block size (128)
     topk: tl.constexpr,
-    chunk_blocks,  # how many score-blocks each chunk owns
     stride_s_h, stride_s_b, stride_s_k,
     stride_ts_c, stride_ts_h, stride_ts_b, stride_ts_t,
     stride_ti_c, stride_ti_h, stride_ti_b, stride_ti_t,
@@ -386,6 +390,11 @@ def _topk_index_partial_kernel(
     kv_len = tl.maximum(tl.load(seq_lens + pid_b), 0)
     num_blocks = (kv_len + block_size - 1) // block_size
 
+    # Chunk split from the row's LIVE block count (not the staged table width, which
+    # would degenerate short contexts to a serial scan in chunk 0) -- device-read,
+    # so the captured graph's split tracks the live position.
+    num_chunks = tl.num_programs(2)
+    chunk_blocks = (num_blocks + num_chunks - 1) // num_chunks
     chunk_start = pid_chunk * chunk_blocks
     chunk_end = tl.minimum(chunk_start + chunk_blocks, num_blocks)
     chunk_actual = tl.maximum(chunk_end - chunk_start, 0)
@@ -633,12 +642,18 @@ def _gqa_sparse_fwd_kernel(
         pos = c + off_n
         # causal + in-sequence: the newest block is partially visible.
         pos_mask = (pos <= q_abs) & (pos < seq_len)
+        # K/V loads MUST be pos-masked (reference semantics): the pool slab is
+        # torch.empty, so the tail page's unwritten rows carry recycled-allocator
+        # garbage whose bf16 bit patterns include NaN/Inf -- an unmasked load
+        # poisons qk (-inf + NaN) or the p @ V dot (0 * NaN) and NaNs the whole
+        # output row. The forced local block visits the partial newest page on
+        # essentially every step, so this is a hot-path hazard, not a corner.
         k = tl.load(
             k_ptr
             + (base + off_n[None, :]) * stride_kr
             + pid_kh * stride_kh
             + off_d[:, None] * stride_kd,
-            mask=d_mask[:, None],
+            mask=d_mask[:, None] & pos_mask[None, :],
             other=0.0,
         )  # [D, N]
         qk = tl.dot(q, k) * sm_scale_log2e
@@ -654,7 +669,7 @@ def _gqa_sparse_fwd_kernel(
             + (base + off_n[:, None]) * stride_vr
             + pid_kh * stride_vh
             + off_d[None, :] * stride_vd,
-            mask=d_mask[None, :],
+            mask=pos_mask[:, None] & d_mask[None, :],
             other=0.0,
         )  # [N, D]
         acc_o += tl.dot(p.to(v.dtype), v)
@@ -756,12 +771,18 @@ def _gqa_sparse_decode_kernel(
         base = tl.maximum(base, 0)
         pos = c + off_n
         pos_mask = pos < kv_len
+        # K/V loads MUST be pos-masked (reference semantics): the pool slab is
+        # torch.empty and the forced local block reads the partial newest page
+        # every step -- unmasked tail rows (recycled-allocator NaN/Inf bit
+        # patterns, or merely huge finite values that overflow the fp32 dot)
+        # would poison qk / p @ V and NaN the whole output. With K masked, the
+        # additive -inf lanes stay -inf and p = exp2(-inf) = 0.
         k = tl.load(
             k_ptr
             + (base + off_n[None, :]) * stride_kr
             + pid_kh * stride_kh
             + off_d[:, None] * stride_kd,
-            mask=d_mask[:, None],
+            mask=d_mask[:, None] & pos_mask[None, :],
             other=0.0,
         )
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
@@ -776,7 +797,7 @@ def _gqa_sparse_decode_kernel(
             + (base + off_n[:, None]) * stride_vr
             + pid_kh * stride_vh
             + off_d[None, :] * stride_vd,
-            mask=d_mask[None, :],
+            mask=pos_mask[:, None] & d_mask[None, :],
             other=0.0,
         )
         acc_o += tl.dot(p.to(v.dtype), v)
@@ -965,7 +986,6 @@ def m3_index_decode(
     )
     num_topk_chunks = 1 << (topk_target.bit_length() - 1)
     block_size_t = triton.next_power_of_2(topk)
-    chunk_blocks = (max_blocks + num_topk_chunks - 1) // num_topk_chunks
     ts_partial = torch.empty(
         (num_topk_chunks, num_idx_heads, num_reqs, block_size_t),
         dtype=torch.float32, device=idx_q.device,
@@ -974,9 +994,11 @@ def m3_index_decode(
         (num_topk_chunks, num_idx_heads, num_reqs, block_size_t),
         dtype=torch.int32, device=idx_q.device,
     )
+    # The chunk split is computed in-kernel from each row's LIVE block count
+    # (device-read; the staged table width would serialize short contexts).
     _topk_index_partial_kernel[(num_reqs, num_idx_heads, num_topk_chunks)](
         score, ts_partial, ti_partial, seq_lens,
-        SPARSE_BLOCK_SIZE, topk, chunk_blocks,
+        SPARSE_BLOCK_SIZE, topk,
         score.stride(0), score.stride(1), score.stride(2),
         ts_partial.stride(0), ts_partial.stride(1), ts_partial.stride(2), ts_partial.stride(3),
         ti_partial.stride(0), ti_partial.stride(1), ti_partial.stride(2), ti_partial.stride(3),

@@ -1,7 +1,7 @@
 """Parity tests for the MiniMax-M3 block-sparse attention kernels.
 
 The pure-torch reference below implements the semantics pinned against the vLLM
-reference implementation (see ``scratch/m3_ref/`` and
+reference implementation (see the vLLM tree's ``vllm/models/minimax_m3/`` and
 ``kernel/triton/minimax_m3_sparse.py``'s module docstring):
 
 * per-index-head block scores: max over the block's 128 positions of
@@ -122,10 +122,21 @@ def make_layout(nblocks: int, seed: int = 0):
     return block_rows, total_pages
 
 
-def scatter_rows(x: torch.Tensor, block_rows: torch.Tensor, total_pages: int):
-    """Place logical rows [S, ...] into a physical slab [total_pages*BLK, ...]."""
+def scatter_rows(
+    x: torch.Tensor, block_rows: torch.Tensor, total_pages: int, fill: float = float("nan")
+):
+    """Place logical rows [S, ...] into a physical slab [total_pages*BLK, ...].
+
+    Unwritten rows default to NaN, modeling the serving pool's ``torch.empty``
+    recycled-allocator garbage: the attend kernels MUST pos-mask every K/V load
+    or the forced local (partial) block poisons the output -- zero-filled slabs
+    hid exactly that bug from the original tests. The index-key slab passes
+    ``fill=0.0`` (BSAKVCache zero-inits it; the score kernels rely on that).
+    """
     S = x.shape[0]
-    slab = torch.zeros(total_pages * BLK, *x.shape[1:], dtype=x.dtype, device=x.device)
+    slab = torch.full(
+        (total_pages * BLK, *x.shape[1:]), fill, dtype=x.dtype, device=x.device
+    )
     for b in range((S + BLK - 1) // BLK):
         n = min(BLK, S - b * BLK)
         base = int(block_rows[b])
@@ -142,8 +153,9 @@ TOPK, INIT, LOCAL = 4, 0, 1
 SCALE = D**-0.5
 
 
+@pytest.mark.parametrize("topk", [4, 16])
 @pytest.mark.parametrize("kv_len,q_len", [(BLK * 7 + 55, 300), (BLK * 2, BLK * 2), (90, 90)])
-def test_prefill_index_score_and_topk(kv_len: int, q_len: int):
+def test_prefill_index_score_and_topk(kv_len: int, q_len: int, topk: int):
     torch.manual_seed(0)
     prefix = kv_len - q_len
     nblocks = (kv_len + BLK - 1) // BLK
@@ -152,7 +164,7 @@ def test_prefill_index_score_and_topk(kv_len: int, q_len: int):
     q_pos = torch.arange(prefix, kv_len, device=DEV)
 
     block_rows, total_pages = make_layout(nblocks)
-    ik_slab = scatter_rows(ik, block_rows, total_pages)
+    ik_slab = scatter_rows(ik, block_rows, total_pages, fill=0.0)
 
     cu = torch.tensor([0, q_len], dtype=torch.int32, device=DEV)
     seq = torch.tensor([kv_len], dtype=torch.int32, device=DEV)
@@ -167,19 +179,20 @@ def test_prefill_index_score_and_topk(kv_len: int, q_len: int):
         want = ref[:, t, :nb]
         assert torch.allclose(got, want, atol=0.35, rtol=0.02), (t, (got - want).abs().max())
 
-    topk_idx = m3_index_topk_prefill(score, cu, pre, q_len, TOPK, INIT, LOCAL)
-    ref_sel = ref_select(ref, q_pos, TOPK, INIT, LOCAL)
+    topk_idx = m3_index_topk_prefill(score, cu, pre, q_len, topk, INIT, LOCAL)
+    ref_sel = ref_select(ref, q_pos, topk, INIT, LOCAL)
     for h in range(H_IDX):
         for t in range(q_len):
             nb = int(q_pos[t]) // BLK + 1
-            k = min(TOPK, nb)
+            k = min(topk, nb)
             got = topk_idx[h, t].tolist()
             assert set(got[:k]) == ref_sel[h][t], (h, t, got, ref_sel[h][t])
             assert all(i == -1 for i in got[k:]), (h, t, got)
 
 
+@pytest.mark.parametrize("topk", [4, 16])
 @pytest.mark.parametrize("kv_lens", [[BLK * 6 + 17, 70, BLK * 3]])
-def test_decode_index_topk(kv_lens: list[int]):
+def test_decode_index_topk(kv_lens: list[int], topk: int):
     torch.manual_seed(1)
     bs = len(kv_lens)
     max_nb = max((L + BLK - 1) // BLK for L in kv_lens)
@@ -201,17 +214,17 @@ def test_decode_index_topk(kv_lens: list[int]):
         ik = torch.randn(L, D_IDX, device=DEV, dtype=torch.bfloat16)
         iks.append(ik)
         br, pages = layouts[i]
-        sub = scatter_rows(ik, br, pages)
+        sub = scatter_rows(ik, br, pages, fill=0.0)
         slab[off * BLK : (off + pages) * BLK] = sub
         off += pages
     seq = torch.tensor(kv_lens, dtype=torch.int32, device=DEV)
-    topk_idx = m3_index_decode(iq, slab, block_rows, seq, max_nb, TOPK, INIT, LOCAL)
+    topk_idx = m3_index_decode(iq, slab, block_rows, seq, max_nb, topk, INIT, LOCAL)
     for i, L in enumerate(kv_lens):
         q_pos = torch.tensor([L - 1], device=DEV)
         ref = ref_block_scores(iq[i : i + 1], iks[i], q_pos)
-        sel = ref_select(ref, q_pos, TOPK, INIT, LOCAL)
+        sel = ref_select(ref, q_pos, topk, INIT, LOCAL)
         nb = (L + BLK - 1) // BLK
-        k = min(TOPK, nb)
+        k = min(topk, nb)
         for h in range(H_IDX):
             got = topk_idx[h, i].tolist()
             assert set(got[:k]) == sel[h][0], (i, h, got, sel[h][0])
@@ -232,14 +245,15 @@ def _attend_case(kv_len: int, q_len: int, seed: int):
     return q, k, v, iq, ik, q_pos, block_rows, total_pages, nblocks, prefix
 
 
+@pytest.mark.parametrize("topk", [4, 16])
 @pytest.mark.parametrize("kv_len,q_len", [(BLK * 7 + 55, 200), (BLK * 2, BLK * 2), (77, 77)])
-def test_prefill_attend(kv_len: int, q_len: int):
+def test_prefill_attend(kv_len: int, q_len: int, topk: int):
     q, k, v, iq, ik, q_pos, block_rows, total_pages, nblocks, prefix = _attend_case(
         kv_len, q_len, seed=2
     )
     k_slab = scatter_rows(k, block_rows, total_pages)
     v_slab = scatter_rows(v, block_rows, total_pages)
-    ik_slab = scatter_rows(ik, block_rows, total_pages)
+    ik_slab = scatter_rows(ik, block_rows, total_pages, fill=0.0)
 
     cu = torch.tensor([0, q_len], dtype=torch.int32, device=DEV)
     seq = torch.tensor([kv_len], dtype=torch.int32, device=DEV)
@@ -247,7 +261,7 @@ def test_prefill_attend(kv_len: int, q_len: int):
     score = m3_index_score_prefill(
         iq, ik_slab, block_rows.view(1, -1), cu, seq, pre, q_len, kv_len
     )
-    topk_idx = m3_index_topk_prefill(score, cu, pre, q_len, TOPK, INIT, LOCAL)
+    topk_idx = m3_index_topk_prefill(score, cu, pre, q_len, topk, INIT, LOCAL)
 
     out = torch.empty_like(q)
     m3_sparse_attn_prefill(
@@ -256,7 +270,7 @@ def test_prefill_attend(kv_len: int, q_len: int):
     )
 
     ref_scores = ref_block_scores(iq, ik, q_pos)
-    sel = ref_select(ref_scores, q_pos, TOPK, INIT, LOCAL)
+    sel = ref_select(ref_scores, q_pos, topk, INIT, LOCAL)
     ref = ref_sparse_attend(q, k, v, sel, q_pos, SCALE)
     err = (out.float() - ref).abs().max().item()
     assert err < 3e-2, err
@@ -271,7 +285,7 @@ def test_prefill_attend_equals_dense_when_topk_covers():
     )
     k_slab = scatter_rows(k, block_rows, total_pages)
     v_slab = scatter_rows(v, block_rows, total_pages)
-    ik_slab = scatter_rows(ik, block_rows, total_pages)
+    ik_slab = scatter_rows(ik, block_rows, total_pages, fill=0.0)
     cu = torch.tensor([0, q_len], dtype=torch.int32, device=DEV)
     seq = torch.tensor([kv_len], dtype=torch.int32, device=DEV)
     pre = torch.tensor([prefix], dtype=torch.int32, device=DEV)
@@ -297,8 +311,9 @@ def test_prefill_attend_equals_dense_when_topk_covers():
     assert err < 3e-2, err
 
 
+@pytest.mark.parametrize("topk", [4, 16])
 @pytest.mark.parametrize("kv_lens", [[BLK * 6 + 17, 70, BLK * 3, BLK * 9]])
-def test_decode_attend(kv_lens: list[int]):
+def test_decode_attend(kv_lens: list[int], topk: int):
     torch.manual_seed(4)
     bs = len(kv_lens)
     max_nb = max((L + BLK - 1) // BLK for L in kv_lens)
@@ -313,8 +328,10 @@ def test_decode_attend(kv_lens: list[int]):
         layouts.append((br, pages))
         block_rows[i, :nb] = br + total * BLK
         total += pages
-    k_slab = torch.zeros(total * BLK, KVH, D, device=DEV, dtype=torch.bfloat16)
-    v_slab = torch.zeros_like(k_slab)
+    # K/V gaps carry NaN (the serving pool is torch.empty; the kernels must
+    # pos-mask); the index slab stays zeroed (BSAKVCache invariant).
+    k_slab = torch.full((total * BLK, KVH, D), float("nan"), device=DEV, dtype=torch.bfloat16)
+    v_slab = torch.full_like(k_slab, float("nan"))
     ik_slab = torch.zeros(total * BLK, D_IDX, device=DEV, dtype=torch.bfloat16)
     ks, vs, iks = [], [], []
     off = 0
@@ -326,17 +343,17 @@ def test_decode_attend(kv_lens: list[int]):
         br, pages = layouts[i]
         k_slab[off * BLK : (off + pages) * BLK] = scatter_rows(kk, br, pages)
         v_slab[off * BLK : (off + pages) * BLK] = scatter_rows(vv, br, pages)
-        ik_slab[off * BLK : (off + pages) * BLK] = scatter_rows(ik, br, pages)
+        ik_slab[off * BLK : (off + pages) * BLK] = scatter_rows(ik, br, pages, fill=0.0)
         off += pages
     seq = torch.tensor(kv_lens, dtype=torch.int32, device=DEV)
-    topk_idx = m3_index_decode(iq, ik_slab, block_rows, seq, max_nb, TOPK, INIT, LOCAL)
+    topk_idx = m3_index_decode(iq, ik_slab, block_rows, seq, max_nb, topk, INIT, LOCAL)
     out = torch.empty_like(q)
     m3_sparse_attn_decode(q, k_slab, v_slab, topk_idx, block_rows, seq, SCALE, out)
 
     for i, L in enumerate(kv_lens):
         q_pos = torch.tensor([L - 1], device=DEV)
         ref_scores = ref_block_scores(iq[i : i + 1], iks[i], q_pos)
-        sel = ref_select(ref_scores, q_pos, TOPK, INIT, LOCAL)
+        sel = ref_select(ref_scores, q_pos, topk, INIT, LOCAL)
         ref = ref_sparse_attend(q[i : i + 1], ks[i], vs[i], sel, q_pos, SCALE)
         err = (out[i].float() - ref[0]).abs().max().item()
         assert err < 3e-2, (i, err)

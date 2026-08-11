@@ -255,10 +255,12 @@ def _make_dummy_weight_state_dict(
             state_dict[key] = t
         elif param.dtype.is_floating_point or param.dtype.is_complex:
             state_dict[key] = torch.randn(param.shape, dtype=param.dtype, device=device)
-        elif param.dtype == torch.uint8:
-            # uint8 buffers are packed/quantization codes (MXFP8 e8m0 scale codes,
-            # NVFP4 nibbles). 127 is e8m0 for 1.0 and a benign FP4 nibble pair;
-            # zeros would collapse every MXFP8 scale to 2^-127 and zero the model.
+        elif param.dtype == torch.uint8 and key.endswith("weight_scale_inv"):
+            # MXFP8 e8m0 exponent codes: 127 encodes scale 1.0; zeros would collapse
+            # every scale to 2^-127 and zero the model. Scoped BY NAME: other uint8
+            # buffers are packed payloads whose bytes mean something else entirely
+            # (GGUF qweight blocks embed fp16 scales -- 0x7F7F is fp16 NaN), so they
+            # keep the benign all-zeros fill below.
             state_dict[key] = torch.full(param.shape, 127, dtype=param.dtype, device=device)
         else:
             state_dict[key] = torch.zeros(param.shape, dtype=param.dtype, device=device)
@@ -1189,10 +1191,15 @@ def _adjust_config(config: EngineConfig):
         and not _cpu_moe_act_ok
         and (config.moe_backend in ("cpu", "hybrid") or config.moe_cpu_layers)
     ):
+        asked = (
+            f"--moe-cpu-layers={config.moe_cpu_layers!r}"
+            if config.moe_backend not in ("cpu", "hybrid")
+            else f"--moe-backend {config.moe_backend!r}"
+        )
         raise ValueError(
-            f"--moe-backend {config.moe_backend!r}: the CPU MoE executor does not support "
-            f"this model's expert activation {getattr(model_config, 'hidden_act', None)!r}; "
-            "use --moe-backend offload (GPU-side dequant) instead."
+            f"{asked}: the CPU MoE executor does not support this model's expert "
+            f"activation {getattr(model_config, 'hidden_act', None)!r}; drop the flag "
+            "and let every layer decode on the GPU offload path instead."
         )
 
     if is_moe and config.moe_backend == "auto":

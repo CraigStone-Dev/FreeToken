@@ -50,6 +50,14 @@ class BSAKVCache(MHAKVCache):
         self._index_head_dim = index_head_dim
         self._num_index_layers = num_index_layers
         self._page_size = page_size
+        # Index keys ride the compute dtype (bf16/fp16 -- the model's index_q/index_k
+        # are engine-dtype and store_index_k's index_put_ raises on a mismatch). The
+        # KV cost model budgets 2 bytes/token/index-layer for this slab
+        # (base.spec_kv_bytes_per_token); keep the two in lockstep.
+        assert dtype.itemsize == 2, (
+            f"BSA index slab budgets 2 bytes/token (spec_kv_bytes_per_token); got {dtype}"
+        )
+        self._index_dtype = dtype
         super().__init__(
             num_kv_heads=num_kv_heads,
             num_layers=num_layers,
@@ -60,26 +68,44 @@ class BSAKVCache(MHAKVCache):
             device=device,
             layer_ids=layer_ids,
         )
+        self._zero_kv_slabs()
         self._alloc_index_slab(num_pages)
 
+    def _zero_kv_slabs(self) -> None:
+        # Defense-in-depth: the attend kernels pos-mask every K/V load (the real
+        # fix for torch.empty's recycled NaN/Inf bit patterns), but a zeroed slab
+        # keeps any future unmasked read finite instead of model-poisoning. One
+        # memset per (re)allocation -- negligible.
+        self._kv_buffer.zero_()
+
     def _alloc_index_slab(self, num_pages: int) -> None:
-        # bf16 == the 2 bytes/token/index-layer the KV cost model budgets for this slab
-        # (base.spec_kv_bytes_per_token); keep the two in lockstep.
+        # ZERO-initialized -- the index-score kernels load index keys unmasked and
+        # rely on unwritten tail rows dotting to a finite 0 (see the invariant
+        # comments in kernel/triton/minimax_m3_sparse.py).
         self._index_k_buffer = torch.zeros(
             self._num_index_layers,
             num_pages * self._page_size,
             self._index_head_dim,
-            dtype=torch.bfloat16,
+            dtype=self._index_dtype,
             device=self._device,
         )
 
     def rebuild(self, num_pages: int) -> None:
         # Free the index slab BEFORE the K/V realloc (super().rebuild frees + syncs +
-        # empty_cache), then re-derive it at the new page count: both slabs resize in
-        # one step so a failed realloc can never leave them disagreeing on row count.
+        # empty_cache), then re-derive it at the new page count. If the index-slab
+        # alloc itself fails (OOM), null the K/V slab too and re-raise: a pool with a
+        # grown K/V slab and no index slab would mis-serve silently, and the engine's
+        # rebuild path pre-validates the budget so this is already exceptional.
         self._index_k_buffer = None
         super().rebuild(num_pages)
-        self._alloc_index_slab(num_pages)
+        self._zero_kv_slabs()
+        try:
+            self._alloc_index_slab(num_pages)
+        except Exception:
+            self._kv_buffer = None
+            self._k_buffer = None
+            self._v_buffer = None
+            raise
 
     def unit_bytes(self) -> tuple[int, int]:
         # The index slab rides the same token budget as the K/V slabs; each slab's

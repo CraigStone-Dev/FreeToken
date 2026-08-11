@@ -43,6 +43,21 @@ def _text_config(hf_config: Any) -> Any:
     return getattr(hf_config, "text_config", None) or hf_config
 
 
+# House rule: an env switch that changes WHAT IS SERVED must leave a server-log
+# trace. parse_config runs a few times per process (engine + weight loader), so
+# each resolved-mode line is logged once per distinct value.
+_LOGGED_MODES: set = set()
+
+
+def _log_mode_once(key: str, message: str) -> None:
+    if key in _LOGGED_MODES:
+        return
+    _LOGGED_MODES.add(key)
+    from freetoken.utils import init_logger
+
+    init_logger(__name__).info(message)
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     text = _text_config(hf_config)
 
@@ -53,8 +68,21 @@ def parse_config(hf_config: Any) -> ModelConfig:
     _cap = os.environ.get("FREETOKEN_M3_MAX_LAYERS")
     if _cap:
         num_layers = min(num_layers, int(_cap))
+        _log_mode_once(
+            f"cap={num_layers}",
+            f"FREETOKEN_M3_MAX_LAYERS: serving a TRUNCATED model "
+            f"({num_layers}/{text.num_hidden_layers} layers) -- dev/testing only, "
+            "outputs are garbage; unset the env for real serving.",
+        )
 
     sparse_enabled = os.getenv("FREETOKEN_M3_SPARSE", "1") != "0"
+    if not sparse_enabled:
+        _log_mode_once(
+            "sparse=0",
+            "FREETOKEN_M3_SPARSE=0: serving the DENSE-attention ablation (plain "
+            "MHA pool, no indexer; different math and outputs from the shipped "
+            "block-sparse model).",
+        )
     args = load_args(text, num_layers, sparse_enabled=sparse_enabled)
 
     # W8A16 MXFP8 (the checkpoint's native dense quantization) for the resident
@@ -62,9 +90,17 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # expert cache. =0 dequantizes to bf16 at load (bring-up / ablation). Read at
     # PARSE time so the resolved config is the single record of the served weights
     # -- an FTW checkpoint converted under one setting must be served under the
-    # same one (see weight.py).
+    # same one (see weight.py) -- and logged HERE so the FTW serve path (which
+    # never runs iter_weights) still leaves a serve-time record of the modes.
     attn_mxfp8 = os.getenv("FREETOKEN_M3_ATTN_MXFP8", "1") != "0"
     mlp_mxfp8 = os.getenv("FREETOKEN_M3_MLP_MXFP8", "1") != "0"
+    _log_mode_once(
+        f"quant={attn_mxfp8}/{mlp_mxfp8}",
+        f"MiniMax-M3 resident quant: attn={'mxfp8' if attn_mxfp8 else 'none'} "
+        f"dense={'mxfp8' if mlp_mxfp8 else 'none'} lm_head=none "
+        "(FREETOKEN_M3_ATTN_MXFP8/FREETOKEN_M3_MLP_MXFP8; an FTW checkpoint "
+        "converted under one setting must be served under the same one).",
+    )
 
     # Leading dense-FFN layers: M3's moe_layer_freq is a contiguous 0-prefix; the
     # offload cache and the generic num_moe_layers arithmetic rely on that shape.

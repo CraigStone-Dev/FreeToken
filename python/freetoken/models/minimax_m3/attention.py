@@ -26,7 +26,7 @@ from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
 
-from .mlp import _make_proj
+from .mlp import make_proj
 
 if TYPE_CHECKING:
     import torch
@@ -46,10 +46,10 @@ class MiniMaxM3Attention(BaseOP):
         self.kv_attn_dim = self.num_kv_heads * self.head_dim
 
         quant = config.attn_quant
-        self.qkv_proj = _make_proj(
+        self.qkv_proj = make_proj(
             quant, args.hidden_size, self.qo_attn_dim + 2 * self.kv_attn_dim
         )
-        self.o_proj = _make_proj(quant, self.qo_attn_dim, args.hidden_size)
+        self.o_proj = make_proj(quant, self.qo_attn_dim, args.hidden_size)
 
         # Per-head Gemma (1+w) q/k norms (qk_norm_type == "per_head").
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=args.norm_eps)
@@ -70,7 +70,7 @@ class MiniMaxM3Attention(BaseOP):
             self.index_dim = args.index_dim
             self.index_q_dim = self.num_index_heads * self.index_dim
             # Merged [index_q | index_k] projection (one shared index KEY head).
-            self.index_qk_proj = _make_proj(
+            self.index_qk_proj = make_proj(
                 quant, args.hidden_size, self.index_q_dim + self.index_dim
             )
             self.index_q_norm = GemmaPlusOneRMSNorm(self.index_dim, eps=args.norm_eps)
