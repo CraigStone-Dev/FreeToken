@@ -66,8 +66,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # + 2 MoE layers) so the forward path / KV / offload cache can be exercised without
     # pinning the full ~230 GB of experts. Unset in normal use (GLM-5.2 precedent).
     _cap = os.environ.get("FREETOKEN_M3_MAX_LAYERS")
-    if _cap:
-        num_layers = min(num_layers, int(_cap))
+    if _cap and int(_cap) < num_layers:  # a cap >= the real count changes nothing
+        num_layers = int(_cap)
         _log_mode_once(
             f"cap={num_layers}",
             f"FREETOKEN_M3_MAX_LAYERS: serving a TRUNCATED model "
@@ -125,6 +125,17 @@ def parse_config(hf_config: Any) -> ModelConfig:
     quant = getattr(hf_config, "quantization_config", None)
     expert_quant = "nvfp4" if quant is not None else "none"
 
+    # The activation is model-constant swigluoai: assert instead of consume.
+    # Raw checkpoints declare "swigluoai"; transformers >= 5's native TextConfig
+    # force-normalizes hidden_act to "silu" (its module computes the gate inline
+    # from swiglu_alpha/limit) -- consuming THAT would let select_nvfp4_backend
+    # pick a silu-only kernel and fail its activation assert after the full
+    # checkpoint load.
+    declared_act = getattr(text, "hidden_act", "swigluoai")
+    assert declared_act in ("swigluoai", "silu"), (
+        f"MiniMax-M3 support implements swigluoai only, got hidden_act={declared_act!r}"
+    )
+
     return ModelConfig(
         num_layers=num_layers,
         num_qo_heads=args.num_heads,
@@ -133,7 +144,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         hidden_size=args.hidden_size,
         vocab_size=text.vocab_size,
         intermediate_size=args.dense_intermediate_size,
-        hidden_act=text.hidden_act,  # "swigluoai"
+        hidden_act="swigluoai",  # pinned; see the declared_act assert above
         rms_norm_eps=text.rms_norm_eps,
         tie_word_embeddings=bool(getattr(text, "tie_word_embeddings", False)),
         rotary_config=rotary_config,

@@ -16,12 +16,12 @@ broadcast in registers -- a per-(n,k)-element scale gather + exp2 costs ~3x the
 whole GEMV (PR#110 review: 424-768 GB/s vs ~2 TB/s for the same-structure
 per-tensor-fp8 kernel).
 
-Prefill / batched forward (M > 1) does NOT use a custom GEMM: it dequantizes the
-weight to bf16 (``fp8 * 2**k`` is exact in bf16) and runs cuBLAS, the same
-dequant-then-matmul precedent as the NVFP4 prefill path. The materialized weight is
-a per-call transient; a fused inline-dequant GEMM never came within 30x of cuBLAS
-on these shapes (PR#110 review), so the transient's extra HBM round-trip is the
-fast option by a wide margin.
+Prefill / batched forward past the GEMV cap (M > 256) does NOT use a custom GEMM:
+it dequantizes the weight to bf16 (``fp8 * 2**k`` is exact in bf16) and runs
+cuBLAS, the same dequant-then-matmul precedent as the NVFP4 prefill path. The
+materialized weight is a per-call bf16 transient; a fused inline-dequant GEMM
+never came within 30x of cuBLAS on these shapes (PR#110 review), so the
+transient's extra HBM round-trip is the fast option by a wide margin.
 
 Numerics: the GEMV dequants fp8->f32 with the pow2 scale in fp32 and accumulates in
 fp32; the M>1 path multiplies in bf16 via cuBLAS with fp32 accumulate (identical to
@@ -44,8 +44,16 @@ MXFP8_BLOCK = 32
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
 # Escape hatch: FREETOKEN_DEBUG_MXFP8_REF=1 swaps the kernels for a pure-torch
-# dequant matmul (numeric reference / A-B debugging). Evaluated once.
+# dequant matmul (numeric reference / A-B debugging). Evaluated once, and logged:
+# an env switch that changes what is served must leave a server-log trace.
 _USE_REF = os.environ.get("FREETOKEN_DEBUG_MXFP8_REF") == "1"
+if _USE_REF:
+    from freetoken.utils import init_logger
+
+    init_logger(__name__).info(
+        "FREETOKEN_DEBUG_MXFP8_REF=1: MXFP8 linears serve the pure-torch fp32 "
+        "dequant reference (slow; debugging only)."
+    )
 
 
 def mxfp8_dequant(weight: torch.Tensor, scale_codes: torch.Tensor,
@@ -56,29 +64,42 @@ def mxfp8_dequant(weight: torch.Tensor, scale_codes: torch.Tensor,
     (``FREETOKEN_M3_*_MXFP8=0``) and the kernels' numeric reference in tests.
     ``weight`` ``[..., N, K]`` fp8-e4m3; ``scale_codes`` ``[..., N, K//32]`` uint8
     e8m0 exponent codes.
+
+    For 16-bit ``dtype`` the whole computation runs in ``dtype``: fp8->bf16 is
+    exact and the pow2 descale is lossless (same argument the GEMV dot kernel
+    relies on when folding the scale before ``tl.dot``), and the fp32 transients
+    would double the peak footprint -- which matters when this runs inside a CUDA
+    graph capture (the transient lands in the shared graph pool). fp32 ``dtype``
+    keeps fp32 compute: it is the numeric REFERENCE in tests.
     """
     assert weight.shape[-1] % MXFP8_BLOCK == 0
     assert scale_codes.shape[-1] == weight.shape[-1] // MXFP8_BLOCK
-    descale = torch.exp2(scale_codes.to(torch.float32) - 127.0)
-    w = weight.to(torch.float32).view(*weight.shape[:-1], -1, MXFP8_BLOCK)
+    compute = torch.float32 if dtype == torch.float32 else dtype
+    descale = torch.exp2(scale_codes.to(torch.float32) - 127.0).to(compute)
+    w = weight.to(compute).view(*weight.shape[:-1], -1, MXFP8_BLOCK)
     return (w * descale.unsqueeze(-1)).view(weight.shape).to(dtype)
 
 
 # ======================================================================================
-# Small-M (<= 64) split-K GEMV: weight-bandwidth bound, so a small batch rides the
-# SAME single weight pass -- one [M_TILE, BLOCK_K] activation tile joins the fp8
-# tile in a tensor-core dot (the pow2-descaled fp8 weight is bf16-exact). Without
-# this, bs=2-8 decode fell into the M>1 dequant+cuBLAS path, which materializes
-# the whole bf16 weight per projection per step (~13x slower), and short
-# extend-prefills (a radix-cached chat turn appending 20-60 tokens) paid the same
-# transient on every projection of the step. The e8m0 scale is loaded once per
-# (BLOCK_N, BLOCK_K//32) tile and broadcast in registers -- a per-(n,k)-element
-# gather + exp2 costs ~3x the whole GEMV.
+# Small-M (<= 256) split-K GEMV: weight-bandwidth bound, so a small batch rides
+# the SAME single weight pass -- one [M_TILE, BLOCK_K] activation tile joins the
+# fp8 tile in a tensor-core dot (the pow2-descaled fp8 weight is bf16-exact).
+# Without this, bs=2-8 decode fell into the M>1 dequant+cuBLAS path, which
+# materializes the whole bf16 weight per projection per step (~13x slower), and
+# short extend-prefills (a radix-cached chat turn appending 20-60 tokens) paid
+# the same transient on every projection of the step. The e8m0 scale is loaded
+# once per (BLOCK_N, BLOCK_K//32) tile and broadcast in registers -- a
+# per-(n,k)-element gather + exp2 costs ~3x the whole GEMV.
 # ======================================================================================
-# Above this, dequant + cuBLAS wins (the bf16 transient amortizes over enough
-# rows). At the boundary the transient path is ~10-20x slower per call, so the
-# cap errs high: M_TILE buckets {16, 32, 64} keep tl.dot register tiles bounded.
-_GEMV_MAX_M = 64
+# The cap covers the default CUDA-graph ladder max (256): every captured decode
+# batch must take the GEMV, because a captured dequant+cuBLAS call would bake
+# its full-weight transient into the shared graph pool (~2 GiB across the
+# resident projection shapes) AND is the slower path everywhere in graph range
+# (RTX PRO 6000: M=128 GEMV 230us vs 933us; H100: M=128 376us vs 1404us).
+# M_TILE buckets {16..256}; 512 exceeds sm_120's 100 KiB shared-memory budget,
+# and past the ladder only prefill lands here, where cuBLAS amortizes the
+# (now bf16, halved) transient.
+_GEMV_MAX_M = 256
 
 
 @triton.jit
@@ -258,7 +279,7 @@ def mxfp8_linear(
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``y = x @ dequant(weight, scale_codes)^T``. Small batches
-    (M <= 64) -> split-K GEMV (one pass over the fp8 weight); larger M -> bf16
+    (M <= 256) -> split-K GEMV (one pass over the fp8 weight); larger M -> bf16
     dequant + cuBLAS (see the module docstring). ``weight`` [N, K] fp8-e4m3;
     ``scale_codes`` [N, K//32] uint8 e8m0 exponent codes (dequant multiplier
     ``2**(code - 127)``)."""

@@ -231,9 +231,13 @@ def test_stale_extension_rejected_for_swigluoai(monkeypatch):
     probes the extension's `max_generic_act_id` marker -- absent on stale builds
     -- and must fail loudly with the rebuild instruction instead."""
     from freetoken.kernel import _cpu_moe
-    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.cpu_executor import CpuMoeExecutor, compiled_extension_supports
 
-    monkeypatch.delattr(_cpu_moe, "max_generic_act_id")
+    # raising=False: on a GENUINELY stale extension the attribute is already
+    # absent, and this test must still run (it is the test for that case).
+    monkeypatch.delattr(_cpu_moe, "max_generic_act_id", raising=False)
+    assert not compiled_extension_supports("swigluoai")
+    assert compiled_extension_supports("silu")  # silu family predates the marker
     cache = _make_nvfp4_cache(1, 4, 256, 128)
     with pytest.raises(RuntimeError, match="rebuild"):
         CpuMoeExecutor(

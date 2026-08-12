@@ -79,6 +79,58 @@ def _hf_config(num_layers: int = 60) -> _Cfg:
     )
 
 
+def _hf_config_native(num_layers: int = 60) -> _Cfg:
+    """The transformers >= 5 NATIVE minimax_m3_vl TextConfig shape: __post_init__
+    pops rope_theta into rope_parameters, sparse_attention_config/moe_layer_freq
+    into flat index_* keys + layer_types/mlp_layer_types, and force-sets
+    hidden_act to "silu". parse_config must resolve both shapes identically
+    (verified empirically against transformers 5.14's class)."""
+    cfg = _hf_config(num_layers)
+    text = cfg.text_config
+    dense = min(3, num_layers)
+    delattr(text, "rope_theta")
+    text.rope_parameters = {
+        "rope_theta": 5000000,
+        "partial_rotary_factor": 0.5,
+        "rope_type": "default",
+    }
+    text.hidden_act = "silu"
+    delattr(text, "sparse_attention_config")
+    text.layer_types = ["full_attention"] * dense + ["minimax_m3_sparse"] * (
+        num_layers - dense
+    )
+    text.index_n_heads = 4
+    text.index_head_dim = 128
+    text.index_block_size = 128
+    text.index_topk_blocks = 16
+    text.index_local_blocks = 1
+    delattr(text, "moe_layer_freq")
+    text.mlp_layer_types = ["dense"] * dense + ["sparse"] * (num_layers - dense)
+    return cfg
+
+
+def test_parse_config_native_shape_matches_raw(monkeypatch):
+    """PR#110 round-2: the native shape silently produced rope base 10000,
+    use_sparse=False and hidden_act='silu' -- all three load-bearing reads must
+    resolve identically to the raw-dict shape."""
+    monkeypatch.delenv("FREETOKEN_M3_MAX_LAYERS", raising=False)
+    monkeypatch.delenv("FREETOKEN_M3_SPARSE", raising=False)
+    raw = parse_config(_hf_config())
+    native = parse_config(_hf_config_native())
+
+    assert native.rotary_config.base == raw.rotary_config.base == 5000000.0
+    assert native.hidden_act == raw.hidden_act == "swigluoai"
+    assert native.first_k_dense_replace == raw.first_k_dense_replace == 3
+    a, b = native.m3_args, raw.m3_args
+    assert a.use_sparse and a.sparse_layer_ids == b.sparse_layer_ids
+    assert a.moe_layer_ids == b.moe_layer_ids
+    assert (a.index_dim, a.num_index_heads, a.topk_blocks, a.block_size) == (
+        b.index_dim, b.num_index_heads, b.topk_blocks, b.block_size,
+    )
+    assert (a.init_blocks, a.local_blocks) == (b.init_blocks, b.local_blocks)
+    assert (a.rope_theta, a.rotary_dim) == (b.rope_theta, b.rotary_dim)
+
+
 def test_parse_config_full_model(monkeypatch):
     monkeypatch.delenv("FREETOKEN_M3_MAX_LAYERS", raising=False)
     monkeypatch.delenv("FREETOKEN_M3_SPARSE", raising=False)

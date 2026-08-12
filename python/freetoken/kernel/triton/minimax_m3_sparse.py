@@ -634,6 +634,10 @@ def _gqa_sparse_fwd_kernel(
     lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
     for _ in range(real_topk):
+        # `blk` is trusted in-range: selection writes exactly `real_topk` real
+        # entries (the forced local block guarantees >= 1). A -1 padding slot
+        # here would OOB-read br_row one element low BEFORE the base clamp --
+        # preserve that selection invariant when editing the top-k kernel.
         blk = tl.load(t_ptr_j).to(tl.int32)
         t_ptr_j = t_ptr_j + stride_tk
         c = blk * BLOCK_SIZE_K
@@ -642,12 +646,13 @@ def _gqa_sparse_fwd_kernel(
         pos = c + off_n
         # causal + in-sequence: the newest block is partially visible.
         pos_mask = (pos <= q_abs) & (pos < seq_len)
-        # K/V loads MUST be pos-masked (reference semantics): the pool slab is
-        # torch.empty, so the tail page's unwritten rows carry recycled-allocator
-        # garbage whose bf16 bit patterns include NaN/Inf -- an unmasked load
-        # poisons qk (-inf + NaN) or the p @ V dot (0 * NaN) and NaNs the whole
-        # output row. The forced local block visits the partial newest page on
-        # essentially every step, so this is a hot-path hazard, not a corner.
+        # K/V loads MUST be pos-masked (reference semantics): the masks are the
+        # correctness CONTRACT for the tail page's unwritten rows -- unmasked,
+        # they would poison qk (-inf + NaN) or the p @ V dot (0 * NaN) and NaN
+        # the whole output row, and the forced local block visits the partial
+        # newest page on essentially every step. BSAKVCache's zero-init of the
+        # slab is defense-in-depth on top, NOT a substitute (recycled pages are
+        # re-dirtied by earlier sequences).
         k = tl.load(
             k_ptr
             + (base + off_n[None, :]) * stride_kr
@@ -764,6 +769,8 @@ def _gqa_sparse_decode_kernel(
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
     for _ in tl.range(chunk_start_topk, chunk_end_topk):
+        # `blk` is trusted in-range (selection invariant; see the sequential
+        # attend kernel): a -1 padding slot would OOB-read br_row pre-clamp.
         blk = tl.load(cur_idx_ptr).to(tl.int32)
         cur_idx_ptr = cur_idx_ptr + stride_tk
         c = blk * BLOCK_SIZE_K
@@ -771,12 +778,13 @@ def _gqa_sparse_decode_kernel(
         base = tl.maximum(base, 0)
         pos = c + off_n
         pos_mask = pos < kv_len
-        # K/V loads MUST be pos-masked (reference semantics): the pool slab is
-        # torch.empty and the forced local block reads the partial newest page
-        # every step -- unmasked tail rows (recycled-allocator NaN/Inf bit
-        # patterns, or merely huge finite values that overflow the fp32 dot)
+        # K/V loads MUST be pos-masked (reference semantics): the masks are the
+        # correctness CONTRACT for the tail page's unwritten rows (the forced
+        # local block reads the partial newest page every step) -- unmasked rows
         # would poison qk / p @ V and NaN the whole output. With K masked, the
-        # additive -inf lanes stay -inf and p = exp2(-inf) = 0.
+        # additive -inf lanes stay -inf and p = exp2(-inf) = 0. BSAKVCache's
+        # zero-init is defense-in-depth on top, NOT a substitute (recycled pages
+        # are re-dirtied by earlier sequences).
         k = tl.load(
             k_ptr
             + (base + off_n[None, :]) * stride_kr

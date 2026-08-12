@@ -38,7 +38,9 @@ class MiniMaxM3SparseMoeBlock(BaseOP):
 
         # Router weights kept fp32 (vLLM stores them fp32 too): both the gate and
         # the bias sit on the top-4 selection boundary, where a bf16 round can
-        # flip near-tie picks away from the reference. ~3 MB total for 57 layers.
+        # flip near-tie picks away from the reference. 128 x 6144 x 4 B = ~3.1 MB
+        # per layer, ~180 MB across the 57 MoE layers -- accepted for selection
+        # fidelity.
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.gate.weight = torch.empty(
             config.num_experts, config.hidden_size, dtype=torch.float32

@@ -81,12 +81,71 @@ def _freq_ids(freq, num_layers: int) -> Tuple[int, ...]:
     return tuple(i for i, f in enumerate(freq[:num_layers]) if f)
 
 
+# ---------------------------------------------------------------------------------
+# Config-shape normalization. Two shapes reach load_args (every sibling family
+# carries the same dual-shape shim):
+#  * RAW checkpoint dicts (the canonical path today: both MiniMaxAI/MiniMax-M3 and
+#    nvidia/MiniMax-M3-NVFP4 ship auto_map remote code, which keeps the raw
+#    attributes): rope_theta / sparse_attention_config / moe_layer_freq verbatim.
+#  * transformers >= 5's NATIVE minimax_m3_vl TextConfig (reached the moment a
+#    checkpoint arrives without auto_map -- community requants, or upstream
+#    dropping remote code), whose __post_init__ NORMALIZES: rope_theta moves into
+#    rope_parameters, sparse_attention_config/moe_layer_freq are popped into flat
+#    index_* keys + layer_types/mlp_layer_types, and hidden_act is force-set to
+#    "silu" (parse_config pins the real expert activation instead of consuming it).
+# ---------------------------------------------------------------------------------
+def _rope_theta(text_config: Any) -> float:
+    theta = getattr(text_config, "rope_theta", None)
+    if theta is None:
+        params = getattr(text_config, "rope_parameters", None) or {}
+        theta = params.get("rope_theta") if isinstance(params, dict) else None
+    return float(theta) if theta is not None else 10000.0
+
+
+def _sparse_geometry(text_config: Any) -> dict:
+    """The sparse-attention geometry in the RAW ``sparse_attention_config`` dict
+    shape, whichever config shape arrived. The native class ships no flat keys
+    for ``sparse_init_block`` / ``sparse_score_type`` /
+    ``sparse_disable_index_value``: it hardcodes the M3 semantics those keys
+    describe (init 0, max scoring, score-only indexer), so the translation pins
+    the same values."""
+    raw = getattr(text_config, "sparse_attention_config", None)
+    if raw:
+        return dict(raw)
+    layer_types = getattr(text_config, "layer_types", None) or []
+    if "minimax_m3_sparse" not in layer_types:
+        return {}
+    return {
+        "use_sparse_attention": True,
+        "sparse_attention_freq": [
+            1 if t == "minimax_m3_sparse" else 0 for t in layer_types
+        ],
+        "sparse_num_index_heads": int(getattr(text_config, "index_n_heads", 4)),
+        "sparse_index_dim": int(getattr(text_config, "index_head_dim", 128)),
+        "sparse_block_size": int(getattr(text_config, "index_block_size", 128)),
+        "sparse_topk_blocks": int(getattr(text_config, "index_topk_blocks", 16)),
+        "sparse_local_block": int(getattr(text_config, "index_local_blocks", 1)),
+        "sparse_init_block": 0,
+        "sparse_score_type": "max",
+    }
+
+
+def _moe_layer_freq(text_config: Any):
+    freq = getattr(text_config, "moe_layer_freq", None)
+    if freq is not None:
+        return freq
+    mlp_types = getattr(text_config, "mlp_layer_types", None)
+    if mlp_types is not None:
+        return [1 if t == "sparse" else 0 for t in mlp_types]
+    return None
+
+
 def load_args(text_config: Any, num_layers: int, *, sparse_enabled: bool) -> MiniMaxM3Args:
     """Build the payload from the HF ``text_config`` (already unwrapped), resolving
     the sparse-attention switch ONCE here (``sparse_enabled`` folds FREETOKEN_M3_SPARSE
     in parse_config): the pool factory, the KV cost model, the backend and the model
     modules all read the resolved payload / group spec, never the env."""
-    sparse_cfg = dict(getattr(text_config, "sparse_attention_config", None) or {})
+    sparse_cfg = _sparse_geometry(text_config)
     use_sparse = sparse_enabled and bool(sparse_cfg.get("use_sparse_attention", False))
 
     head_dim_early = getattr(text_config, "head_dim", None) or (
@@ -180,7 +239,7 @@ def load_args(text_config: Any, num_layers: int, *, sparse_enabled: bool) -> Min
         head_dim=head_dim,
         norm_eps=text_config.rms_norm_eps,
         rotary_dim=rotary_dim,
-        rope_theta=float(getattr(text_config, "rope_theta", 10000.0)),
+        rope_theta=_rope_theta(text_config),
         max_position=text_config.max_position_embeddings,
         swiglu_alpha=float(getattr(text_config, "swiglu_alpha", 1.702)),
         swiglu_limit=float(getattr(text_config, "swiglu_limit", 7.0)),
@@ -199,7 +258,7 @@ def load_args(text_config: Any, num_layers: int, *, sparse_enabled: bool) -> Min
         init_blocks=int(sparse_cfg.get("sparse_init_block", 0)) if use_sparse else 0,
         local_blocks=int(sparse_cfg.get("sparse_local_block", 0)) if use_sparse else 0,
         sparse_layer_ids=sparse_layer_ids,
-        moe_layer_ids=_freq_ids(getattr(text_config, "moe_layer_freq", None), num_layers),
+        moe_layer_ids=_freq_ids(_moe_layer_freq(text_config), num_layers),
     )
 
 

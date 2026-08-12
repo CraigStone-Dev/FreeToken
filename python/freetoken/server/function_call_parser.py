@@ -2466,12 +2466,14 @@ class MiniMaxM3Detector(BaseFormatDetector):
         Same-name nesting is depth-matched so an ``<item>`` containing ``<item>``
         closes correctly.
 
-        Accepted risk of the leniency: a LEAF value that itself quotes wire
-        syntax (``<city>see NS<foo>x NS</foo>``) parses as structure, and a
-        malformed tag's dangling closer truncates the scan. Both are the cost of
+        Accepted risk of the leniency: a LEAF value quoting a well-formed
+        element PAIR (``<city>see NS<foo>x NS</foo>``) parses as structure, a
+        value quoting its OWN element's closer ends that element early, and a
+        malformed tag's dangling closer truncates the scan. All are the cost of
         the strict alternative -- where ONE stray character voided every
-        parameter that did parse -- and the model never emits either shape in
-        well-formed turns.
+        parameter that did parse -- and the model never emits these shapes in
+        well-formed turns. (Quoted invoke/wrapper markers, which DID occur in
+        practice, are handled structurally by ``_scan_invoke_interior``.)
         """
         items: List[tuple] = []
         pos, n = 0, len(text)
@@ -2509,27 +2511,61 @@ class MiniMaxM3Detector(BaseFormatDetector):
             pos = search
         return items
 
-    def _leaf_value(self, raw: str) -> Any:
-        leaf = raw.strip("\n")
-        # An empty element is the empty STRING; loose-JSON would turn it into {}.
-        return "" if leaf.strip() == "" else _parse_loose_json_value(leaf)
+    def _typed_leaf(self, raw: str, prop: Any) -> Any:
+        """Leaf dequoting. The template's ``to_xml`` renders leaf values VERBATIM
+        (``NS<k>{{ val }}NS</k>``, no added whitespace), so a schema-string leaf
+        round-trips exactly: stripping would corrupt multi-line string arguments
+        whose leading/trailing newlines are data. Declared non-string types
+        tolerate surrounding whitespace (``int("\\n42\\n")`` etc. is the intent);
+        undeclared leaves fall back to loose JSON, keeping the verbatim text
+        whenever the parse yields a string anyway. A declared-string ``null``
+        stays the literal string: the template deliberately never renders null
+        (fields are omitted), so literal "null" text is data."""
+        if prop is not None:
+            ptype = (
+                str(prop.get("type", "string")).strip().lower()
+                if isinstance(prop, dict)
+                else "string"
+            )
+            if ptype in ("string", "str", "enum"):
+                return raw
+            return self._convert_param_value(raw.strip(), "_", {"_": prop}, "")
+        if raw.strip() == "":
+            # An empty element is the empty STRING; loose-JSON would make it {}.
+            return ""
+        value = _parse_loose_json_value(raw.strip())
+        return raw if isinstance(value, str) else value
 
-    def _nested_value(self, raw: str) -> Any:
+    def _nested_value(self, raw: str, schema: Any = None) -> Any:
         items = self._scan_elements(raw)
         if not items:
-            return self._leaf_value(raw)
-        return self._structure(items)
+            return self._typed_leaf(raw, schema)
+        return self._structure(items, schema)
 
-    def _structure(self, items: List[tuple]) -> Any:
+    def _structure(self, items: List[tuple], schema: Any = None) -> Any:
+        """Composite value from scanned elements, threading the JSON schema down:
+        object properties type their fields, array ``items`` type the elements --
+        so a nested field declared ``"type": "string"`` arrives as a string, not
+        loose-JSON's best guess."""
+        props = schema.get("properties") if isinstance(schema, dict) else None
+        item_schema = schema.get("items") if isinstance(schema, dict) else None
         names = {k for k, _ in items}
         # Arrays: the template renders one <item> per element; repeated same-name
         # siblings under any tag are also a list (never silently collapse to the
         # last value).
         if len(names) == 1 and (len(items) > 1 or next(iter(names)) == "item"):
-            return [self._nested_value(raw) for _, raw in items]
+            only = next(iter(names))
+            sub = item_schema if only == "item" else (
+                props.get(only) if isinstance(props, dict) else None
+            )
+            if isinstance(sub, dict) and str(sub.get("type", "")).lower() == "array":
+                sub = sub.get("items")
+            return [self._nested_value(raw, sub) for _, raw in items]
         out: Dict[str, Any] = {}
         for key, raw in items:
-            value = self._nested_value(raw)
+            value = self._nested_value(
+                raw, props.get(key) if isinstance(props, dict) else None
+            )
             if key in out:
                 prev = out[key]
                 out[key] = (prev if isinstance(prev, list) else [prev]) + [value]
@@ -2537,19 +2573,18 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 out[key] = value
         return out
 
-    def _parse_invoke_args(self, func_name: str, body: str, tools: List[Tool]) -> Dict:
+    def _args_from_items(
+        self, func_name: str, items: List[tuple], tools: List[Tool]
+    ) -> Dict:
         config = self._get_param_config(func_name, tools)
         args: Dict[str, Any] = {}
-        for key, raw in self._scan_elements(body):
+        for key, raw in items:
+            prop = config.get(key) if isinstance(config, dict) and key in config else None
             nested = self._scan_elements(raw)
             if nested:
-                value: Any = self._structure(nested)
-            elif key in config:
-                value = self._convert_param_value(raw.strip("\n"), key, config, func_name)
-                if raw.strip() == "" and isinstance(value, dict):
-                    value = ""  # empty leaf never becomes {}
+                value: Any = self._structure(nested, prop)
             else:
-                value = self._leaf_value(raw)
+                value = self._typed_leaf(raw, prop)
             if key in args:
                 prev = args[key]
                 args[key] = (prev if isinstance(prev, list) else [prev]) + [value]
@@ -2557,30 +2592,102 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 args[key] = value
         return args
 
-    def _parse_block_invokes(
-        self, block: str, tools: List[Tool], calls: List[ToolCallItem], base_index: int
-    ) -> None:
-        """Append every invoke in ``block`` (the wrapper interior; possibly
-        truncated) to ``calls``. A truncated trailing invoke (no ``</invoke>``)
-        salvages its complete parameters -- the recover_truncated_call path."""
-        tool_indices = self._get_tool_indices(tools)
-        for m in self.invoke_open_re.finditer(block):
-            close = block.find(self._invoke_close, m.end())
-            body = block[m.end() : close] if close != -1 else block[m.end() :]
-            func_name = m.group(1)
-            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
-                logger.warning(f"Model attempted to call undefined function: {func_name}")
+    def _scan_invoke_interior(self, text: str, pos: int) -> tuple:
+        """Collect parameter elements from ``pos`` (just past an invoke opener)
+        until a TOP-LEVEL ``NS</invoke>`` / ``NS</tool_call>`` / end of text.
+        Close markers are only interpreted BETWEEN elements: a parameter value
+        quoting wire syntax inside a well-formed element can neither terminate
+        the invoke early nor truncate the wrapper block (both were real defects
+        with raw ``str.find`` over the block). Returns ``(items, end_pos,
+        closer)`` with ``closer`` in {"invoke", "eot", None}; ``end_pos`` points
+        AT the closer marker (``len(text)`` when the text ran out -- the
+        truncation-salvage path, every complete element already collected)."""
+        items: List[tuple] = []
+        collecting = True
+        n = len(text)
+        while pos < n:
+            nxt = text.find(self.NS + "<", pos)
+            if nxt == -1:
+                return items, n, None
+            if text.startswith(self._invoke_close, nxt):
+                return items, nxt, "invoke"
+            if text.startswith(self.eot_token, nxt):
+                return items, nxt, "eot"
+            pos = nxt
+            if text.startswith(self.NS + "</", pos):
+                # Dangling closer we did not open: stop collecting (ambiguous
+                # structure) but keep scanning for the real invoke boundary.
+                collecting = False
+                pos += len(self.NS) + 2
                 continue
-            args = self._parse_invoke_args(func_name, body, tools)
-            calls.append(
-                ToolCallItem(
-                    tool_index=base_index + len(calls),
-                    name=func_name,
-                    parameters=json.dumps(args, ensure_ascii=False),
+            tag_start = pos + len(self.NS) + 1
+            gt = text.find(">", tag_start)
+            if gt == -1:
+                return items, n, None  # truncated open tag
+            name = text[tag_start:gt]
+            if not name or any(c in self._TAG_BAD_CHARS for c in name):
+                pos = gt + 1  # malformed tag (e.g. a quoted <invoke ...> echo)
+                continue
+            open_tag = self.NS + "<" + name + ">"
+            close_tag = self.NS + "</" + name + ">"
+            depth, search, inner_end = 1, gt + 1, -1
+            while depth:
+                cpos = text.find(close_tag, search)
+                if cpos == -1:
+                    return items, n, None  # unterminated element: salvage
+                opos = text.find(open_tag, search)
+                if opos != -1 and opos < cpos:
+                    depth += 1
+                    search = opos + len(open_tag)
+                else:
+                    depth -= 1
+                    inner_end = cpos
+                    search = cpos + len(close_tag)
+            if collecting:
+                items.append((name, text[gt + 1 : inner_end]))
+            pos = search
+        return items, n, None
+
+    def _parse_block(
+        self, text: str, pos: int, tools: List[Tool], calls: List[ToolCallItem]
+    ) -> int:
+        """Parse a wrapper interior starting at ``pos`` (just past ``bot_token``),
+        appending calls; returns the position just past the block's
+        ``NS</tool_call>``, or ``len(text)`` when the wrapper never closes
+        (end-of-generation truncation -- a truncated trailing invoke still
+        salvages its complete parameters, the recover_truncated_call path)."""
+        tool_indices = self._get_tool_indices(tools)
+        n = len(text)
+        while pos < n:
+            nxt = text.find(self.NS + "<", pos)
+            if nxt == -1:
+                return n
+            if text.startswith(self.eot_token, nxt):
+                return nxt + len(self.eot_token)
+            m = self.invoke_open_re.match(text, nxt)
+            if m is None:
+                pos = nxt + len(self.NS) + 1  # stray marker at block level
+                continue
+            items, end, closer = self._scan_invoke_interior(text, m.end())
+            func_name = m.group(1)
+            if func_name in tool_indices or _should_forward_unknown_tool(func_name):
+                args = self._args_from_items(func_name, items, tools)
+                calls.append(
+                    ToolCallItem(
+                        tool_index=len(calls),
+                        name=func_name,
+                        parameters=json.dumps(args, ensure_ascii=False),
+                    )
                 )
-            )
-            if close == -1:
-                break  # truncated trailing invoke consumed everything
+            else:
+                logger.warning(f"Model attempted to call undefined function: {func_name}")
+            if closer == "invoke":
+                pos = end + len(self._invoke_close)
+            elif closer == "eot":
+                return end + len(self.eot_token)
+            else:
+                return n
+        return n
 
     # ---- one-shot -------------------------------------------------------------------
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
@@ -2597,12 +2704,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 normal_parts.append(text[pos:])
                 break
             normal_parts.append(text[pos:b])
-            e = text.find(self.eot_token, b + len(self.bot_token))
-            block = text[b + len(self.bot_token) : e if e != -1 else len(text)]
-            self._parse_block_invokes(block, tools, calls, base_index=0)
-            if e == -1:
-                break
-            pos = e + len(self.eot_token)
+            pos = self._parse_block(text, b + len(self.bot_token), tools, calls)
         return StreamingParseResult(
             normal_text="".join(normal_parts).strip(), calls=calls
         )
@@ -2636,54 +2738,72 @@ class MiniMaxM3Detector(BaseFormatDetector):
 
             # In-block: the buffer keeps the opener (finish_streaming suppression +
             # recover_truncated_call re-parse both key off has_tool_call(buffer)).
+            # Marker interpretation is structural, matching detect_and_parse: the
+            # first TOP-LEVEL invoke opener or wrapper closer wins, and quoted
+            # wire syntax inside a still-streaming element neither closes the
+            # invoke early nor ends the block.
             body = self._buffer[len(self.bot_token) :]
-            m = self.invoke_open_re.search(body)
-            end_pos = body.find(self.eot_token)
-            if m is not None and (end_pos == -1 or m.start() < end_pos):
-                close = body.find(self._invoke_close, m.end())
-                if close == -1:
-                    break  # invoke still streaming -> hold (opener retained)
-                func_name = m.group(1)
-                inner = body[m.end() : close]
-                self._buffer = self.bot_token + body[close + len(self._invoke_close) :]
-                if func_name not in tool_indices and not _should_forward_unknown_tool(
-                    func_name
-                ):
-                    logger.warning(
-                        f"Model attempted to call undefined function: {func_name}"
-                    )
-                    continue
-                args = self._parse_invoke_args(func_name, inner, tools)
-                args_json = json.dumps(args, ensure_ascii=False)
-                self.current_tool_id += 1
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
-                self.prev_tool_call_arr[self.current_tool_id] = {
-                    "name": func_name,
-                    "arguments": args,
-                }
-                calls.append(
-                    ToolCallItem(
-                        tool_index=self.current_tool_id, name=func_name, parameters=""
-                    )
-                )
-                calls.append(
-                    ToolCallItem(
-                        tool_index=self.current_tool_id, name=None, parameters=args_json
-                    )
-                )
-                self.streamed_args_for_tool[self.current_tool_id] = args_json
-                continue
-            if end_pos != -1:
+            action = None
+            scan = 0
+            while True:
+                nxt = body.find(self.NS + "<", scan)
+                if nxt == -1:
+                    break
+                if body.startswith(self.eot_token, nxt):
+                    action = ("eot", nxt, None)
+                    break
+                m = self.invoke_open_re.match(body, nxt)
+                if m is not None:
+                    action = ("invoke", nxt, m)
+                    break
+                scan = nxt + len(self.NS) + 1  # stray marker at block level
+            if action is None:
+                break  # inside the block, nothing complete yet -> hold
+            if action[0] == "eot":
                 # Wrapper closed: drop the block, loop back to the idle scan so the
                 # residue gets partial-marker holds and second-block detection
                 # instead of leaking raw.
-                self._buffer = body[end_pos + len(self.eot_token) :]
+                self._buffer = body[action[1] + len(self.eot_token) :]
                 self._m3_in_block = False
                 continue
-            break  # inside the block, nothing complete yet -> hold
+            m = action[2]
+            items, end, closer = self._scan_invoke_interior(body, m.end())
+            if closer != "invoke":
+                # Invoke still streaming (or eot-truncated: left to
+                # finish_streaming / recover_truncated_call) -> hold.
+                break
+            func_name = m.group(1)
+            self._buffer = self.bot_token + body[end + len(self._invoke_close) :]
+            if func_name not in tool_indices and not _should_forward_unknown_tool(
+                func_name
+            ):
+                logger.warning(
+                    f"Model attempted to call undefined function: {func_name}"
+                )
+                continue
+            args = self._args_from_items(func_name, items, tools)
+            args_json = json.dumps(args, ensure_ascii=False)
+            self.current_tool_id += 1
+            while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                self.prev_tool_call_arr.append({})
+            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                self.streamed_args_for_tool.append("")
+            self.prev_tool_call_arr[self.current_tool_id] = {
+                "name": func_name,
+                "arguments": args,
+            }
+            calls.append(
+                ToolCallItem(
+                    tool_index=self.current_tool_id, name=func_name, parameters=""
+                )
+            )
+            calls.append(
+                ToolCallItem(
+                    tool_index=self.current_tool_id, name=None, parameters=args_json
+                )
+            )
+            self.streamed_args_for_tool[self.current_tool_id] = args_json
+            continue
 
         return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 

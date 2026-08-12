@@ -166,6 +166,104 @@ def test_detect_and_parse_unknown_tool_follows_forwarding_policy():
         fcp.FORWARD_UNKNOWN_TOOLS = orig
 
 
+def test_quoted_invoke_opener_is_data_not_call():
+    """A parameter VALUE quoting the invoke wire syntax must parse as data, not
+    spawn a phantom call (PR#110 round-2: raw finditer over the block produced a
+    second write_file {} call and diverged from streaming)."""
+    quoted = f'see {NS}<invoke name="write_file"> for the syntax'
+    text = _block(
+        f'{NS}<invoke name="get_weather">{NS}<city>{quoted}{NS}</city>{NS}</invoke>\n'
+    )
+    res = MiniMaxM3Detector().detect_and_parse(text, _tools())
+    assert [c.name for c in res.calls] == ["get_weather"]
+    assert json.loads(res.calls[0].parameters) == {"city": quoted}
+    # streaming agrees (it already produced one call before the fix; pin it)
+    det = MiniMaxM3Detector()
+    r = det.parse_streaming_increment(text, _tools())
+    assert [c.name for c in r.calls if c.name is not None] == ["get_weather"]
+
+
+def test_quoted_wrapper_closer_is_data_not_block_end():
+    """A value quoting NS</tool_call> must not end the wrapper: before the fix
+    the parameter was dropped ({}) and the rest of the block leaked as raw
+    markup content."""
+    quoted = f"wrap calls in {NS}</tool_call> at the end"
+    inner = f'{NS}<invoke name="get_weather">{NS}<city>{quoted}{NS}</city>{NS}</invoke>\n'
+    text = _block(inner) + " done."
+    res = MiniMaxM3Detector().detect_and_parse(text, _tools())
+    assert [c.name for c in res.calls] == ["get_weather"]
+    assert json.loads(res.calls[0].parameters) == {"city": quoted}
+    assert res.normal_text == "done."
+    # chunked streaming: same call, no markup leak
+    det = MiniMaxM3Detector()
+    calls, texts = [], []
+    for i in range(0, len(text), 7):
+        r = det.parse_streaming_increment(text[i : i + 7], _tools())
+        calls += [c for c in r.calls if c.name is not None]
+        texts.append(r.normal_text)
+    assert [c.name for c in calls] == ["get_weather"]
+    assert NS not in "".join(texts)
+
+
+def test_multiline_string_argument_verbatim():
+    """The template renders leaf values verbatim; the round-trip must preserve
+    them verbatim too -- strip("\\n") ate the trailing newline of multi-line
+    string arguments (PR#110 round-2)."""
+    tools = [
+        Tool(function=Function(name="write_file", parameters={
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+        }))
+    ]
+    content = "line1\nline2\n"
+    text = _block(
+        f'{NS}<invoke name="write_file">'
+        f"{NS}<path>/tmp/x{NS}</path>"
+        f"{NS}<content>{content}{NS}</content>"
+        f"{NS}</invoke>\n"
+    )
+    res = MiniMaxM3Detector().detect_and_parse(text, tools)
+    assert json.loads(res.calls[0].parameters) == {"path": "/tmp/x", "content": content}
+
+
+def test_nested_schema_types_string_leaves():
+    """Nested leaves honor the declared schema (PR#110 round-2: string-typed
+    nested fields arrived as loose-JSON numbers/bools); undeclared nested leaves
+    keep the loose-JSON fallback."""
+    tools = [
+        Tool(function=Function(name="create_order", parameters={
+            "type": "object",
+            "properties": {
+                "shipping": {
+                    "type": "object",
+                    "properties": {
+                        "zip": {"type": "string"},
+                        "note": {"type": "string"},
+                        "floor": {"type": "integer"},
+                    },
+                },
+                "tags": {"type": "array", "items": {"type": "string"}},
+            },
+        }))
+    ]
+    text = _block(
+        f'{NS}<invoke name="create_order">'
+        f"{NS}<shipping>"
+        f"{NS}<zip>94107{NS}</zip>"
+        f"{NS}<note>true{NS}</note>"
+        f"{NS}<floor>3{NS}</floor>"
+        f"{NS}</shipping>"
+        f"{NS}<tags>"
+        f"{NS}<item>1{NS}</item>"
+        f"{NS}<item>two{NS}</item>"
+        f"{NS}</tags>"
+        f"{NS}</invoke>\n"
+    )
+    args = json.loads(MiniMaxM3Detector().detect_and_parse(text, tools).calls[0].parameters)
+    assert args["shipping"] == {"zip": "94107", "note": "true", "floor": 3}
+    assert args["tags"] == ["1", "two"]
+
+
 def test_streaming_text_then_call():
     det = MiniMaxM3Detector()
     full = "Let me check." + _block(

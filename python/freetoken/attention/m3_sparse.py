@@ -80,7 +80,13 @@ def _pick_inner_backend(block_size: int) -> str:
     override = os.getenv("FREETOKEN_M3_INNER_BACKEND")
     if override:
         for part in override.split(","):
-            info = attention_backend_info(part)
+            try:
+                info = attention_backend_info(part)
+            except KeyError:
+                raise ValueError(
+                    f"FREETOKEN_M3_INNER_BACKEND={override!r}: unknown attention "
+                    f"backend {part!r}"
+                ) from None
             if AttnType.FULL not in info.supported_types:
                 raise ValueError(
                     f"FREETOKEN_M3_INNER_BACKEND={override!r}: {part!r} does not "
@@ -104,13 +110,19 @@ def _pick_inner_backend(block_size: int) -> str:
         from freetoken.engine.engine import _backend_requirements_met
         from freetoken.utils.arch import is_sm90_family
 
+        skipped = name
         for candidate, arch_ok in (("fa,fi", is_sm90_family()), ("fi", True), ("triton", True)):
             if arch_ok and _page_ok(candidate) and _backend_requirements_met(candidate):
                 name = candidate
                 break
         else:  # pragma: no cover - triton is unconditional
             name = "triton"
-    logger.info(f"m3_sparse dense-layer backend: {name} (auto)")
+        logger.info(
+            f"m3_sparse dense-layer backend: {name} (auto; skipped {skipped!r}: "
+            f"it cannot address this pool's {block_size}-token pages)"
+        )
+    else:
+        logger.info(f"m3_sparse dense-layer backend: {name} (auto)")
     return name
 
 

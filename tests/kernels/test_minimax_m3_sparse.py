@@ -357,3 +357,81 @@ def test_decode_attend(kv_lens: list[int], topk: int):
         ref = ref_sparse_attend(q[i : i + 1], ks[i], vs[i], sel, q_pos, SCALE)
         err = (out[i].float() - ref[0]).abs().max().item()
         assert err < 3e-2, (i, err)
+
+
+def test_decode_attend_capture_replay_mutated_lengths():
+    """PR#110 round-2 probe, ported: the decode index+attend pair under CUDA-graph
+    capture, replayed with MUTATED kv lengths (1 / 129 / 8191 rotated across
+    requests) and refreshed K/V/index data -- the live split-K partition and
+    every length-dependent mask must be replay-safe, with nothing but ``max_nb``
+    baked into the capture (exactly the production graph contract)."""
+    topk = 16
+    LENS = [1, 129, 8191]
+    bs = len(LENS)
+    MAXL = max(LENS)
+    max_nb = (MAXL + BLK - 1) // BLK
+    block_rows = torch.zeros(bs, max_nb, dtype=torch.int32, device=DEV)
+    total = 0
+    layouts = []
+    for i in range(bs):
+        br, pages = make_layout(max_nb, seed=20 + i)
+        layouts.append((br, pages))
+        block_rows[i] = br + total * BLK
+        total += pages
+    k_slab = torch.full(
+        (total * BLK, KVH, D), float("nan"), device=DEV, dtype=torch.bfloat16
+    )
+    v_slab = torch.full_like(k_slab, float("nan"))
+    ik_slab = torch.zeros(total * BLK, D_IDX, device=DEV, dtype=torch.bfloat16)
+
+    def refresh(seed):
+        torch.manual_seed(seed)
+        ks, vs, iks = [], [], []
+        off = 0
+        for i in range(bs):
+            kk = torch.randn(MAXL, KVH, D, device=DEV, dtype=torch.bfloat16)
+            vv = torch.randn(MAXL, KVH, D, device=DEV, dtype=torch.bfloat16)
+            ik = torch.randn(MAXL, D_IDX, device=DEV, dtype=torch.bfloat16)
+            ks.append(kk); vs.append(vv); iks.append(ik)
+            br, pages = layouts[i]
+            k_slab[off * BLK : (off + pages) * BLK] = scatter_rows(kk, br, pages)
+            v_slab[off * BLK : (off + pages) * BLK] = scatter_rows(vv, br, pages)
+            ik_slab[off * BLK : (off + pages) * BLK] = scatter_rows(ik, br, pages, fill=0.0)
+            off += pages
+        return ks, vs, iks
+
+    q = torch.randn(bs, HQ, D, device=DEV, dtype=torch.bfloat16)
+    iq = torch.randn(bs, H_IDX, D_IDX, device=DEV, dtype=torch.bfloat16)
+    seq = torch.tensor(LENS, dtype=torch.int32, device=DEV)
+    out = torch.empty_like(q)
+    data = refresh(100)
+    # warmup outside capture (Triton JIT), then capture the pair
+    ti = m3_index_decode(iq, ik_slab, block_rows, seq, max_nb, topk, INIT, LOCAL)
+    m3_sparse_attn_decode(q, k_slab, v_slab, ti, block_rows, seq, SCALE, out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ti = m3_index_decode(iq, ik_slab, block_rows, seq, max_nb, topk, INIT, LOCAL)
+        m3_sparse_attn_decode(q, k_slab, v_slab, ti, block_rows, seq, SCALE, out)
+
+    def check(lens, ks, vs, iks):
+        for i, L in enumerate(lens):
+            q_pos = torch.tensor([L - 1], device=DEV)
+            ref_scores = ref_block_scores(iq[i : i + 1], iks[i][:L], q_pos)
+            sel = ref_select(ref_scores, q_pos, topk, INIT, LOCAL)
+            ref = ref_sparse_attend(q[i : i + 1], ks[i][:L], vs[i][:L], sel, q_pos, SCALE)
+            err = (out[i].float() - ref[0]).abs().max().item()
+            assert err < 3e-2, (lens, i, err)
+            assert torch.isfinite(out[i].float()).all(), (lens, i)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    check(LENS, *data)
+    for step, new_lens in enumerate(([129, 8191, 1], [8191, 1, 129])):
+        data = refresh(200 + step)
+        seq.copy_(torch.tensor(new_lens, dtype=torch.int32, device=DEV))
+        q.normal_()
+        iq.normal_()
+        graph.replay()
+        torch.cuda.synchronize()
+        check(new_lens, *data)

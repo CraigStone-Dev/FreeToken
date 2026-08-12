@@ -108,6 +108,14 @@ def _read_proj(reader: _ShardReader, key: str) -> tuple[torch.Tensor, torch.Tens
         assert w.dtype == torch.float8_e4m3fn and s.dtype == torch.uint8, (
             f"unexpected MXFP8 dtypes at {key}: {w.dtype}/{s.dtype}"
         )
+        # The GEMV folds w * 2**(code-127) into the 16-bit activation dtype; that
+        # is lossless only while the product stays in range (fp8-e4m3 max is
+        # ~2**8.8, bf16 max ~2**128 -> codes above 245 could overflow the fold).
+        # Real checkpoints sit near 127; pin the assumption at load, not at NaN.
+        assert int(s.max()) <= 245, (
+            f"e8m0 scale code {int(s.max())} at {key} exceeds the bf16-exact "
+            "fold bound (245); the W8A16 kernels would overflow"
+        )
         return w, s
     return w, None
 

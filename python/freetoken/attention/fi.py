@@ -93,8 +93,9 @@ class FlashInferBackend(BaseAttnBackend):
         # ``cta_tile_q`` is 128 (64 at head_dim >= 256); when the cap can't be met
         # it disables split-KV and allocates no tmp_v at all. The original flat
         # 128 MiB overflowed on head_dim=256 extend-prefills (Qwen3.5/3.6 MoE) and
-        # the flat 256 MiB on MiniMax-M3's 64-head dense layers (H100: 64 heads x
-        # 72 padded rows x 128 x 128 x 4 B = 288 MiB of tmp_v). Derive the bound
+        # the flat 256 MiB on MiniMax-M3's 64-head dense layers (H100, 132 SMs:
+        # 64 heads x ceil(2*132/4)=66 padded rows x 128 x 128 x 4 B = 264 MiB of
+        # tmp_v, over the flat buffer). Derive the bound
         # from the model's TP-LOCAL geometry + this device's SM count, with slack
         # for the tmp_s/merge siblings, floored at the old 256 MiB -- geometries
         # that never exceeded the flat buffer (e.g. GLM-4.7's 96q/8kv) stay at it.

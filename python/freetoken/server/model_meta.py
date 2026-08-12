@@ -51,6 +51,24 @@ def think_chat_template_kwargs(reasoning_parser: str | None, gear: str | None) -
     return {"enable_thinking": gear == "on"}  # qwen3, glm, gemma4
 
 
+def think_toggle_kwargs(reasoning_parser: str | None, enabled: bool) -> dict:
+    """``chat_template_kwargs`` for a protocol-level thinking ON/OFF toggle (the
+    Anthropic ``thinking.type`` object, Responses ``reasoning.effort``), routed
+    through the same per-family mapping as the chat-completions gears -- a
+    hardcoded ``{"enable_thinking": bool}`` is inert for families whose template
+    reads a different knob (M3's ``thinking_mode``). A family without the
+    requested direction (gpt-oss / minimax have no off gear) returns ``{}``:
+    the template has no such knob to set. With no configured parser the
+    protocol-generic key is kept (harmless for templates that ignore it)."""
+    gears, _default = think_spec(reasoning_parser)
+    if not gears:
+        return {"enable_thinking": enabled}
+    gear = "on" if enabled else "off"
+    if gear not in gears:
+        return {}
+    return think_chat_template_kwargs(reasoning_parser, gear)
+
+
 def moe_total_experts(config: Any) -> int:
     """Total routed-expert slots the model has: experts per layer x MoE layers. Matches the
     engine's own basis (``Engine._resolve_auto_moe_cache_size``), so a residency rate derived

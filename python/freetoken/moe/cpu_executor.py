@@ -73,6 +73,27 @@ _ACT_IDS = {
 _WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
 
 
+def compiled_extension_supports(activation: str) -> bool:
+    """Whether the COMPILED ``_cpu_moe`` extension can serve ``activation``
+    through its generic epilogue (the mxfp4 kernel path handles its act
+    internally and predates the ABI marker; its callers never need this probe).
+
+    A stale prebuilt ``.so`` accepts newer act ids while silently computing the
+    wrong math -- ``CpuMoeExecutor.__init__`` turns that into a hard error, but
+    a DEFAULT decision (the engine's auto offload->hybrid upgrade) should
+    consult this first and degrade to offload with a log line instead of
+    crashing the default boot after the full weight load."""
+    if activation not in _ACT_IDS:
+        return False
+    if _ACT_IDS[activation] < 3:
+        return True
+    try:
+        from freetoken.kernel import _cpu_moe
+    except ImportError:
+        return False
+    return _ACT_IDS[activation] <= getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
+
+
 def physical_core_cpus() -> list[int]:
     """One logical CPU per physical core, restricted to this process's affinity.
 
