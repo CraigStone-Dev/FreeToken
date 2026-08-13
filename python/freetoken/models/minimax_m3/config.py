@@ -126,11 +126,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
     expert_quant = "nvfp4" if quant is not None else "none"
 
     # The activation is model-constant swigluoai: assert instead of consume.
-    # Raw checkpoints declare "swigluoai"; transformers >= 5's native TextConfig
-    # force-normalizes hidden_act to "silu" (its module computes the gate inline
-    # from swiglu_alpha/limit) -- consuming THAT would let select_nvfp4_backend
-    # pick a silu-only kernel and fail its activation assert after the full
-    # checkpoint load.
+    # Raw checkpoints declare "swigluoai"; the native transformers TextConfig
+    # force-normalizes hidden_act to "silu", which would send the backend
+    # selection down a silu-only path.
     declared_act = getattr(text, "hidden_act", "swigluoai")
     assert declared_act in ("swigluoai", "silu"), (
         f"MiniMax-M3 support implements swigluoai only, got hidden_act={declared_act!r}"

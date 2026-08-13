@@ -226,10 +226,9 @@ def test_cpu_decode_nvfp4_swigluoai_matches_dequant_reference(bs):
 
 def test_stale_extension_rejected_for_swigluoai(monkeypatch):
     """A prebuilt _cpu_moe.so from before ACT_SWIGLUOAI accepts act id 3 without
-    error and silently computes the wrong activation in the generic epilogue
-    (PR#110 review hit this: 52% rel error until a manual rebuild). The executor
-    probes the extension's `max_generic_act_id` marker -- absent on stale builds
-    -- and must fail loudly with the rebuild instruction instead."""
+    error and silently computes the wrong activation in the generic epilogue.
+    The executor probes the extension's `max_generic_act_id` marker -- absent on
+    stale builds -- and must fail loudly with the rebuild instruction."""
     from freetoken.kernel import _cpu_moe
     from freetoken.moe.cpu_executor import CpuMoeExecutor, compiled_extension_supports
 

@@ -159,9 +159,9 @@ def test_convert_system_role_message_and_unknown_block():
 
 
 def test_convert_thinking_toggle_routes_through_family_mapping():
-    """PR#110 round-2: a hardcoded {"enable_thinking": bool} was inert for M3,
-    whose template reads thinking_mode -- the toggle must go through the same
-    model_meta mapping as the chat-completions gears."""
+    """A hardcoded {"enable_thinking": bool} is inert for M3, whose template
+    reads thinking_mode -- the toggle must go through the same model_meta
+    mapping as the chat-completions gears."""
     def _req(ttype):
         return AnthropicMessagesRequest.model_validate(
             {

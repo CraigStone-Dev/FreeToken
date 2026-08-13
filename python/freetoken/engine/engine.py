@@ -1165,9 +1165,8 @@ def _adjust_config(config: EngineConfig):
     required_attn_types = _required_attn_types(model_config)
     _dtype = getattr(config, "dtype", None)  # duck-typed test configs omit it
     if AttnType.BSA in required_attn_types and _dtype is not None and _dtype.itemsize != 2:
-        # Reject at CONFIG time: the BSA pool's index slab budgets 2 bytes/token
-        # and asserts itemsize==2 -- but only after the model is resident, and
-        # not at all under `python -O`.
+        # Reject at config time: the BSA pool's own assert only fires after the
+        # model is resident (and not at all under `python -O`).
         raise ValueError(
             f"--dtype {config.dtype}: block-sparse attention serves 16-bit "
             "compute only (the index slab budgets 2 bytes/token); use bfloat16 "
@@ -1204,10 +1203,9 @@ def _adjust_config(config: EngineConfig):
     _cpu_moe_acts = (
         "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
     )
-    # NOTE: hidden_act (the DENSE activation) stands proxy for the expert
-    # activation -- true for every in-tree model; a future model mixing the two
-    # needs a dedicated expert-act field here. mxfp4 experts pass regardless:
-    # their act runs inside the mxfp4 kernel, not the generic epilogue.
+    # hidden_act (the dense activation) stands proxy for the expert activation --
+    # true for every in-tree model. mxfp4 experts pass regardless: their act runs
+    # inside the mxfp4 kernel, not the generic epilogue.
     _cpu_moe_act_ok = getattr(model_config, "hidden_act", "silu") in _cpu_moe_acts or (
         getattr(model_config, "moe_weight_format", None) == "mxfp4"
     )
@@ -1259,11 +1257,9 @@ def _adjust_config(config: EngineConfig):
                     f"{getattr(model_config, 'hidden_act', None)!r}; staying on offload"
                 )
             elif moe_wfmt != "mxfp4" and not compiled_extension_supports(_act):
-                # A stale prebuilt _cpu_moe.so accepts newer act ids while
-                # computing the wrong math; an explicit --moe-backend cpu/hybrid
-                # still hard-fails in CpuMoeExecutor.__init__, but a DEFAULT
-                # must not turn into a post-load crash -- degrade like
-                # select_nvfp4_backend does.
+                # Stale prebuilt _cpu_moe.so: an explicit cpu/hybrid pick still
+                # hard-fails in the executor, but a default must not turn into a
+                # post-load crash -- degrade to offload.
                 logger.info_rank0(
                     f"benchbw profile recommends hybrid, but the compiled _cpu_moe "
                     f"extension predates activation {_act!r} (rebuild with "

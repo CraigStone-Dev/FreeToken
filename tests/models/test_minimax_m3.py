@@ -110,9 +110,9 @@ def _hf_config_native(num_layers: int = 60) -> _Cfg:
 
 
 def test_parse_config_native_shape_matches_raw(monkeypatch):
-    """PR#110 round-2: the native shape silently produced rope base 10000,
-    use_sparse=False and hidden_act='silu' -- all three load-bearing reads must
-    resolve identically to the raw-dict shape."""
+    """The native shape silently produced rope base 10000, use_sparse=False and
+    hidden_act='silu' before the dual-shape shim -- all three load-bearing reads
+    must resolve identically to the raw-dict shape."""
     monkeypatch.delenv("FREETOKEN_M3_MAX_LAYERS", raising=False)
     monkeypatch.delenv("FREETOKEN_M3_SPARSE", raising=False)
     raw = parse_config(_hf_config())

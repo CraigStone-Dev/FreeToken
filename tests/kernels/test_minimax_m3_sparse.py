@@ -360,11 +360,11 @@ def test_decode_attend(kv_lens: list[int], topk: int):
 
 
 def test_decode_attend_capture_replay_mutated_lengths():
-    """PR#110 round-2 probe, ported: the decode index+attend pair under CUDA-graph
-    capture, replayed with MUTATED kv lengths (1 / 129 / 8191 rotated across
-    requests) and refreshed K/V/index data -- the live split-K partition and
-    every length-dependent mask must be replay-safe, with nothing but ``max_nb``
-    baked into the capture (exactly the production graph contract)."""
+    """The decode index+attend pair under CUDA-graph capture, replayed with
+    mutated kv lengths (1 / 129 / 8191 rotated across requests) and refreshed
+    K/V/index data: the split-K partition and every length-dependent mask must
+    be replay-safe, with nothing but ``max_nb`` baked into the capture -- the
+    production graph contract."""
     topk = 16
     LENS = [1, 129, 8191]
     bs = len(LENS)

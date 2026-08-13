@@ -449,14 +449,11 @@ class MiniMaxM3ReasoningParser(BaseReasoningParser):
         self._head_buffer = ""
 
     def detect_and_parse(self, text: str) -> ReasoningParseResult:
-        """One-shot parse, POSITIONAL and VERBATIM, matching this parser's own
-        streaming path and the reference grammar (PR#110 cross-validation: the
-        base one-shot relabeled prose BEFORE a mid-content ``<mm:think>`` as
-        reasoning, ``.strip()``-ed both sides, and ``replace``d EVERY marker
-        occurrence -- corrupting content that quotes the marker). Reasoning is
-        anchored at the FIRST opener the model wrote; prose before it stays
-        content, later occurrences are data, and nothing is whitespace-trimmed.
-        """
+        """One-shot parse, positional and verbatim, matching the streaming path:
+        reasoning is anchored at the first opener the model wrote, prose before
+        it stays content, later marker occurrences are data, and nothing is
+        whitespace-trimmed. (The base one-shot relabels prose before a
+        mid-content opener and strips both sides -- wrong for this grammar.)"""
         end = self.think_end_token
         if self.force_reasoning:
             # enabled gear: the template pre-opened the think block.

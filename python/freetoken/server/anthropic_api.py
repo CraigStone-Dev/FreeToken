@@ -285,11 +285,8 @@ def convert_anthropic_prompt(
         template_tools, parser_tools = split_tool_lists(raw_tools, selected)
 
     # Native extended-thinking toggle -> template kwargs, through the per-family
-    # mapping (model_meta): "enabled" turns thinking on for templates that
-    # default it off (gemma4); an explicit "disabled" is forwarded so templates
-    # that default ON can honor it. A bare {"enable_thinking": bool} here was
-    # inert for families whose template reads a different knob (M3's
-    # thinking_mode).
+    # mapping in model_meta (a bare enable_thinking bool is inert for templates
+    # that read a different knob, e.g. M3's thinking_mode).
     from .model_meta import think_toggle_kwargs
 
     ctk: dict[str, Any] = {}

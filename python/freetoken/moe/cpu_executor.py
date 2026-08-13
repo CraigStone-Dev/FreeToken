@@ -55,10 +55,8 @@ _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
 _FLAG_SLOTS_PER_LAYER = 16
 
 # Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. Id 3 is the
-# clamped (up + 1) swiglu: "swigluoai" (MiniMax-M3 over the generic bf16/nvfp4/...
-# GEMV epilogue, with the executor's swiglu_alpha/swiglu_limit scalars) and
-# "gpt_oss_swiglu" (same math, fused inside the mxfp4 kernel with its bias add --
-# act id 3 only reaches the generic epilogue for non-mxfp4 formats).
+# clamped (up + 1) swiglu: "swigluoai" runs it in the generic GEMV epilogue,
+# "gpt_oss_swiglu" is the same math fused inside the mxfp4 kernel.
 _ACT_IDS = {
     "silu": 0,
     "swish": 0,
@@ -74,15 +72,11 @@ _WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
 
 
 def compiled_extension_supports(activation: str) -> bool:
-    """Whether the COMPILED ``_cpu_moe`` extension can serve ``activation``
-    through its generic epilogue (the mxfp4 kernel path handles its act
-    internally and predates the ABI marker; its callers never need this probe).
-
-    A stale prebuilt ``.so`` accepts newer act ids while silently computing the
-    wrong math -- ``CpuMoeExecutor.__init__`` turns that into a hard error, but
-    a DEFAULT decision (the engine's auto offload->hybrid upgrade) should
-    consult this first and degrade to offload with a log line instead of
-    crashing the default boot after the full weight load."""
+    """Whether the compiled ``_cpu_moe`` extension can serve ``activation``
+    through its generic epilogue. A stale prebuilt .so accepts newer act ids
+    while silently computing the wrong math; the executor hard-errors on that,
+    but the engine's auto offload->hybrid upgrade consults this first so a
+    default boot degrades to offload instead of crashing after weight load."""
     if activation not in _ACT_IDS:
         return False
     if _ACT_IDS[activation] < 3:
@@ -174,11 +168,10 @@ class CpuMoeExecutor:
             )
         if activation not in _ACT_IDS:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
-        # ABI probe: act ids past the original silu/gelu family are computed by the
-        # extension's GENERIC epilogue for non-mxfp4 formats ("gpt_oss_swiglu" rides
-        # inside the mxfp4 kernel and predates the marker). A stale prebuilt
-        # _cpu_moe.so accepts newer ids without error and silently computes the
-        # wrong activation -- fail loudly with the rebuild instruction instead.
+        # ABI probe: a stale prebuilt _cpu_moe.so accepts newer act ids without
+        # error and silently computes the wrong activation in the generic
+        # epilogue -- fail loudly with the rebuild instruction instead. (mxfp4
+        # handles its act inside the kernel and predates the marker.)
         if _ACT_IDS[activation] >= 3 and fmt != "mxfp4_triton":
             supported = getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
             if _ACT_IDS[activation] > supported:

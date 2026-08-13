@@ -891,8 +891,8 @@ def test_convert_reasoning_effort_none_disables_thinking():
 
 
 def test_convert_reasoning_toggle_routes_through_family_mapping():
-    """PR#110 round-2: the toggle goes through model_meta's per-family mapping --
-    for M3 that is thinking_mode, not the (inert) enable_thinking key."""
+    """The toggle goes through model_meta's per-family mapping -- for M3 that is
+    thinking_mode, not the (inert) enable_thinking key."""
     req = ResponsesRequest.model_validate(
         {"model": "m", "input": "hi", "reasoning": {"effort": "high"}}
     )

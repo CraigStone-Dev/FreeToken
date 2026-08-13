@@ -167,9 +167,9 @@ def test_detect_and_parse_unknown_tool_follows_forwarding_policy():
 
 
 def test_quoted_invoke_opener_is_data_not_call():
-    """A parameter VALUE quoting the invoke wire syntax must parse as data, not
-    spawn a phantom call (PR#110 round-2: raw finditer over the block produced a
-    second write_file {} call and diverged from streaming)."""
+    """A parameter value quoting the invoke wire syntax must parse as data --
+    a raw regex over the block used to spawn a phantom call and diverge from
+    streaming."""
     quoted = f'see {NS}<invoke name="write_file"> for the syntax'
     text = _block(
         f'{NS}<invoke name="get_weather">{NS}<city>{quoted}{NS}</city>{NS}</invoke>\n'
@@ -207,8 +207,8 @@ def test_quoted_wrapper_closer_is_data_not_block_end():
 
 def test_multiline_string_argument_verbatim():
     """The template renders leaf values verbatim; the round-trip must preserve
-    them verbatim too -- strip("\\n") ate the trailing newline of multi-line
-    string arguments (PR#110 round-2)."""
+    them verbatim too (stripping ate the trailing newline of multi-line string
+    arguments)."""
     tools = [
         Tool(function=Function(name="write_file", parameters={
             "type": "object",
@@ -227,9 +227,9 @@ def test_multiline_string_argument_verbatim():
 
 
 def test_nested_schema_types_string_leaves():
-    """Nested leaves honor the declared schema (PR#110 round-2: string-typed
-    nested fields arrived as loose-JSON numbers/bools); undeclared nested leaves
-    keep the loose-JSON fallback."""
+    """Nested leaves honor the declared schema (string-typed fields stay
+    strings instead of loose-JSON numbers/bools); undeclared nested leaves keep
+    the loose-JSON fallback."""
     tools = [
         Tool(function=Function(name="create_order", parameters={
             "type": "object",
@@ -328,7 +328,7 @@ def test_auto_selection_picks_minimax_m3():
 
 
 # ---------------------------------------------------------------------------
-# PR #110 review regressions
+# Review regressions
 # ---------------------------------------------------------------------------
 def test_reasoning_adaptive_leading_bare_closer_one_shot():
     # Adaptive non-thinking turns START with a bare </mm:think> written by the
@@ -475,10 +475,9 @@ def test_args_empty_value_is_empty_string():
 
 
 def test_args_repeated_siblings_keep_parent_key():
-    """Reference semantics (PR#110 cross-validation): only <item> children render
-    as a bare array; repeated same-name siblings under any OTHER tag stay an
-    object with an array-valued key -- the old bare-list collapse dropped the
-    parent key both references keep."""
+    """Only <item> children render as a bare array; repeated same-name siblings
+    under any other tag stay an object with an array-valued key (the bare-list
+    collapse dropped the parent key the references keep)."""
     det = MiniMaxM3Detector()
     body = (
         f"{NS}<items>{NS}<sku>a{NS}</sku>{NS}<sku>b{NS}</sku>{NS}</items>"
@@ -492,9 +491,9 @@ def test_args_repeated_siblings_keep_parent_key():
 
 
 def test_element_semantics_reference_batch():
-    """PR#110 cross-validation batch: empty container-typed params, anyOf
-    coercion, dangling-closer leniency, single-quoted invoke name, $text for
-    mixed content, and float preservation -- all reference-confirmed."""
+    """Element-grammar batch: empty container-typed params, anyOf coercion,
+    dangling-closer leniency, single-quoted invoke name, $text for mixed
+    content, and float preservation."""
     tools = [
         Tool(function=Function(name="t", parameters={
             "type": "object",
@@ -544,10 +543,9 @@ def test_element_semantics_reference_batch():
 
 
 def test_reasoning_one_shot_matches_streaming_positionally():
-    """PR#110 cross-validation item 7: the base one-shot retroactively relabeled
-    prose BEFORE a mid-content <mm:think> as reasoning while streaming kept it
-    as content -- the two paths must agree (positional anchor), and a LATER
-    quoted marker occurrence is data (item 8's replace-all corruption)."""
+    """One-shot and streaming must agree positionally: prose before a
+    mid-content <mm:think> stays content, and a later quoted marker occurrence
+    is data."""
     text = "intro <mm:think>deep thought</mm:think> answer quoting <mm:think> literally"
     one = MiniMaxM3ReasoningParser(force_reasoning=False).detect_and_parse(text)
     assert one.reasoning_text == "deep thought"

@@ -2405,26 +2405,17 @@ class MiniMaxM3Detector(BaseFormatDetector):
         ]<]minimax[>[</invoke>
         ]<]minimax[>[</tool_call>
 
-    Top-level leaf parameters are typed from the tool schema
-    (``_convert_param_value``); nested leaves fall back to loose-JSON typing.
-    Element scanning is LENIENT: stray text between elements is skipped (never
-    rejecting the parameters that did parse), an empty element is the empty
-    string (not ``{}``), repeated sibling tags aggregate into a list, and a
-    truncated trailing element salvages every complete sibling before it --
-    which is what makes ``recover_truncated_call`` work for calls cut off by
-    max_tokens.
+    Leaf values are typed from the tool schema at every nesting level (loose JSON
+    when undeclared). Element scanning is lenient -- malformed tags and stray text
+    never void the parameters that did parse, and a truncated trailing element
+    salvages every complete sibling (which is what makes ``recover_truncated_call``
+    work for calls cut off by max_tokens).
 
     Streaming: text outside the wrapper streams live (holding back a partial
     marker suffix); inside the wrapper each completed ``</invoke>`` emits its call
-    in one piece (name announcement + the full arguments JSON as one fragment) --
-    the recursive grammar has no prefix-stable partial-arguments rendering, so
-    fragments trivially satisfy ``args_fragments_prefix_stable``. Wire order is
-    preserved (text arriving after a call in the same chunk defers to the next
-    increment), a closed wrapper loops back to the idle scan (a second block or a
-    split marker in the residue is handled, never leaked), and the buffer KEEPS
-    the wrapper opener while inside a block so the base ``finish_streaming``
-    suppresses truncated-markup residue and ``recover_truncated_call`` can
-    re-parse it.
+    in one piece, wire order preserved. The buffer keeps the wrapper opener while
+    inside a block so ``finish_streaming`` suppresses truncated-markup residue and
+    ``recover_truncated_call`` can re-parse it.
     """
 
     NS = "]<]minimax[>["
@@ -2433,9 +2424,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = self.NS + "<tool_call>"
         self.eot_token = self.NS + "</tool_call>"
-        # Lenient quoting: the template renders double quotes but models emit
-        # single quotes too (reference-confirmed; the strict regex leaked the
-        # whole block as content).
+        # The template renders double quotes but models emit single quotes too.
         self.invoke_open_re = re.compile(
             re.escape(self.NS) + r'<invoke\s+name=["\']([^"\']+)["\']\s*>'
         )
@@ -2461,24 +2450,17 @@ class MiniMaxM3Detector(BaseFormatDetector):
     _TAG_BAD_CHARS = frozenset(' "<>/')
 
     def _scan_elements(self, text: str) -> tuple:
-        """Scan ``text`` for a sequence of ``NS<k>...NS</k>`` elements; returns
-        ``(items, stray)`` with ``items = [(name, raw_inner), ...]`` and
-        ``stray`` the concatenated inter-element text (mixed text+children
-        surfaces it under ``"$text"``, matching the references). Lenient by
-        design (the model writes this grammar free-form): a malformed tag or a
-        dangling closer is stepped over WITHOUT dropping the well-formed
-        siblings after it, and an UNTERMINATED trailing element stops the scan
-        with every complete sibling already collected (truncation salvage).
-        Same-name nesting is depth-matched so an ``<item>`` containing
-        ``<item>`` closes correctly.
+        """Scan ``text`` for ``NS<k>...NS</k>`` elements; returns ``(items, stray)``
+        where ``stray`` is the inter-element text (surfaced as ``"$text"`` for
+        mixed content). Lenient: malformed tags and dangling closers are stepped
+        over without dropping later siblings, an unterminated trailing element
+        salvages everything before it, and same-name nesting is depth-matched.
 
-        Accepted risk of the leniency: a LEAF value quoting a well-formed
-        element PAIR (``<city>see NS<foo>x NS</foo>``) parses as structure and a
-        value quoting its OWN element's closer ends that element early. Both are
-        the cost of the strict alternative -- where ONE stray character voided
-        every parameter that did parse -- and the model never emits these shapes
-        in well-formed turns. (Quoted invoke/wrapper markers, which DID occur in
-        practice, are handled structurally by ``_scan_invoke_interior``.)
+        Known leniency trade-off: a leaf value quoting a well-formed element pair
+        parses as structure, and one quoting its own closer ends the element
+        early -- the strict alternative voided every parameter over one stray
+        character. (Quoted invoke/wrapper markers are handled structurally by
+        ``_scan_invoke_interior``.)
         """
         items: List[tuple] = []
         stray_parts: List[str] = []
@@ -2524,15 +2506,11 @@ class MiniMaxM3Detector(BaseFormatDetector):
         return items, "".join(stray_parts)
 
     def _typed_leaf(self, raw: str, prop: Any) -> Any:
-        """Leaf dequoting. The template's ``to_xml`` renders leaf values VERBATIM
-        (``NS<k>{{ val }}NS</k>``, no added whitespace), so a schema-string leaf
-        round-trips exactly: stripping would corrupt multi-line string arguments
-        whose leading/trailing newlines are data. Declared non-string types
-        tolerate surrounding whitespace (``int("\\n42\\n")`` etc. is the intent);
-        undeclared leaves fall back to loose JSON, keeping the verbatim text
-        whenever the parse yields a string anyway. A declared-string ``null``
-        stays the literal string: the template deliberately never renders null
-        (fields are omitted), so literal "null" text is data."""
+        """Leaf dequoting. The template renders leaf values verbatim, so string
+        leaves round-trip exactly (stripping would corrupt multi-line arguments).
+        Declared non-string types tolerate surrounding whitespace; undeclared
+        leaves fall back to loose JSON but keep the verbatim text when the parse
+        yields a string anyway."""
         if prop is not None:
             if isinstance(prop, dict) and "type" not in prop:
                 subs = prop.get("anyOf") or prop.get("oneOf")
@@ -2546,8 +2524,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
             if ptype in ("string", "str", "enum"):
                 return raw
             if ptype in ("number", "float", "double"):
-                # An integer literal stays int, but "5.0" stays 5.0 (the shared
-                # converter collapses whole floats; the references keep them).
+                # Integer literals stay int; "5.0" stays 5.0.
                 s = raw.strip()
                 try:
                     return int(s)
@@ -2567,10 +2544,8 @@ class MiniMaxM3Detector(BaseFormatDetector):
         return raw if isinstance(value, str) else value
 
     def _union_leaf(self, raw: str, subs: list) -> Any:
-        """``anyOf`` / ``oneOf``: try each member's STRICT coercion in declared
-        order, keeping the verbatim text when only the string member (or
-        nothing) matches -- the vLLM reference coerces unions; sglang skips
-        them entirely."""
+        """``anyOf``/``oneOf``: try each member's strict coercion in declared
+        order; verbatim text when only the string member (or nothing) matches."""
         s = raw.strip()
         for sub in subs:
             t = str(sub.get("type", "")).strip().lower() if isinstance(sub, dict) else ""
@@ -2607,14 +2582,11 @@ class MiniMaxM3Detector(BaseFormatDetector):
         return self._structure(items, schema, stray=stray)
 
     def _structure(self, items: List[tuple], schema: Any = None, stray: str = "") -> Any:
-        """Composite value from scanned elements, threading the JSON schema down:
-        object ``properties`` (with the ``additionalProperties`` fallback) type
-        their fields, array ``items`` type the elements -- so a nested field
-        declared ``"type": "string"`` arrives as a string, not loose-JSON's best
-        guess. Only ``<item>`` children render as a bare array (the template's
-        array convention); repeated same-name siblings under any OTHER tag stay
-        an object with an array-valued key (the references keep the parent key).
-        Mixed text+children keeps the text under ``"$text"``."""
+        """Composite value from scanned elements, threading the JSON schema down
+        (``properties`` / ``items`` / ``additionalProperties``). Only ``<item>``
+        children render as a bare array -- the template's array convention;
+        repeated siblings under any other tag stay an object with an array-valued
+        key. Mixed text+children keeps the text under ``"$text"``."""
         props = schema.get("properties") if isinstance(schema, dict) else None
         item_schema = schema.get("items") if isinstance(schema, dict) else None
 
@@ -2635,9 +2607,9 @@ class MiniMaxM3Detector(BaseFormatDetector):
         out: Dict[str, Any] = {}
         for key, raw in items:
             sub = _sub_schema(key)
-            # A REPEATED key's elements are the array's members: unwrap the
-            # declared array schema to its items for each one. (A singleton key
-            # keeps the array schema -- its <item> children unwrap inside.)
+            # A repeated key's elements are the array's members: unwrap its array
+            # schema to the item schema. A singleton key keeps the array schema
+            # (its <item> children unwrap inside).
             if (
                 counts[key] > 1
                 and isinstance(sub, dict)
@@ -2675,14 +2647,12 @@ class MiniMaxM3Detector(BaseFormatDetector):
 
     def _scan_invoke_interior(self, text: str, pos: int) -> tuple:
         """Collect parameter elements from ``pos`` (just past an invoke opener)
-        until a TOP-LEVEL ``NS</invoke>`` / ``NS</tool_call>`` / end of text.
-        Close markers are only interpreted BETWEEN elements: a parameter value
-        quoting wire syntax inside a well-formed element can neither terminate
-        the invoke early nor truncate the wrapper block (both were real defects
-        with raw ``str.find`` over the block). Returns ``(items, end_pos,
-        closer)`` with ``closer`` in {"invoke", "eot", None}; ``end_pos`` points
-        AT the closer marker (``len(text)`` when the text ran out -- the
-        truncation-salvage path, every complete element already collected)."""
+        until a top-level ``NS</invoke>`` / ``NS</tool_call>`` / end of text.
+        Close markers are only interpreted between elements, so a value quoting
+        wire syntax can neither end the invoke early nor truncate the block.
+        Returns ``(items, end_pos, closer)`` with ``closer`` in
+        {"invoke", "eot", None}; ``end_pos`` points at the closer marker
+        (``len(text)`` when the text ran out -- truncation salvage)."""
         items: List[tuple] = []
         n = len(text)
         while pos < n:
@@ -2814,12 +2784,10 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 self._m3_in_block = True
                 continue
 
-            # In-block: the buffer keeps the opener (finish_streaming suppression +
-            # recover_truncated_call re-parse both key off has_tool_call(buffer)).
-            # Marker interpretation is structural, matching detect_and_parse: the
-            # first TOP-LEVEL invoke opener or wrapper closer wins, and quoted
-            # wire syntax inside a still-streaming element neither closes the
-            # invoke early nor ends the block.
+            # In-block: the buffer keeps the opener (finish_streaming and
+            # recover_truncated_call key off has_tool_call(buffer)). Markers are
+            # interpreted structurally, same as detect_and_parse: the first
+            # top-level invoke opener or wrapper closer wins.
             body = self._buffer[len(self.bot_token) :]
             action = None
             scan = 0

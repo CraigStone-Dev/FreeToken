@@ -81,19 +81,13 @@ def _freq_ids(freq, num_layers: int) -> Tuple[int, ...]:
     return tuple(i for i, f in enumerate(freq[:num_layers]) if f)
 
 
-# ---------------------------------------------------------------------------------
-# Config-shape normalization. Two shapes reach load_args (every sibling family
-# carries the same dual-shape shim):
-#  * RAW checkpoint dicts (the canonical path today: both MiniMaxAI/MiniMax-M3 and
-#    nvidia/MiniMax-M3-NVFP4 ship auto_map remote code, which keeps the raw
-#    attributes): rope_theta / sparse_attention_config / moe_layer_freq verbatim.
-#  * transformers >= 5's NATIVE minimax_m3_vl TextConfig (reached the moment a
-#    checkpoint arrives without auto_map -- community requants, or upstream
-#    dropping remote code), whose __post_init__ NORMALIZES: rope_theta moves into
-#    rope_parameters, sparse_attention_config/moe_layer_freq are popped into flat
-#    index_* keys + layer_types/mlp_layer_types, and hidden_act is force-set to
-#    "silu" (parse_config pins the real expert activation instead of consuming it).
-# ---------------------------------------------------------------------------------
+# Config-shape normalization. Two shapes reach load_args: raw checkpoint dicts
+# (the auto_map remote-code path keeps rope_theta / sparse_attention_config /
+# moe_layer_freq verbatim), and transformers >= 5's native minimax_m3_vl
+# TextConfig, whose __post_init__ moves rope_theta into rope_parameters, pops the
+# sparse config and moe_layer_freq into flat index_* keys + layer_types /
+# mlp_layer_types, and force-sets hidden_act to "silu". Every sibling family
+# carries the same dual-shape shim.
 def _rope_theta(text_config: Any) -> float:
     theta = getattr(text_config, "rope_theta", None)
     if theta is None:
@@ -103,12 +97,10 @@ def _rope_theta(text_config: Any) -> float:
 
 
 def _sparse_geometry(text_config: Any) -> dict:
-    """The sparse-attention geometry in the RAW ``sparse_attention_config`` dict
-    shape, whichever config shape arrived. The native class ships no flat keys
-    for ``sparse_init_block`` / ``sparse_score_type`` /
-    ``sparse_disable_index_value``: it hardcodes the M3 semantics those keys
-    describe (init 0, max scoring, score-only indexer), so the translation pins
-    the same values."""
+    """The sparse-attention geometry in the raw ``sparse_attention_config`` dict
+    shape, whichever config shape arrived. The native class has no flat keys for
+    init_block / score_type / disable_index_value -- it hardcodes those M3
+    semantics, so the translation pins the same values."""
     raw = getattr(text_config, "sparse_attention_config", None)
     if raw:
         return dict(raw)

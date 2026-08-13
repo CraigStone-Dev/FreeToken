@@ -53,17 +53,15 @@ _PREFILL_SCORE_CHUNK = 4096
 
 
 def _pick_inner_backend(block_size: int) -> str:
-    """FULL backend for the dense leading layers, resolved through the ENGINE's own
-    FULL auto-tree (``_resolve_auto_attention_backend`` -- one resolver, so the two
-    trees can never diverge again: a private copy once gated "fa,fi" on the
-    open-ended ``is_sm90_supported`` and crashed sm_12x boxes at construction),
-    then filtered for page-size compatibility: this pool serves 128-token pages,
-    so a candidate that pins other page sizes (trtllm: 16/32/64) is skipped.
+    """FULL backend for the dense leading layers, resolved through the engine's
+    own FULL auto-tree (one resolver, so the two trees cannot diverge), then
+    filtered for page-size compatibility: this pool serves 128-token pages, so a
+    candidate that pins other page sizes (trtllm: 16/32/64) is skipped.
 
-    ``FREETOKEN_M3_INNER_BACKEND`` overrides (e.g. "triton" on a box whose
-    flashinfer JIT toolchain is broken); the override is validated against the
-    capability matrix so a page-incompatible or non-FULL pick fails at
-    construction with a real message instead of mis-addressing the pool.
+    ``FREETOKEN_M3_INNER_BACKEND`` overrides (e.g. "triton" on a box with a
+    broken flashinfer JIT toolchain); the override is validated so a
+    page-incompatible or non-FULL pick fails at construction with a real
+    message instead of mis-addressing the pool.
     """
     import os
 

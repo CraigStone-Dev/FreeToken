@@ -133,7 +133,7 @@ def test_auto_bsa_sets_block_page_size(monkeypatch):
 
 def test_bsa_rejects_float32_dtype(monkeypatch):
     # --dtype float32 used to pass config validation and die on the pool's
-    # itemsize==2 assert after the model was resident (PR#110 round-2).
+    # itemsize==2 assert only after the model was resident.
     from freetoken.engine.engine import _adjust_config
 
     _patch_env(monkeypatch)

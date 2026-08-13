@@ -52,14 +52,12 @@ def think_chat_template_kwargs(reasoning_parser: str | None, gear: str | None) -
 
 
 def think_toggle_kwargs(reasoning_parser: str | None, enabled: bool) -> dict:
-    """``chat_template_kwargs`` for a protocol-level thinking ON/OFF toggle (the
-    Anthropic ``thinking.type`` object, Responses ``reasoning.effort``), routed
-    through the same per-family mapping as the chat-completions gears -- a
-    hardcoded ``{"enable_thinking": bool}`` is inert for families whose template
-    reads a different knob (M3's ``thinking_mode``). A family without the
-    requested direction (gpt-oss / minimax have no off gear) returns ``{}``:
-    the template has no such knob to set. With no configured parser the
-    protocol-generic key is kept (harmless for templates that ignore it)."""
+    """``chat_template_kwargs`` for a protocol-level thinking on/off toggle
+    (Anthropic ``thinking.type``, Responses ``reasoning.effort``), routed through
+    the same per-family mapping as the chat-completions gears -- a hardcoded
+    ``enable_thinking`` is inert for templates that read a different knob (M3's
+    ``thinking_mode``). A family without the requested direction returns ``{}``;
+    with no configured parser the protocol-generic key is kept."""
     gears, _default = think_spec(reasoning_parser)
     if not gears:
         return {"enable_thinking": enabled}

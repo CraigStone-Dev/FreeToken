@@ -230,13 +230,11 @@ def convert_responses_to_genspec(
     else:
         template_tools, parser_tools = split_tool_lists(raw_tools, selected)
 
-    # Thinking toggle: an explicit chat_template_kwargs extra field wins; else the
-    # protocol-native `reasoning` object (codex sends {"effort": ...}) drives the
-    # template's thinking mode through the per-family mapping (model_meta) --
-    # a bare {"enable_thinking": bool} is inert for families whose template
-    # reads a different knob (M3's thinking_mode). effort "none" explicitly
-    # DISABLES thinking (vLLM maps it the same way); other/unset efforts enable
-    # it, with the effort level forwarded for templates that grade it (gpt-oss).
+    # Thinking toggle: an explicit chat_template_kwargs extra field wins; else
+    # the protocol-native `reasoning` object drives the template through the
+    # per-family mapping in model_meta. effort "none" disables thinking (vLLM
+    # semantics); other efforts enable it and are forwarded for templates that
+    # grade them (gpt-oss).
     from .model_meta import think_toggle_kwargs
 
     ctk = dict(getattr(req, "chat_template_kwargs", None) or {})

@@ -1,31 +1,18 @@
 """MXFP8 (block-32 e8m0-scaled FP8) W8A16 dense linear, shared across models.
 
-MiniMax-M3's modelopt MIXED_PRECISION checkpoint quantizes every dense projection
-(attention q/k/v/o, the leading dense MLPs, the per-layer shared experts, the sparse
-indexer projections) to **MXFP8**: ``weight`` fp8-e4m3 ``[N, K]`` plus a per-output-row,
-per-32-input-column e8m0 scale ``weight_scale_inv`` (uint8 exponent codes ``[N, K//32]``;
-the dequant multiplier is ``2**(code - 127)``, matching vLLM's
-``modelopt`` MXFP8 semantics -- ``_mxfp8_e4m3_quantize_torch`` computes
-``descale = exp2(code - 127)`` and ``w_bf16 = w_fp8 * descale``).
+MiniMax-M3's modelopt checkpoint quantizes every dense projection (q/k/v/o, dense
+MLPs, shared experts, indexer) to MXFP8: fp8-e4m3 ``weight [N, K]`` plus uint8 e8m0
+exponent codes ``weight_scale_inv [N, K//32]``, dequant multiplier ``2**(code - 127)``.
 
-Keeping the weight MXFP8 and reading it directly in a W8A16 GEMV halves the decode
-weight traffic vs a bf16 dequant at load -- decode is weight-bandwidth bound, same
-motivation as ``fp8_pertensor_linear``, whose split-K structure the M==1 kernel
-mirrors. The block-32 scale is loaded ONCE per (BLOCK_N, BLOCK_K//32) tile and
-broadcast in registers -- a per-(n,k)-element scale gather + exp2 costs ~3x the
-whole GEMV (PR#110 review: 424-768 GB/s vs ~2 TB/s for the same-structure
-per-tensor-fp8 kernel).
+Decode is weight-bandwidth bound, so small batches read the fp8 weight directly in a
+split-K GEMV (half the traffic of a bf16-resident weight). The block-32 scale is
+loaded once per tile and broadcast in registers; a per-element scale gather + exp2
+costs ~3x the whole GEMV. Past the GEMV cap the forward dequantizes to bf16
+(``fp8 * 2**k`` is exact in bf16) and runs cuBLAS -- a fused inline-dequant GEMM
+never came close to cuBLAS on these shapes, so the transient is the fast option.
 
-Prefill / batched forward past the GEMV cap (M > 256) does NOT use a custom GEMM:
-it dequantizes the weight to bf16 (``fp8 * 2**k`` is exact in bf16) and runs
-cuBLAS, the same dequant-then-matmul precedent as the NVFP4 prefill path. The
-materialized weight is a per-call bf16 transient; a fused inline-dequant GEMM
-never came within 30x of cuBLAS on these shapes (PR#110 review), so the
-transient's extra HBM round-trip is the fast option by a wide margin.
-
-Numerics: the GEMV dequants fp8->f32 with the pow2 scale in fp32 and accumulates in
-fp32; the M>1 path multiplies in bf16 via cuBLAS with fp32 accumulate (identical to
-serving every other bf16 projection).
+The GEMV accumulates in fp32; the cuBLAS path is bf16 with fp32 accumulate, same as
+any other bf16 projection.
 """
 
 from __future__ import annotations
@@ -44,8 +31,7 @@ MXFP8_BLOCK = 32
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
 # Escape hatch: FREETOKEN_DEBUG_MXFP8_REF=1 swaps the kernels for a pure-torch
-# dequant matmul (numeric reference / A-B debugging). Evaluated once, and logged:
-# an env switch that changes what is served must leave a server-log trace.
+# dequant matmul (numeric reference / A-B debugging). Evaluated once, logged once.
 _USE_REF = os.environ.get("FREETOKEN_DEBUG_MXFP8_REF") == "1"
 if _USE_REF:
     from freetoken.utils import init_logger
@@ -60,17 +46,11 @@ def mxfp8_dequant(weight: torch.Tensor, scale_codes: torch.Tensor,
                   dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
     """Dequant: ``w[n, k] * 2**(codes[n, k//32] - 127)`` -> ``dtype``.
 
-    Serves the M>1 forward (dequant + cuBLAS), the load-time bf16 ablation path
-    (``FREETOKEN_M3_*_MXFP8=0``) and the kernels' numeric reference in tests.
-    ``weight`` ``[..., N, K]`` fp8-e4m3; ``scale_codes`` ``[..., N, K//32]`` uint8
-    e8m0 exponent codes.
-
-    For 16-bit ``dtype`` the whole computation runs in ``dtype``: fp8->bf16 is
-    exact and the pow2 descale is lossless (same argument the GEMV dot kernel
-    relies on when folding the scale before ``tl.dot``), and the fp32 transients
-    would double the peak footprint -- which matters when this runs inside a CUDA
-    graph capture (the transient lands in the shared graph pool). fp32 ``dtype``
-    keeps fp32 compute: it is the numeric REFERENCE in tests.
+    Serves the large-M forward (dequant + cuBLAS), the load-time bf16 ablation
+    path and the kernels' numeric reference in tests. For 16-bit dtypes the
+    whole computation runs in that dtype -- the pow2 descale is lossless there,
+    and fp32 transients would double the peak footprint (which lands in the
+    graph pool when captured). fp32 keeps fp32 compute: it is the reference.
     """
     assert weight.shape[-1] % MXFP8_BLOCK == 0
     assert scale_codes.shape[-1] == weight.shape[-1] // MXFP8_BLOCK
@@ -80,25 +60,12 @@ def mxfp8_dequant(weight: torch.Tensor, scale_codes: torch.Tensor,
     return (w * descale.unsqueeze(-1)).view(weight.shape).to(dtype)
 
 
-# ======================================================================================
-# Small-M (<= 256) split-K GEMV: weight-bandwidth bound, so a small batch rides
-# the SAME single weight pass -- one [M_TILE, BLOCK_K] activation tile joins the
-# fp8 tile in a tensor-core dot (the pow2-descaled fp8 weight is bf16-exact).
-# Without this, bs=2-8 decode fell into the M>1 dequant+cuBLAS path, which
-# materializes the whole bf16 weight per projection per step (~13x slower), and
-# short extend-prefills (a radix-cached chat turn appending 20-60 tokens) paid
-# the same transient on every projection of the step. The e8m0 scale is loaded
-# once per (BLOCK_N, BLOCK_K//32) tile and broadcast in registers -- a
-# per-(n,k)-element gather + exp2 costs ~3x the whole GEMV.
-# ======================================================================================
-# The cap covers the default CUDA-graph ladder max (256): every captured decode
-# batch must take the GEMV, because a captured dequant+cuBLAS call would bake
-# its full-weight transient into the shared graph pool (~2 GiB across the
-# resident projection shapes) AND is the slower path everywhere in graph range
-# (RTX PRO 6000: M=128 GEMV 230us vs 933us; H100: M=128 376us vs 1404us).
-# M_TILE buckets {16..256}; 512 exceeds sm_120's 100 KiB shared-memory budget,
-# and past the ladder only prefill lands here, where cuBLAS amortizes the
-# (now bf16, halved) transient.
+# GEMV cap. Must cover the CUDA-graph ladder max (256): a captured dequant+cuBLAS
+# call would bake its full-weight transient into the shared graph pool (~2 GiB
+# across the resident shapes), and the GEMV is also simply faster everywhere in
+# graph range (M=128: ~230us vs ~930us on RTX PRO 6000). M_TILE buckets {16..256};
+# 512 exceeds sm_120's shared-memory budget. Past the cap only prefill lands here,
+# where cuBLAS amortizes the transient.
 _GEMV_MAX_M = 256
 
 
@@ -108,14 +75,10 @@ def _mxfp8_gemv_m1_splitk_kernel(
     stride_ak, stride_wn, stride_wk, stride_sn, stride_sk, stride_pk, stride_pn,
     BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    """M == 1 specialization: a plain fp32 multiply-reduce (no tensor-core tile;
-    2 <= M <= 64 rides the dot kernel below).
-
-    Architecture note (PR#110 follow-up review): the dot tile's 16-row padding
-    costs ~30% at M=1 on RTX PRO 6000 / RTX 5090 measurements, which is why this
-    kernel exists -- but on H100 the dot kernel at M=1 is ~26% FASTER than this
-    one. If sm_90 becomes a serving target, benchmark both there and dispatch by
-    arch (or drop this kernel and route M=1 through the dot tile)."""
+    """M == 1 specialization: a plain fp32 multiply-reduce. The dot tile's 16-row
+    padding costs ~30% at M=1 on RTX PRO 6000 / 5090, hence this kernel -- but on
+    H100 the dot kernel is ~26% faster even at M=1. If sm_90 becomes a serving
+    target, re-benchmark and dispatch by arch (or drop this kernel)."""
     KB32: tl.constexpr = BLOCK_K // 32
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
