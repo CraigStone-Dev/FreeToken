@@ -2433,8 +2433,11 @@ class MiniMaxM3Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = self.NS + "<tool_call>"
         self.eot_token = self.NS + "</tool_call>"
+        # Lenient quoting: the template renders double quotes but models emit
+        # single quotes too (reference-confirmed; the strict regex leaked the
+        # whole block as content).
         self.invoke_open_re = re.compile(
-            re.escape(self.NS) + r'<invoke\s+name="([^"]+)"\s*>'
+            re.escape(self.NS) + r'<invoke\s+name=["\']([^"\']+)["\']\s*>'
         )
         self._invoke_close = self.NS + "</invoke>"
         # While True, self._buffer starts with bot_token (the retained opener).
@@ -2457,33 +2460,41 @@ class MiniMaxM3Detector(BaseFormatDetector):
     # ---- lenient recursive parameter-XML scanning ------------------------------------
     _TAG_BAD_CHARS = frozenset(' "<>/')
 
-    def _scan_elements(self, text: str) -> List[tuple]:
+    def _scan_elements(self, text: str) -> tuple:
         """Scan ``text`` for a sequence of ``NS<k>...NS</k>`` elements; returns
-        ``[(name, raw_inner), ...]``. Lenient by design (the model writes this
-        grammar free-form): stray text between elements is skipped, a malformed
-        tag is stepped over, and an UNTERMINATED trailing element stops the scan
+        ``(items, stray)`` with ``items = [(name, raw_inner), ...]`` and
+        ``stray`` the concatenated inter-element text (mixed text+children
+        surfaces it under ``"$text"``, matching the references). Lenient by
+        design (the model writes this grammar free-form): a malformed tag or a
+        dangling closer is stepped over WITHOUT dropping the well-formed
+        siblings after it, and an UNTERMINATED trailing element stops the scan
         with every complete sibling already collected (truncation salvage).
-        Same-name nesting is depth-matched so an ``<item>`` containing ``<item>``
-        closes correctly.
+        Same-name nesting is depth-matched so an ``<item>`` containing
+        ``<item>`` closes correctly.
 
         Accepted risk of the leniency: a LEAF value quoting a well-formed
-        element PAIR (``<city>see NS<foo>x NS</foo>``) parses as structure, a
-        value quoting its OWN element's closer ends that element early, and a
-        malformed tag's dangling closer truncates the scan. All are the cost of
-        the strict alternative -- where ONE stray character voided every
-        parameter that did parse -- and the model never emits these shapes in
-        well-formed turns. (Quoted invoke/wrapper markers, which DID occur in
+        element PAIR (``<city>see NS<foo>x NS</foo>``) parses as structure and a
+        value quoting its OWN element's closer ends that element early. Both are
+        the cost of the strict alternative -- where ONE stray character voided
+        every parameter that did parse -- and the model never emits these shapes
+        in well-formed turns. (Quoted invoke/wrapper markers, which DID occur in
         practice, are handled structurally by ``_scan_invoke_interior``.)
         """
         items: List[tuple] = []
+        stray_parts: List[str] = []
         pos, n = 0, len(text)
         while pos < n:
             nxt = text.find(self.NS + "<", pos)
             if nxt == -1:
-                break  # trailing stray text: ignored
+                stray_parts.append(text[pos:])
+                break
+            stray_parts.append(text[pos:nxt])
             pos = nxt
             if text.startswith(self.NS + "</", pos):
-                break  # a close tag we did not open leaked into this slice: stop
+                # A close tag we did not open: model noise -- skip the marker and
+                # keep scanning (aborting dropped every later sibling).
+                pos += len(self.NS) + 2
+                continue
             tag_start = pos + len(self.NS) + 1
             gt = text.find(">", tag_start)
             if gt == -1:
@@ -2498,7 +2509,8 @@ class MiniMaxM3Detector(BaseFormatDetector):
             while depth:
                 cpos = text.find(close_tag, search)
                 if cpos == -1:
-                    return items  # unterminated element: salvage what parsed
+                    # unterminated element: salvage what parsed
+                    return items, "".join(stray_parts)
                 opos = text.find(open_tag, search)
                 if opos != -1 and opos < cpos:
                     depth += 1
@@ -2509,7 +2521,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
                     search = cpos + len(close_tag)
             items.append((name, text[gt + 1 : inner_end]))
             pos = search
-        return items
+        return items, "".join(stray_parts)
 
     def _typed_leaf(self, raw: str, prop: Any) -> Any:
         """Leaf dequoting. The template's ``to_xml`` renders leaf values VERBATIM
@@ -2522,6 +2534,10 @@ class MiniMaxM3Detector(BaseFormatDetector):
         stays the literal string: the template deliberately never renders null
         (fields are omitted), so literal "null" text is data."""
         if prop is not None:
+            if isinstance(prop, dict) and "type" not in prop:
+                subs = prop.get("anyOf") or prop.get("oneOf")
+                if isinstance(subs, list) and subs:
+                    return self._union_leaf(raw, subs)
             ptype = (
                 str(prop.get("type", "string")).strip().lower()
                 if isinstance(prop, dict)
@@ -2529,6 +2545,20 @@ class MiniMaxM3Detector(BaseFormatDetector):
             )
             if ptype in ("string", "str", "enum"):
                 return raw
+            if ptype in ("number", "float", "double"):
+                # An integer literal stays int, but "5.0" stays 5.0 (the shared
+                # converter collapses whole floats; the references keep them).
+                s = raw.strip()
+                try:
+                    return int(s)
+                except ValueError:
+                    try:
+                        return float(s)
+                    except ValueError:
+                        return raw
+            if ptype in ("object", "array") and raw.strip() == "":
+                # Empty container-typed element -> typed empty container.
+                return {} if ptype == "object" else []
             return self._convert_param_value(raw.strip(), "_", {"_": prop}, "")
         if raw.strip() == "":
             # An empty element is the empty STRING; loose-JSON would make it {}.
@@ -2536,41 +2566,92 @@ class MiniMaxM3Detector(BaseFormatDetector):
         value = _parse_loose_json_value(raw.strip())
         return raw if isinstance(value, str) else value
 
+    def _union_leaf(self, raw: str, subs: list) -> Any:
+        """``anyOf`` / ``oneOf``: try each member's STRICT coercion in declared
+        order, keeping the verbatim text when only the string member (or
+        nothing) matches -- the vLLM reference coerces unions; sglang skips
+        them entirely."""
+        s = raw.strip()
+        for sub in subs:
+            t = str(sub.get("type", "")).strip().lower() if isinstance(sub, dict) else ""
+            if t in ("integer", "int"):
+                try:
+                    return int(s)
+                except ValueError:
+                    continue
+            if t in ("number", "float", "double"):
+                try:
+                    return int(s)
+                except ValueError:
+                    try:
+                        return float(s)
+                    except ValueError:
+                        continue
+            if t in ("boolean", "bool") and s.lower() in ("true", "false"):
+                return s.lower() == "true"
+            if t == "null" and s.lower() == "null":
+                return None
+            if t in ("object", "array"):
+                try:
+                    v = json.loads(s)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(v, dict if t == "object" else list):
+                    return v
+        return raw
+
     def _nested_value(self, raw: str, schema: Any = None) -> Any:
-        items = self._scan_elements(raw)
+        items, stray = self._scan_elements(raw)
         if not items:
             return self._typed_leaf(raw, schema)
-        return self._structure(items, schema)
+        return self._structure(items, schema, stray=stray)
 
-    def _structure(self, items: List[tuple], schema: Any = None) -> Any:
+    def _structure(self, items: List[tuple], schema: Any = None, stray: str = "") -> Any:
         """Composite value from scanned elements, threading the JSON schema down:
-        object properties type their fields, array ``items`` type the elements --
-        so a nested field declared ``"type": "string"`` arrives as a string, not
-        loose-JSON's best guess."""
+        object ``properties`` (with the ``additionalProperties`` fallback) type
+        their fields, array ``items`` type the elements -- so a nested field
+        declared ``"type": "string"`` arrives as a string, not loose-JSON's best
+        guess. Only ``<item>`` children render as a bare array (the template's
+        array convention); repeated same-name siblings under any OTHER tag stay
+        an object with an array-valued key (the references keep the parent key).
+        Mixed text+children keeps the text under ``"$text"``."""
         props = schema.get("properties") if isinstance(schema, dict) else None
         item_schema = schema.get("items") if isinstance(schema, dict) else None
+
+        def _sub_schema(key: str) -> Any:
+            sub = props.get(key) if isinstance(props, dict) else None
+            if sub is None and isinstance(schema, dict):
+                ap = schema.get("additionalProperties")
+                if isinstance(ap, dict):
+                    sub = ap
+            return sub
+
         names = {k for k, _ in items}
-        # Arrays: the template renders one <item> per element; repeated same-name
-        # siblings under any tag are also a list (never silently collapse to the
-        # last value).
-        if len(names) == 1 and (len(items) > 1 or next(iter(names)) == "item"):
-            only = next(iter(names))
-            sub = item_schema if only == "item" else (
-                props.get(only) if isinstance(props, dict) else None
-            )
-            if isinstance(sub, dict) and str(sub.get("type", "")).lower() == "array":
-                sub = sub.get("items")
-            return [self._nested_value(raw, sub) for _, raw in items]
+        if names == {"item"}:
+            return [self._nested_value(raw, item_schema) for _, raw in items]
+        counts: Dict[str, int] = {}
+        for k, _ in items:
+            counts[k] = counts.get(k, 0) + 1
         out: Dict[str, Any] = {}
         for key, raw in items:
-            value = self._nested_value(
-                raw, props.get(key) if isinstance(props, dict) else None
-            )
+            sub = _sub_schema(key)
+            # A REPEATED key's elements are the array's members: unwrap the
+            # declared array schema to its items for each one. (A singleton key
+            # keeps the array schema -- its <item> children unwrap inside.)
+            if (
+                counts[key] > 1
+                and isinstance(sub, dict)
+                and str(sub.get("type", "")).lower() == "array"
+            ):
+                sub = sub.get("items")
+            value = self._nested_value(raw, sub)
             if key in out:
                 prev = out[key]
                 out[key] = (prev if isinstance(prev, list) else [prev]) + [value]
             else:
                 out[key] = value
+        if stray.strip():
+            out["$text"] = stray.strip()
         return out
 
     def _args_from_items(
@@ -2580,9 +2661,9 @@ class MiniMaxM3Detector(BaseFormatDetector):
         args: Dict[str, Any] = {}
         for key, raw in items:
             prop = config.get(key) if isinstance(config, dict) and key in config else None
-            nested = self._scan_elements(raw)
+            nested, stray = self._scan_elements(raw)
             if nested:
-                value: Any = self._structure(nested, prop)
+                value: Any = self._structure(nested, prop, stray=stray)
             else:
                 value = self._typed_leaf(raw, prop)
             if key in args:
@@ -2603,7 +2684,6 @@ class MiniMaxM3Detector(BaseFormatDetector):
         AT the closer marker (``len(text)`` when the text ran out -- the
         truncation-salvage path, every complete element already collected)."""
         items: List[tuple] = []
-        collecting = True
         n = len(text)
         while pos < n:
             nxt = text.find(self.NS + "<", pos)
@@ -2615,9 +2695,8 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 return items, nxt, "eot"
             pos = nxt
             if text.startswith(self.NS + "</", pos):
-                # Dangling closer we did not open: stop collecting (ambiguous
-                # structure) but keep scanning for the real invoke boundary.
-                collecting = False
+                # Dangling closer we did not open: model noise -- skip it and
+                # keep collecting (the references keep well-formed siblings).
                 pos += len(self.NS) + 2
                 continue
             tag_start = pos + len(self.NS) + 1
@@ -2643,8 +2722,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
                     depth -= 1
                     inner_end = cpos
                     search = cpos + len(close_tag)
-            if collecting:
-                items.append((name, text[gt + 1 : inner_end]))
+            items.append((name, text[gt + 1 : inner_end]))
             pos = search
         return items, n, None
 

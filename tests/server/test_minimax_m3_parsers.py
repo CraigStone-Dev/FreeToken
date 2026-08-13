@@ -474,7 +474,11 @@ def test_args_empty_value_is_empty_string():
     assert json.loads(res.calls[0].parameters) == {"city": ""}
 
 
-def test_args_repeated_siblings_become_list():
+def test_args_repeated_siblings_keep_parent_key():
+    """Reference semantics (PR#110 cross-validation): only <item> children render
+    as a bare array; repeated same-name siblings under any OTHER tag stay an
+    object with an array-valued key -- the old bare-list collapse dropped the
+    parent key both references keep."""
     det = MiniMaxM3Detector()
     body = (
         f"{NS}<items>{NS}<sku>a{NS}</sku>{NS}<sku>b{NS}</sku>{NS}</items>"
@@ -483,8 +487,96 @@ def test_args_repeated_siblings_become_list():
     text = _block(f'{NS}<invoke name="create_order">{body}{NS}</invoke>\n')
     res = det.detect_and_parse(text, _tools())
     args = json.loads(res.calls[0].parameters)
-    assert args["items"] == ["a", "b"]  # same-name siblings aggregate
-    assert args["note"] == ["x", "y"]  # repeated top-level params too
+    assert args["items"] == {"sku": ["a", "b"]}  # parent key kept, values aggregate
+    assert args["note"] == ["x", "y"]  # repeated top-level params still aggregate
+
+
+def test_element_semantics_reference_batch():
+    """PR#110 cross-validation batch: empty container-typed params, anyOf
+    coercion, dangling-closer leniency, single-quoted invoke name, $text for
+    mixed content, and float preservation -- all reference-confirmed."""
+    tools = [
+        Tool(function=Function(name="t", parameters={
+            "type": "object",
+            "properties": {
+                "obj": {"type": "object"},
+                "arr": {"type": "array"},
+                "uni": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+                "price": {"type": "number"},
+            },
+        }))
+    ]
+    det = MiniMaxM3Detector()
+    body = (
+        f"{NS}<obj>{NS}</obj>"
+        f"{NS}<arr>{NS}</arr>"
+        f"{NS}<uni>42{NS}</uni>"
+        f"{NS}<price>5.0{NS}</price>"
+    )
+    text = _block(f'{NS}<invoke name="t">{body}{NS}</invoke>\n')
+    args = json.loads(det.detect_and_parse(text, tools).calls[0].parameters)
+    assert args["obj"] == {} and args["arr"] == []  # typed empty containers
+    assert args["uni"] == 42  # anyOf: integer member coerces
+    assert args["price"] == 5.0 and isinstance(args["price"], float)  # not 5
+
+    # anyOf falls back to the string member verbatim
+    text2 = _block(f'{NS}<invoke name="t">{NS}<uni>hello{NS}</uni>{NS}</invoke>\n')
+    args2 = json.loads(MiniMaxM3Detector().detect_and_parse(text2, tools).calls[0].parameters)
+    assert args2["uni"] == "hello"
+
+    # a dangling closer no longer drops the well-formed siblings after it
+    body3 = f"{NS}</ghost>{NS}<uni>7{NS}</uni>"
+    text3 = _block(f'{NS}<invoke name="t">{body3}{NS}</invoke>\n')
+    args3 = json.loads(MiniMaxM3Detector().detect_and_parse(text3, tools).calls[0].parameters)
+    assert args3["uni"] == 7
+
+    # single-quoted name= parses (double quotes are the template's rendering,
+    # but models emit single quotes too)
+    text4 = _block(f"{NS}<invoke name='t'>{NS}<uni>1{NS}</uni>{NS}</invoke>\n")
+    res4 = MiniMaxM3Detector().detect_and_parse(text4, tools)
+    assert [c.name for c in res4.calls] == ["t"]
+
+    # mixed text+children keeps the text under $text
+    body5 = f"{NS}<obj>freeform {NS}<k>v{NS}</k>{NS}</obj>"
+    text5 = _block(f'{NS}<invoke name="t">{body5}{NS}</invoke>\n')
+    args5 = json.loads(MiniMaxM3Detector().detect_and_parse(text5, tools).calls[0].parameters)
+    assert args5["obj"] == {"k": "v", "$text": "freeform"}
+
+
+def test_reasoning_one_shot_matches_streaming_positionally():
+    """PR#110 cross-validation item 7: the base one-shot retroactively relabeled
+    prose BEFORE a mid-content <mm:think> as reasoning while streaming kept it
+    as content -- the two paths must agree (positional anchor), and a LATER
+    quoted marker occurrence is data (item 8's replace-all corruption)."""
+    text = "intro <mm:think>deep thought</mm:think> answer quoting <mm:think> literally"
+    one = MiniMaxM3ReasoningParser(force_reasoning=False).detect_and_parse(text)
+    assert one.reasoning_text == "deep thought"
+    assert one.normal_text == "intro  answer quoting <mm:think> literally"
+
+    p = MiniMaxM3ReasoningParser(force_reasoning=False)
+    reasoning, content = [], []
+    for i in range(0, len(text), 3):
+        r = p.parse_streaming_increment(text[i : i + 3])
+        reasoning.append(r.reasoning_text)
+        content.append(r.normal_text)
+    r = p.flush()
+    reasoning.append(r.reasoning_text)
+    content.append(r.normal_text)
+    assert "".join(reasoning) == one.reasoning_text
+    assert "".join(content) == one.normal_text
+
+
+def test_reasoning_one_shot_verbatim_no_strip():
+    # whitespace around reasoning/content is data (references are verbatim)
+    r = MiniMaxM3ReasoningParser(force_reasoning=False).detect_and_parse(
+        "<mm:think>\nthink\n</mm:think>\nanswer\n"
+    )
+    assert r.reasoning_text == "\nthink\n"
+    assert r.normal_text == "\nanswer\n"
+    r2 = MiniMaxM3ReasoningParser(force_reasoning=True).detect_and_parse(
+        "th\n</mm:think>\nans\n"
+    )
+    assert r2.reasoning_text == "th\n" and r2.normal_text == "\nans\n"
 
 
 def test_detect_and_parse_multiple_wrappers_and_inter_block_text():

@@ -449,10 +449,49 @@ class MiniMaxM3ReasoningParser(BaseReasoningParser):
         self._head_buffer = ""
 
     def detect_and_parse(self, text: str) -> ReasoningParseResult:
-        if not self.force_reasoning and text.lstrip().startswith(self.think_end_token):
-            head = text.lstrip()[len(self.think_end_token) :]
-            return ReasoningParseResult(normal_text=head.strip())
-        return super().detect_and_parse(text)
+        """One-shot parse, POSITIONAL and VERBATIM, matching this parser's own
+        streaming path and the reference grammar (PR#110 cross-validation: the
+        base one-shot relabeled prose BEFORE a mid-content ``<mm:think>`` as
+        reasoning, ``.strip()``-ed both sides, and ``replace``d EVERY marker
+        occurrence -- corrupting content that quotes the marker). Reasoning is
+        anchored at the FIRST opener the model wrote; prose before it stays
+        content, later occurrences are data, and nothing is whitespace-trimmed.
+        """
+        end = self.think_end_token
+        if self.force_reasoning:
+            # enabled gear: the template pre-opened the think block.
+            reasoning, sep, rest = text.partition(end)
+            if sep:
+                return ReasoningParseResult(reasoning_text=reasoning, normal_text=rest)
+            # No closer: a malformed turn running straight into a tool block
+            # ends reasoning there (dsv4 precedent); else truncated reasoning.
+            if self.tool_start_token is not None and self.tool_start_token in text:
+                t = text.find(self.tool_start_token)
+                return ReasoningParseResult(
+                    reasoning_text=text[:t], normal_text=text[t:]
+                )
+            return ReasoningParseResult(reasoning_text=text)
+        # adaptive: a leading bare closer is "thinking off for this turn"
+        # (whitespace-tolerant head, same as streaming).
+        head = text.lstrip()
+        if head.startswith(end):
+            return ReasoningParseResult(normal_text=head[len(end) :])
+        start = text.find(self.think_start_token)
+        if start == -1:
+            return ReasoningParseResult(normal_text=text)
+        before = text[:start]
+        body = text[start + len(self.think_start_token) :]
+        reasoning, sep, rest = body.partition(end)
+        if sep:
+            return ReasoningParseResult(
+                reasoning_text=reasoning, normal_text=before + rest
+            )
+        if self.tool_start_token is not None and self.tool_start_token in body:
+            t = body.find(self.tool_start_token)
+            return ReasoningParseResult(
+                reasoning_text=body[:t], normal_text=before + body[t:]
+            )
+        return ReasoningParseResult(reasoning_text=body)
 
     def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
         if self._leading_closer_pending:
