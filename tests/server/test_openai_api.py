@@ -161,6 +161,50 @@ def test_chat_request_reasoning_replay_field_aliases():
         assert asst["thinking"] == "prior thought", field
 
 
+def _chat_req(**extra) -> ChatCompletionRequest:
+    return ChatCompletionRequest.model_validate(
+        {"model": "m", "messages": [{"role": "user", "content": "hi"}], **extra}
+    )
+
+
+def test_chat_reasoning_effort_enables_thinking():
+    spec = chat_request_to_genspec(_chat_req(reasoning_effort="high"), {})
+    assert spec.chat_template_kwargs == {"enable_thinking": True, "reasoning_effort": "high"}
+
+    # explicit chat_template_kwargs extra field wins over the effort mapping
+    spec = chat_request_to_genspec(
+        _chat_req(reasoning_effort="none", chat_template_kwargs={"enable_thinking": True}), {}
+    )
+    assert spec.chat_template_kwargs == {"enable_thinking": True}
+
+    # absent effort -> kwargs pass through untouched
+    assert chat_request_to_genspec(_chat_req(), {}).chat_template_kwargs == {}
+
+
+def test_chat_reasoning_effort_none_disables_thinking():
+    # vLLM-compatible semantics: an explicit effort "none" DISABLES thinking.
+    spec = chat_request_to_genspec(_chat_req(reasoning_effort="none"), {})
+    assert spec.chat_template_kwargs == {"enable_thinking": False}
+
+
+def test_chat_reasoning_effort_routes_through_family_mapping():
+    """The toggle goes through model_meta's per-family mapping -- for M3 that is
+    thinking_mode, not the (inert) enable_thinking key."""
+    on = _chat_req(reasoning_effort="high")
+    spec = chat_request_to_genspec(on, {}, reasoning_parser="minimax_m3")
+    assert spec.chat_template_kwargs == {"thinking_mode": "enabled", "reasoning_effort": "high"}
+
+    off = _chat_req(reasoning_effort="none")
+    spec = chat_request_to_genspec(off, {}, reasoning_parser="minimax_m3")
+    assert spec.chat_template_kwargs == {"thinking_mode": "disabled"}
+
+    # gpt-oss: the template grades effort and has no off gear
+    spec = chat_request_to_genspec(on, {}, reasoning_parser="gpt_oss")
+    assert spec.chat_template_kwargs == {"reasoning_effort": "high"}
+    spec = chat_request_to_genspec(off, {}, reasoning_parser="gpt_oss")
+    assert spec.chat_template_kwargs == {}
+
+
 def test_non_stream_chat_completion_returns_openai_tool_calls_and_sends_tools():
     output = '[TOOL_CALLS] [{"name":"get_weather","arguments":{"city":"Paris"}}]'
     state = FakeState(
