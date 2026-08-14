@@ -43,18 +43,11 @@ def chat_request_to_genspec(
     reasoning_parser: str | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
-    from .model_meta import think_toggle_kwargs
+    from .model_meta import effort_toggle_kwargs
 
-    # Thinking toggle: an explicit chat_template_kwargs extra field wins; else
-    # top-level reasoning_effort drives the template through the per-family
-    # mapping in model_meta. Effort "none" disables thinking (vLLM semantics);
-    # other efforts enable it and are forwarded for templates that grade them
-    # (gpt-oss).
     ctk = req.chat_template_kwargs
-    if req.reasoning_effort and not ctk:
-        ctk = dict(think_toggle_kwargs(reasoning_parser, req.reasoning_effort != "none"))
-        if req.reasoning_effort != "none":
-            ctk.setdefault("reasoning_effort", req.reasoning_effort)
+    if req.reasoning_effort:
+        ctk = effort_toggle_kwargs(reasoning_parser, req.reasoning_effort, ctk)
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=resolve_sampling(
