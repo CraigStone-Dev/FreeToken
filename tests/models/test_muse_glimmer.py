@@ -393,6 +393,9 @@ def test_raw_config_shim_serves_unknown_model_type(tmp_path):
     assert cfg.text_config.rope_parameters.get("rope_theta") == 1e4
     assert getattr(cfg, "missing_field", None) is None
     assert cfg.to_dict()["dtype"] == "bfloat16"
+    # _name_or_path survives the underscore guard (DSV4's parse_config reads it
+    # to locate inference/config.json) and the cached copy keeps it.
+    assert cfg._name_or_path == str(tmp_path)
 
 
 def test_model_state_dict_matches_loader_keys():

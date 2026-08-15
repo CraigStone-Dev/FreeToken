@@ -145,6 +145,11 @@ class RawConfigShim:
         self._data = {**(data or {}), **kwargs}
 
     def __getattr__(self, name: str) -> Any:
+        if name == "_name_or_path":
+            # PretrainedConfig carries the checkpoint path under this name and
+            # DSV4's parse_config reads it (to find inference/config.json), so it
+            # must survive the underscore guard below.
+            return self.__dict__.get("_data", {}).get("_name_or_path", "")
         if name.startswith("_"):
             raise AttributeError(name)
         try:
@@ -180,7 +185,7 @@ def _load_hf_config(model_path: str) -> Any:
         # Anything else (bad path, malformed JSON) stays fatal.
         if "model type" not in str(exc):
             raise
-        return RawConfigShim(_raw_config_json(model_path))
+        return RawConfigShim(_raw_config_json(model_path), _name_or_path=model_path)
 
 
 def cached_load_hf_config(model_path: str) -> PretrainedConfig:

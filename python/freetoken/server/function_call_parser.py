@@ -27,6 +27,16 @@ from partial_json_parser.core.options import Allow
 from pydantic import BaseModel
 
 from .api_models import Function, Tool
+from .reasoning_parser import (
+    ATEM_BARE_START_RE,
+    ATEM_CLOSING_TOKENS,
+    ATEM_INLINE_HEADER_RE,
+    ATEM_MESSAGE,
+    ATEM_RECIPIENT_RE,
+    ATEM_START,
+    atem_bare_start_state,
+    atem_hold_len,
+)
 
 try:
     import orjson
@@ -681,6 +691,11 @@ class InvokeParamStreamMixin:
             return self._convert_param_value(raw, key, self._ps_param_config, "")
         return _parse_loose_json_value(raw)
 
+    def _ps_canonical_name(self, name: str) -> str:
+        """Hook: normalize an invoke's function name before validation (identity by
+        default; muse_glimmer collapses template-doubled ``name.name`` recipients)."""
+        return name
+
     def _ps_trim_leading(self, text: str) -> str:
         if self._ps_trim_single:
             return text[1:] if text[:1] and text[:1] in self._ps_trim else text
@@ -755,7 +770,7 @@ class InvokeParamStreamMixin:
                     m = self._ps_invoke_open_re.search(buf, inv)
                     if m is None:
                         break  # invoke tag still streaming
-                    func_name = m.group(1).strip()
+                    func_name = self._ps_canonical_name(m.group(1).strip())
                     if self.current_tool_id == -1:
                         self.current_tool_id = 0
                     while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -3060,32 +3075,26 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
 
     The invoke/parameter body is the InvokeParamStreamMixin grammar; per the
     template's own contract values are parsed with regexes (not strict XML) and
-    string values are NOT whitespace-trimmed (``_ps_trim = ""``). A thin channel
-    layer around the mixin swallows the ``<|start|>...<|message|>`` headers and
-    the ``<|eot|>/<|eom|>`` terminators, streams ``to=user`` bodies as text, and
-    drops ``to=self`` bodies (they only reach this detector when no reasoning
-    parser runs upstream, matching detect_and_parse). The stream's bare first
-    segment (generation resumes after the template's ``<|start|>assistant``) is
-    recognized by its ``to=...<|message|>`` head.
+    string values are NOT whitespace-trimmed (``_ps_trim = ""``). A channel layer
+    around the mixin swallows the ``<|start|>...<|message|>`` headers and the
+    ``<|eot|>/<|eom|>`` terminators, streams ``to=user`` bodies as text, and drops
+    ``to=self`` bodies (they only reach this detector when no reasoning parser
+    runs upstream). Channels also open headerless: the stream's bare first
+    segment (generation resumes after the template's ``<|start|>assistant``) and
+    mid-stream ``to=X<|message|>`` switches (the model leaves a channel without
+    ``<|eom|>``).
+
+    ATEM markup is EXECUTED only inside a tool-recipient channel (vLLM's rule).
+    A block quoted in a ``to=user`` body -- or the system prompt's own ATEM
+    example echoed back -- renders as plain text instead of becoming a real
+    call.
     """
 
-    toolcall_opener = "<atem:function_calls>"
+    # <atem:function_calls> is not a unique tool opener under the channel-scoped
+    # execution rule (a to=user body may quote it), so no checkpoint anchor.
+    toolcall_opener = None
     _ps_trim = ""  # "spaces for string values are not stripped" (chat-template contract)
     _ps_missing_type = "string"
-
-    _CH_START = "<|start|>"
-    _CH_MESSAGE = "<|message|>"
-    _CH_CLOSERS = ("<|eot|>", "<|eom|>", "<|end_of_text|>")
-    _recipient_re = re.compile(r"to=([^\s<]+)")
-    _HEADER_HEADS = ("to=", "assistant", "<|message|>")
-
-    _invoke_re = re.compile(r'<atem:invoke name="([^"]*)">(.*?)(?:</atem:invoke>|$)', re.DOTALL)
-    _param_re = re.compile(
-        r'<atem:parameter name="([^"]*)">(.*?)'
-        r"(?:</atem:parameter>|(?=<atem:parameter)|(?=</atem:invoke>)|$)",
-        re.DOTALL,
-    )
-    _block_re = re.compile(r"<atem:function_calls>(.*?)(?:</atem:function_calls>|$)", re.DOTALL)
 
     def __init__(self):
         super().__init__()
@@ -3104,8 +3113,9 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         self._ps_param_close = "</atem:parameter>"
         self._ps_reset()
 
-        # Channel layer state: "text" | "skip" (non-user channel body) | "tool"
-        # (tool channel body, delegated to the mixin).
+        # Channel layer state: "text" (to=user / outside channels) | "skip"
+        # (non-user, non-tool channel body) | "tool" (tool channel body,
+        # delegated to the mixin).
         self._ch_mode = "text"
         self._at_stream_start = True
 
@@ -3113,61 +3123,93 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         return self.bot_token in text
 
     def block_close_tokens(self) -> tuple:
-        return (self.eot_token,) + self._CH_CLOSERS
+        return (self.eot_token,) + ATEM_CLOSING_TOKENS
+
+    def _ps_canonical_name(self, name: str) -> str:
+        """The template renders a bare-name tool's recipient namespace as
+        ``name.*``, so the model emits ``get_weather.get_weather``: collapse the
+        doubled form to the registered head (never when the doubled form itself
+        is a registered tool)."""
+        head, dot, tail = name.partition(".")
+        indices = getattr(self, "_tool_indices", {})
+        if dot and head == tail and head in indices and name not in indices:
+            return head
+        return name
+
+    # ------------------------------------------------------------------
+    # streaming
+    # ------------------------------------------------------------------
+    def _enter_recipient(self, recipient: str) -> None:
+        if recipient == "self":
+            self._ch_mode = "skip"
+        elif recipient == "user":
+            self._ch_mode = "text"
+        else:
+            self._ch_mode = "tool"
 
     @staticmethod
-    def _partial_suffix(text: str, tokens) -> int:
-        best = 0
-        for tok in tokens:
-            for k in range(min(len(tok) - 1, len(text)), best, -1):
-                if text.endswith(tok[:k]):
-                    best = k
-                    break
+    def _channel_boundary(buf: str):
+        """Earliest channel boundary in ``buf``: ``(pos, kind, payload)`` with kind
+        "closer" (payload = token), "start", or "inline" (payload = the headerless
+        ``to=X<|message|>`` match); ``(-1, None, None)`` when none is present."""
+        best = (len(buf) + 1, None, None)
+        for tok in ATEM_CLOSING_TOKENS:
+            pos = buf.find(tok)
+            if pos != -1 and pos < best[0]:
+                best = (pos, "closer", tok)
+        pos = buf.find(ATEM_START)
+        if pos != -1 and pos < best[0]:
+            best = (pos, "start", None)
+        m = ATEM_INLINE_HEADER_RE.search(buf)
+        if m is not None and m.start() < best[0]:
+            best = (m.start(), "inline", m)
+        if best[1] is None:
+            return -1, None, None
         return best
 
-    @staticmethod
-    def _earliest(text: str, tokens):
-        best_pos, best_tok = -1, None
-        for tok in tokens:
-            pos = text.find(tok)
-            if pos != -1 and (best_pos == -1 or pos < best_pos):
-                best_pos, best_tok = pos, tok
-        return best_pos, best_tok
-
-    def _parse_invoke_calls(self, block_body: str, tools: List[Tool]) -> List[ToolCallItem]:
-        """One-shot: every complete-enough invoke in one ATEM block body."""
-        tool_indices = self._get_tool_indices(tools)
+    def _finalize_truncated_invoke(self) -> List[ToolCallItem]:
+        """The channel (or the whole stream) ended while the ATEM machinery was
+        mid-flight. If an invoke already streamed its Start, close its argument
+        JSON so the streamed fragments stay valid (never emit broken arguments),
+        ledger the completed parameters, and advance the ordinal so the next
+        call cannot merge into this one. Anything less than an open invoke is
+        markup debris: warn and reset."""
+        mode = getattr(self, "_ps_mode", "idle")
+        if mode == "idle":
+            return []
         calls: List[ToolCallItem] = []
-        for func_name, invoke_body in self._invoke_re.findall(block_body):
-            func_name = func_name.strip()
-            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
-                logger.warning(f"Model attempted to call undefined function: {func_name}")
-                continue
-            param_config = self._get_param_config(func_name, tools)
-            params = {
-                name: self._convert_param_value(value, name, param_config, func_name)
-                for name, value in self._param_re.findall(invoke_body)
-            }
+        if mode in ("invoke", "pstr", "pbuf"):
+            ledger = self.streamed_args_for_tool[self.current_tool_id]
+            if mode == "pstr":
+                frag = '"}'  # the ledger ends inside an open string value
+            elif ledger:
+                frag = "}"  # ends after a complete "key": value pair
+            else:
+                frag = "{}"  # invoke opened, no parameter emitted yet
+            self.streamed_args_for_tool[self.current_tool_id] += frag
             calls.append(
-                ToolCallItem(
-                    tool_index=tool_indices.get(func_name, -1),
-                    name=func_name,
-                    parameters=json.dumps(params, ensure_ascii=False),
-                )
+                ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=frag)
             )
+            try:
+                parsed = json.loads(self.streamed_args_for_tool[self.current_tool_id])
+            except (json.JSONDecodeError, ValueError):
+                parsed = {}
+            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
+                parsed if isinstance(parsed, dict) else {}
+            )
+            self.streamed_args_for_tool[self.current_tool_id] = ""
+            self.current_tool_id += 1
+            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                self.streamed_args_for_tool.append("")
+            logger.warning(
+                "muse_glimmer: tool channel closed mid-invoke; arguments truncated"
+            )
+        else:  # block / invoke_skip / pskip: no open call, just partial markup
+            logger.warning(
+                "muse_glimmer: tool channel closed mid-block; partial tool markup dropped"
+            )
+        self._ps_reset()
         return calls
-
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        idx = _first_existing_pos(text, [self._CH_START, self.bot_token])
-        normal_text = text[:idx].strip() if idx != -1 else text
-        if not self.has_tool_call(text):
-            return StreamingParseResult(normal_text=normal_text, calls=[])
-        calls: List[ToolCallItem] = []
-        for block_body in self._block_re.findall(text):
-            for item in self._parse_invoke_calls(block_body, tools):
-                item.tool_index = len(calls)
-                calls.append(item)
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def _run_mixin(self, atem_part: str, remainder: str, tools: List[Tool]) -> StreamingParseResult:
         """Feed ``atem_part`` through the invoke/parameter machinery; whatever the
@@ -3183,7 +3225,6 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             self._tool_indices = self._get_tool_indices(tools)
         normal_parts: List[str] = []
         calls: List[ToolCallItem] = []
-        openers = (self._CH_START, self.bot_token) + self._CH_CLOSERS
         while True:
             buf = self._buffer
             if not buf:
@@ -3194,22 +3235,22 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     break  # text after a call defers to the next step (wire order)
                 if self._at_stream_start:
                     # Bare first-segment header: generation resumed after
-                    # ``<|start|>assistant``, so the header arrives without its opener.
-                    head = buf.lstrip()
-                    if head.startswith(self._HEADER_HEADS):
-                        msg = buf.find(self._CH_MESSAGE)
-                        if msg == -1:
-                            break  # header still streaming
-                        self._enter_channel(buf[:msg])
-                        self._buffer = buf[msg + len(self._CH_MESSAGE):]
-                        self._at_stream_start = False
-                        continue
-                    if not head or any(p.startswith(head) for p in self._HEADER_HEADS):
-                        break  # could still grow into a bare header: hold
+                    # ``<|start|>assistant``. Commit only on a FULL header match;
+                    # ordinary content that merely starts with "assistant"/"to="
+                    # falls through and streams as text.
+                    if not buf.startswith(ATEM_START):
+                        m = ATEM_BARE_START_RE.match(buf)
+                        if m:
+                            self._enter_recipient(m.group(1) or "user")
+                            self._buffer = buf[m.end():]
+                            self._at_stream_start = False
+                            continue
+                        if atem_bare_start_state(buf) == "undecided":
+                            break  # could still grow into a header: hold
                     self._at_stream_start = False
-                pos, tok = self._earliest(buf, openers)
+                pos, kind, payload = self._channel_boundary(buf)
                 if pos == -1:
-                    hold = self._partial_suffix(buf, openers)
+                    hold = atem_hold_len(buf)
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
@@ -3219,40 +3260,39 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
-                if tok in self._CH_CLOSERS:
-                    self._buffer = buf[len(tok):]  # stray terminator: drop
+                if kind == "closer":
+                    self._buffer = buf[len(payload):]  # stray terminator: drop
                     continue
-                if tok == self.bot_token:
-                    # Bare ATEM block (no channel header): straight to the mixin.
-                    self._ch_mode = "tool"
+                if kind == "inline":
+                    self._enter_recipient(payload.group(1))
+                    self._buffer = buf[payload.end():]
                     continue
-                # tok == <|start|>: parse the channel header.
-                msg = buf.find(self._CH_MESSAGE)
+                # kind == "start": parse the channel header.
+                msg = buf.find(ATEM_MESSAGE)
                 if msg == -1:
                     break  # header still streaming
-                self._enter_channel(buf[len(self._CH_START):msg])
-                self._buffer = buf[msg + len(self._CH_MESSAGE):]
+                m = ATEM_RECIPIENT_RE.search(buf[len(ATEM_START):msg])
+                self._enter_recipient(m.group(1) if m else "user")
+                self._buffer = buf[msg + len(ATEM_MESSAGE):]
                 continue
 
-            boundary_pos, boundary_tok = self._earliest(buf, self._CH_CLOSERS + (self._CH_START,))
+            pos, kind, payload = self._channel_boundary(buf)
 
             if self._ch_mode == "skip":
-                if boundary_pos == -1:
-                    hold = self._partial_suffix(buf, self._CH_CLOSERS + (self._CH_START,))
+                if pos == -1:
+                    hold = atem_hold_len(buf)
                     self._buffer = buf[len(buf) - hold:] if hold else ""
                     break
-                drop_to = boundary_pos
-                if boundary_tok in self._CH_CLOSERS:
-                    drop_to += len(boundary_tok)
-                self._buffer = buf[drop_to:]
+                # Drop the skipped body; transition exactly like text mode would.
+                self._buffer = buf[pos:]
                 self._ch_mode = "text"
                 continue
 
-            # self._ch_mode == "tool": the body up to the channel boundary belongs to
-            # the ATEM machinery; text the mixin releases inside the channel is markup
-            # whitespace between blocks and is dropped.
-            if boundary_pos == -1:
-                hold = self._partial_suffix(buf, self._CH_CLOSERS + (self._CH_START,))
+            # self._ch_mode == "tool": the body up to the channel boundary belongs
+            # to the ATEM machinery; text the mixin releases inside the channel is
+            # markup whitespace between blocks and is dropped.
+            if pos == -1:
+                hold = atem_hold_len(buf)
                 atem_part = buf[: len(buf) - hold] if hold else buf
                 if not atem_part:
                     break
@@ -3261,43 +3301,88 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 if self._buffer == buf:
                     break  # no progress: the mixin is holding a partial marker
                 continue
-            result = self._run_mixin(buf[:boundary_pos], "", tools)
+            result = self._run_mixin(buf[:pos], buf[pos:], tools)
             calls.extend(result.calls)
-            # The channel is closing: unconsumed residue is markup debris of a
-            # truncated block -- never leaked as content.
-            self._ps_reset()
-            drop_to = boundary_pos
-            if boundary_tok in self._CH_CLOSERS:
-                drop_to += len(boundary_tok)
-            self._buffer = buf[drop_to:]
-            self._ch_mode = "text"
+            # The channel is closing: finalize a mid-flight invoke (its Start
+            # already streamed) instead of letting the next call merge into it.
+            calls.extend(self._finalize_truncated_invoke())
+            # _run_mixin left any unconsumed markup debris buffered ahead of the
+            # boundary; the transitions below drop the debris with it.
+            buf = self._buffer
+            pos, kind, payload = self._channel_boundary(buf)
+            assert pos != -1  # the boundary that ended the mixin run is still here
+            if kind == "closer":
+                self._buffer = buf[pos + len(payload):]
+                self._ch_mode = "text"
+            elif kind == "inline":
+                self._enter_recipient(payload.group(1))
+                self._buffer = buf[payload.end():]
+            else:  # abutting <|start|>: reprocess it in text mode
+                self._buffer = buf[pos:]
+                self._ch_mode = "text"
             continue
         return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
-
-    def _enter_channel(self, header: str) -> None:
-        m = self._recipient_re.search(header)
-        recipient = m.group(1) if m else "user"
-        if recipient == "user":
-            self._ch_mode = "text"  # body streams live; terminators dropped in text mode
-        elif recipient == "self":
-            self._ch_mode = "skip"  # reasoning: only reaches us with no reasoning parser upstream
-        else:
-            self._ch_mode = "tool"
 
     def finish_streaming(self) -> str:
         residual, self._buffer = self._buffer, ""
         ch_mode, self._ch_mode = self._ch_mode, "text"
+        at_start, self._at_stream_start = self._at_stream_start, True
         ps_mode = getattr(self, "_ps_mode", "idle")
         self._ps_reset()
         if ch_mode != "text" or ps_mode != "idle":
             return ""
-        if self.has_tool_call(residual) or self._CH_START in residual:
+        if at_start and residual and atem_bare_start_state(residual) == "undecided":
+            return ""  # stream died inside the bare header: debris
+        if ATEM_START in residual or ATEM_MESSAGE in residual:
             return ""
-        for tok in self._CH_CLOSERS:
+        for tok in ATEM_CLOSING_TOKENS:
             residual = residual.replace(tok, "")
         if self.prev_tool_call_arr and residual.strip() == "":
             return ""
         return residual
+
+    # ------------------------------------------------------------------
+    # one-shot
+    # ------------------------------------------------------------------
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """One-shot parse by replaying the streaming machinery on a fresh clone,
+        so both paths share one definition of channel classification (a raw
+        ``to=self`` body never leaks into content), execution scoping and value
+        semantics. Streamed fragments are reassembled into complete calls; a
+        call truncated by end-of-input closes from the parse ledger, exactly as
+        the serving layer would."""
+        clone = type(self)()
+        raw_calls: List[ToolCallItem] = []
+        normal_parts: List[str] = []
+        result = clone.parse_streaming_increment(text, tools)
+        normal_parts.append(result.normal_text)
+        raw_calls.extend(result.calls)
+        while True:  # drain wire-order deferrals (one call boundary per step)
+            result = clone.parse_streaming_increment("", tools)
+            if not result.normal_text and not result.calls:
+                break
+            normal_parts.append(result.normal_text)
+            raw_calls.extend(result.calls)
+        raw_calls.extend(clone._finalize_truncated_invoke())  # input ended mid-invoke
+        normal_parts.append(clone.finish_streaming())
+
+        order: List[int] = []
+        by_index: Dict[int, Dict[str, str]] = {}
+        for item in raw_calls:
+            if item.name is not None and item.tool_index not in by_index:
+                by_index[item.tool_index] = {"name": item.name, "params": ""}
+                order.append(item.tool_index)
+            if item.parameters and item.tool_index in by_index:
+                by_index[item.tool_index]["params"] += item.parameters
+        calls = [
+            ToolCallItem(
+                tool_index=ordinal,
+                name=by_index[idx]["name"],
+                parameters=by_index[idx]["params"] or "{}",
+            )
+            for ordinal, idx in enumerate(order)
+        ]
+        return StreamingParseResult(normal_text="".join(normal_parts).strip(), calls=calls)
 
 
 class FunctionCallParser:
