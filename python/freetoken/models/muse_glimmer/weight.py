@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from typing import Iterator
 
 import safetensors
@@ -7,7 +9,7 @@ import torch
 from freetoken.distributed import get_tp_info
 from freetoken.models.config import detect_compressed_tensors_nvfp4
 from freetoken.models.loader import ct_nvfp4_fuse, iter_weight_files, nvfp4_parts_ct
-from freetoken.utils import cached_load_hf_config
+from freetoken.utils import cached_load_hf_config, download_hf_weight
 from tqdm import tqdm
 
 # Vision stack of the multimodal wrapper -- served text-only, always dropped.
@@ -109,6 +111,55 @@ def iter_weights(
     assert not fuse_buf, f"Incomplete projection fusions: {list(fuse_buf.keys())}"
 
 
+class _ShardReader:
+    """Serves tensors by name across safetensors shards (handles opened lazily).
+
+    The quant scales of a ``weight_packed`` can land in a DIFFERENT shard than the
+    packed weight itself (Muse-Glimmer-30B-NVFP4 splits layer 49's down_proj across
+    the shard boundary), so sibling lookups must go through the index's weight_map
+    rather than the shard the packed weight came from."""
+
+    def __init__(self, model_path: str, device: torch.device):
+        folder = download_hf_weight(model_path)
+        index = os.path.join(folder, "model.safetensors.index.json")
+        if os.path.exists(index):
+            with open(index, encoding="utf-8") as f:
+                weight_map = json.load(f)["weight_map"]
+            self._map = {
+                name: os.path.join(folder, shard) for name, shard in weight_map.items()
+            }
+        else:  # single-file checkpoint
+            self._map = {}
+            for file in iter_weight_files(model_path):
+                with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+                    for name in f.keys():
+                        self._map[name] = file
+        self._device = str(device)
+        self._handles: dict[str, object] = {}
+
+    def files(self) -> list[str]:
+        return sorted(set(self._map.values()))
+
+    def names_in(self, file: str) -> list[str]:
+        return [name for name, shard in self._map.items() if shard == file]
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        file = self._map[name]
+        h = self._handles.get(file)
+        if h is None:
+            h = safetensors.safe_open(file, framework="pt", device=self._device).__enter__()
+            self._handles[file] = h
+        return h.get_tensor(name)
+
+    def close(self) -> None:
+        for h in self._handles.values():
+            try:
+                h.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001 -- best-effort handle cleanup
+                pass
+        self._handles.clear()
+
+
 def _iter_weights_compressed_tensors(
     model_path: str, device: torch.device
 ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -121,13 +172,14 @@ def _iter_weights_compressed_tensors(
     its own scales, so the fused FP4 weights are exact. Embeddings, norms and lm_head are
     bf16 (the checkpoint's ignore list)."""
     nvfp4_buf: dict[str, dict[int, tuple]] = {}
-    for file in tqdm(
-        iter_weight_files(model_path),
-        desc="Loading compressed-tensors weights",
-        disable=not get_tp_info().is_primary(),
-    ):
-        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            for raw_name in f.keys():
+    reader = _ShardReader(model_path, device)
+    try:
+        for file in tqdm(
+            reader.files(),
+            desc="Loading compressed-tensors weights",
+            disable=not get_tp_info().is_primary(),
+        ):
+            for raw_name in reader.names_in(file):
                 if raw_name.endswith(_CT_SCALE_SUFFIXES):
                     continue  # consumed with their weight_packed
                 name = _rename(raw_name)
@@ -135,7 +187,7 @@ def _iter_weights_compressed_tensors(
                     continue
                 if raw_name.endswith(".weight_packed"):
                     base = name[: -len(".weight_packed")]
-                    parts = nvfp4_parts_ct(f, raw_name[: -len(".weight_packed")])
+                    parts = nvfp4_parts_ct(reader, raw_name[: -len(".weight_packed")])
                     emit = ct_nvfp4_fuse(base, parts, nvfp4_buf, _FUSIONS)
                     if emit is not None:
                         yield from emit
@@ -145,7 +197,9 @@ def _iter_weights_compressed_tensors(
                         yield base + ".weight_scale", s
                         yield base + ".weight_global", g
                     continue
-                yield name, f.get_tensor(raw_name)
+                yield name, reader.get_tensor(raw_name)
+    finally:
+        reader.close()
 
     assert not nvfp4_buf, f"Incomplete NVFP4 fusions: {list(nvfp4_buf.keys())}"
 
