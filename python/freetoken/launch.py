@@ -30,7 +30,7 @@ OPENCLAW_PROVIDER_NAME = "FreeToken"
 HERMES_API_KEY = "freetoken-local"
 HERMES_MIN_CONTEXT_LENGTH = 64_000  # Hermes refuses to start below this
 DSH_API_KEY = "freetoken"
-DSH_MIN_NODE_MAJOR = 22  # dsh needs Node >=22.19 but its npm package declares no engines gate
+DSH_MIN_NODE = (22, 19)  # dsh's floor; its npm package declares no engines gate
 DSH_LAUNCH_SETTINGS_NAME = "freetoken-launch.settings.yaml"
 DSH_LAUNCH_PATCH_NAME = "freetoken-launch.cordis.patch.yml"
 CLOUD_PROVIDER_API_KEY_ENV = (
@@ -706,12 +706,14 @@ def _warn_dsh_node_version() -> None:
         raw = subprocess.run(
             [node, "--version"], capture_output=True, text=True, timeout=5
         ).stdout.strip()
-        major = int(raw.lstrip("v").split(".", 1)[0])
+        parts = raw.lstrip("v").split(".")
+        version = (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
     except (OSError, ValueError, subprocess.SubprocessError):
         return
-    if major < DSH_MIN_NODE_MAJOR:
+    if version < DSH_MIN_NODE:
+        floor = ".".join(str(part) for part in DSH_MIN_NODE)
         print(
-            f"warning: dsh requires Node.js >={DSH_MIN_NODE_MAJOR}.19 and node reports {raw}.",
+            f"warning: dsh requires Node.js >={floor} and node reports {raw}.",
             file=sys.stderr,
         )
 
@@ -779,6 +781,7 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
             "DEEPSEEK_API_KEY": DSH_API_KEY,
             "DSH_TELEMETRY_DISABLED": "1",
         },
+        unset_env=CLOUD_PROVIDER_API_KEY_ENV,
     )
 
 
