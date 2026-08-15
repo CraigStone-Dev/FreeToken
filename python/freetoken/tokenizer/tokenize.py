@@ -50,6 +50,7 @@ class TokenizeManager:
         results: List[torch.Tensor] = []
         # TODO: batch tokenization
         for msg in msgs:
+            add_special_tokens = True
             if isinstance(msg.text, list):
                 chat_template_kwargs = msg.chat_template_kwargs or {}
                 if self._dsv4_encoder is not None:
@@ -69,10 +70,17 @@ class TokenizeManager:
                         **chat_template_kwargs,
                     )
                     assert isinstance(prompt, str)
+                    # The template owns every special token (HF's apply_chat_template
+                    # tokenizes with add_special_tokens=False for the same reason):
+                    # tokenizers that auto-add bos (muse-glimmer's, llama's) would
+                    # otherwise double it -- the template already rendered one.
+                    add_special_tokens = False
             else:
                 prompt = msg.text
             input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(prompt, return_tensors="pt")
+                self.tokenizer.encode(
+                    prompt, return_tensors="pt", add_special_tokens=add_special_tokens
+                )
             )
             results.append(input_ids.view(-1).to(torch.int32))
         return results
