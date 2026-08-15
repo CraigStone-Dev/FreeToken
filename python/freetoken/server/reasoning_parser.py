@@ -18,6 +18,7 @@ preserves the block for the tool-call parser.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Type
 
@@ -546,6 +547,191 @@ class GemmaThoughtReasoningParser(BaseReasoningParser):
         )
 
 
+# Muse Glimmer ATEM protocol control tokens. Generation starts right after the
+# template's ``<|start|>assistant``, so the FIRST segment arrives as a bare header
+# continuation (`` to=self<|message|>...``); every later segment opens with a full
+# ``<|start|>assistant to=X<|message|>``. ``<|eom|>`` separates segments within one
+# turn (the model keeps generating); ``<|eot|>`` / ``<|end_of_text|>`` are the stops.
+ATEM_START = "<|start|>"
+ATEM_MESSAGE = "<|message|>"
+ATEM_CLOSING_TOKENS = ("<|eot|>", "<|eom|>", "<|end_of_text|>")
+ATEM_BOUNDARY_TOKENS = ATEM_CLOSING_TOKENS + (ATEM_START,)
+ATEM_ALL_TOKENS = (ATEM_START, ATEM_MESSAGE) + ATEM_CLOSING_TOKENS
+_ATEM_RECIPIENT_RE = re.compile(r"to=([^\s<]+)")
+# Strings the bare first-segment header can start with (after leading whitespace).
+_ATEM_HEADER_HEADS = ("to=", "assistant", ATEM_MESSAGE)
+
+
+def _longest_atem_partial_suffix(text: str) -> int:
+    """Length of the longest suffix of ``text`` that is a *proper* prefix of any ATEM
+    control token (the Harmony hold-back, for Muse Glimmer's marker set)."""
+    best = 0
+    for tok in ATEM_ALL_TOKENS:
+        for k in range(min(len(tok) - 1, len(text)), best, -1):
+            if text.endswith(tok[:k]):
+                best = k
+                break
+    return best
+
+
+class MuseGlimmerReasoningParser(BaseReasoningParser):
+    """Reasoning parser for Muse Glimmer's ATEM channel output.
+
+    Routes ``to=self`` segments to ``reasoning_text`` and ``to=user`` (or
+    recipient-less) segments, unwrapped, to ``normal_text``. A tool-recipient
+    segment (``to=<tool>``, carrying an ``<atem:function_calls>`` block) is
+    preserved verbatim in ``normal_text`` -- normalized to open with
+    ``<|start|>assistant`` even for the bare first segment -- so the downstream
+    ``MuseGlimmerDetector`` sees one uniform block shape. Text with no ATEM
+    markers at all (raw, non-templated prompts) passes through as content.
+    All three methods are overridden; the base ``<think>`` machinery is unused.
+    """
+
+    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+        super().__init__(
+            think_start_token="",
+            think_end_token="",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+        )
+        self._buffer = ""
+        self._emitted_reasoning = 0
+        self._emitted_content = 0
+
+    def detect_and_parse(self, text: str) -> ReasoningParseResult:
+        if ATEM_MESSAGE not in text and ATEM_START not in text:
+            return ReasoningParseResult(normal_text=text)
+        reasoning, content = self._scan(text, hold_partial=False)
+        return ReasoningParseResult(
+            reasoning_text=reasoning.strip(), normal_text=content.strip()
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
+        self._buffer += new_text
+        reasoning, content = self._scan(self._buffer, hold_partial=True)
+        result = ReasoningParseResult(
+            reasoning_text=reasoning[self._emitted_reasoning :],
+            normal_text=content[self._emitted_content :],
+        )
+        self._emitted_reasoning = len(reasoning)
+        self._emitted_content = len(content)
+        return result
+
+    def flush(self) -> ReasoningParseResult:
+        reasoning, content = self._scan(self._buffer, hold_partial=False)
+        result = ReasoningParseResult(
+            reasoning_text=reasoning[self._emitted_reasoning :],
+            normal_text=content[self._emitted_content :],
+        )
+        self._emitted_reasoning = len(reasoning)
+        self._emitted_content = len(content)
+        return result
+
+    @staticmethod
+    def _segment_end(text: str, start: int) -> tuple[int, str | None]:
+        """Earliest boundary token from ``start`` and its string, or
+        ``(len(text), None)`` when the last segment is still streaming."""
+        best_pos: int | None = None
+        best_tok: str | None = None
+        for tok in ATEM_BOUNDARY_TOKENS:
+            pos = text.find(tok, start)
+            if pos != -1 and (best_pos is None or pos < best_pos):
+                best_pos = pos
+                best_tok = tok
+        if best_pos is None:
+            return len(text), None
+        return best_pos, best_tok
+
+    @staticmethod
+    def _bare_header_state(text: str) -> str:
+        """Classify the head of a stream that does not open with ``<|start|>``:
+        "header" (a bare header continuation), "undecided" (still a prefix of
+        one), or "content" (plain text -- raw non-templated output)."""
+        head = text.lstrip()
+        if head.startswith(_ATEM_HEADER_HEADS):
+            return "header"
+        if not head or any(probe.startswith(head) for probe in _ATEM_HEADER_HEADS):
+            return "undecided"
+        return "content"
+
+    def _scan(self, text: str, *, hold_partial: bool) -> tuple[str, str]:
+        reasoning: list[str] = []
+        content: list[str] = []
+        i = 0
+        first = not text.startswith(ATEM_START)
+        if first:
+            state = self._bare_header_state(text)
+            if state == "undecided":
+                if hold_partial:
+                    return "", ""
+                # Truncated inside the bare header ("assis" / " to=") -> debris;
+                # plain whitespace stays content.
+                return "", text if not text.strip() else ""
+            if state == "content":
+                # No header: the leading run is plain content up to the first boundary.
+                end, tok = self._segment_end(text, 0)
+                body = text[:end]
+                if tok is None and hold_partial:
+                    held = _longest_atem_partial_suffix(body)
+                    if held:
+                        body = body[:-held]
+                content.append(body)
+                if tok is None:
+                    return "".join(reasoning), "".join(content)
+                i = end + (len(tok) if tok in ATEM_CLOSING_TOKENS else 0)
+                first = False
+
+        while True:
+            if first:
+                seg_start = 0
+                header_start = 0
+                first = False
+            else:
+                seg_start = text.find(ATEM_START, i)
+                if seg_start == -1:
+                    break
+                header_start = seg_start + len(ATEM_START)
+            msg = text.find(ATEM_MESSAGE, header_start)
+            if msg == -1:
+                break  # header still streaming (at flush: header debris, dropped)
+            header = text[header_start:msg]
+            body_start = msg + len(ATEM_MESSAGE)
+            end, matched_token = self._segment_end(text, body_start)
+            terminated = matched_token is not None
+            m = _ATEM_RECIPIENT_RE.search(header)
+            recipient = m.group(1) if m else "user"
+            if recipient == "self":
+                body = text[body_start:end]
+                if not terminated and hold_partial:
+                    held = _longest_atem_partial_suffix(body)
+                    if held:
+                        body = body[:-held]
+                reasoning.append(body)
+            elif recipient == "user":
+                body = text[body_start:end]
+                if not terminated and hold_partial:
+                    held = _longest_atem_partial_suffix(body)
+                    if held:
+                        body = body[:-held]
+                content.append(body)
+            else:
+                # Tool channel: preserved verbatim (markers included) for the tool
+                # parser. A CLOSING terminator belongs to the block; an abutting
+                # <|start|> opens the NEXT segment and is not included.
+                if matched_token in ATEM_CLOSING_TOKENS:
+                    slice_end = end + len(matched_token)
+                else:
+                    slice_end = end
+                block = text[seg_start:slice_end]
+                if not block.startswith(ATEM_START):
+                    block = ATEM_START + "assistant" + block  # normalize the bare first segment
+                content.append(block)
+            if not terminated:
+                break
+            i = end
+        return "".join(reasoning), "".join(content)
+
+
 class ReasoningParser:
     """Wraps a reasoning detector for streaming and non-streaming use."""
 
@@ -556,6 +742,7 @@ class ReasoningParser:
         "glm": ThinkReasoningParser,
         "minimax": ThinkReasoningParser,
         "minimax_m3": MiniMaxM3ReasoningParser,
+        "muse_glimmer": MuseGlimmerReasoningParser,
         "gemma4": GemmaThoughtReasoningParser,
     }
 

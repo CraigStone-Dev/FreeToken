@@ -34,6 +34,28 @@ def detect_expert_quant(hf_config: Any) -> str:
     return "nvfp4" if "fp4" in str(algo).lower() else str(algo).lower()
 
 
+def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
+    """Detect a compressed-tensors NVFP4 (W4A16) checkpoint (dense Qwen3.6-27B,
+    Muse-Glimmer-30B-NVFP4, ...).
+
+    llm-compressor stores ``quant_method == "compressed-tensors"`` with a ``config_groups``
+    map whose ``weights`` are ``num_bits=4, type="float", group_size=16`` -- the NVFP4 layout
+    (``weight_packed`` uint8 + ``weight_scale`` fp8 block + scalar ``weight_global_scale``).
+    All ``targets: ["Linear"]`` are NVFP4 except the per-module ``ignore`` list."""
+    quant = getattr(hf_config, "quantization_config", None)
+    if quant is None:
+        return False
+    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    if str(get("quant_method") or "").lower() != "compressed-tensors":
+        return False
+    groups = get("config_groups") or {}
+    for g in (groups.values() if isinstance(groups, dict) else []):
+        w = (g or {}).get("weights") or {}
+        if int(w.get("num_bits", 0) or 0) == 4 and str(w.get("type", "")).lower() == "float":
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class RotaryConfig:
     head_dim: int
@@ -221,6 +243,12 @@ class ModelConfig:
     attn_sm_scale: float | None = None  # None -> 1/sqrt(head_dim)
     final_logit_softcapping: float | None = None
     embedding_scale: float | None = None
+    # Second RMSNorm eps for models whose post-sublayer norms use a different eps than the
+    # pre-sublayer ones (muse_glimmer: post_attention/post_feedforward at 1e-8 vs 1e-5).
+    post_norm_eps: float | None = None
+    # Scalar the raw lm_head logits are multiplied by BEFORE final_logit_softcapping
+    # (muse_glimmer: 1/sqrt(hidden/256)); None leaves the logits unscaled.
+    output_multiplier: float | None = None
     vision_config: Any | None = None
     image_token_id: int | None = None
     attention_groups: Tuple[AttentionGroupConfig, ...] = ()

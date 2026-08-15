@@ -9,7 +9,13 @@ import safetensors
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
-from freetoken.models.loader import drop_page_cache, iter_weight_files
+from freetoken.models.loader import (
+    ct_bf16_fuse,
+    ct_nvfp4_fuse,
+    drop_page_cache,
+    iter_weight_files,
+    nvfp4_parts_ct,
+)
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
     load_nvfp4_expert_source_banks,
@@ -529,55 +535,13 @@ _CT_BF16_FUSE: dict[str, tuple[str, ...]] = {
 # scales are for W4A4 which FreeToken does not run).
 _CT_SCALE_SUFFIXES = (".weight_scale", ".weight_global_scale", ".input_global_scale", ".input_scale")
 
-
-def _nvfp4_parts_ct(f, raw_base: str):
-    """compressed-tensors NVFP4 -> ``(packed uint8 [O, IN//2], block scale fp8 [O, IN//16],
-    per-output-row global fp16 [O])`` for the W4A16 kernels. The native/dequant global is
-    ``1/weight_global_scale`` (compressed-tensors stores the quant-side global)."""
-    w = f.get_tensor(raw_base + ".weight_packed")
-    s = f.get_tensor(raw_base + ".weight_scale")
-    wg = f.get_tensor(raw_base + ".weight_global_scale").reshape(1).to(torch.float32)
-    g = (1.0 / wg).to(torch.float16).expand(w.shape[0]).contiguous()
-    return w, s, g
+# The parts/fuse machinery is shared with muse_glimmer and lives in models/loader.py.
+_nvfp4_parts_ct = nvfp4_parts_ct
+_ct_bf16_fuse = ct_bf16_fuse
 
 
 def _ct_nvfp4_fuse(base: str, parts_tuple: tuple, buf: dict):
-    """Buffer a native NVFP4 fusion part ``(w, s, g)``; emit the concatenated native parts once
-    complete, ``[]`` while incomplete, ``None`` if ``base`` is not a fusion part."""
-    for fused_suffix, parts in _CT_NVFP4_FUSE.items():
-        for idx, part in enumerate(parts):
-            if base.endswith(part):
-                key = base[: -len(part)] + fused_suffix
-                slots = buf.setdefault(key, {})
-                slots[idx] = parts_tuple
-                if len(slots) < len(parts):
-                    return []
-                del buf[key]
-                ws = [slots[i][0] for i in range(len(parts))]
-                ss = [slots[i][1] for i in range(len(parts))]
-                gs = [slots[i][2] for i in range(len(parts))]
-                return [
-                    (key + ".weight", torch.cat(ws, dim=0)),
-                    (key + ".weight_scale", torch.cat(ss, dim=0)),
-                    (key + ".weight_global", torch.cat(gs, dim=0)),
-                ]
-    return None
-
-
-def _ct_bf16_fuse(base: str, tensor: torch.Tensor, buf: dict, groups: dict):
-    """Buffer a bf16 fusion part; emit the concatenated ``.weight`` once complete, ``[]`` while
-    incomplete, ``None`` if ``base`` is not a part of any group in ``groups``."""
-    for fused_suffix, parts in groups.items():
-        for idx, part in enumerate(parts):
-            if base.endswith(part):
-                key = base[: -len(part)] + fused_suffix
-                slots = buf.setdefault(key, {})
-                slots[idx] = tensor
-                if len(slots) < len(parts):
-                    return []
-                del buf[key]
-                return [(key + ".weight", torch.cat([slots[i] for i in range(len(parts))], dim=0))]
-    return None
+    return ct_nvfp4_fuse(base, parts_tuple, buf, _CT_NVFP4_FUSE)
 
 
 def _iter_weights_compressed_tensors(

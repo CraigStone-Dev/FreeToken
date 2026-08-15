@@ -68,6 +68,7 @@ TOOLS_TAG_LIST = [
     "<｜DSML｜function_calls>",
     "<｜DSML｜tool_calls>",
     "<｜DSML｜invoke",
+    "<atem:function_calls>",
 ]
 
 
@@ -3042,6 +3043,263 @@ class GptOssDetector(BaseFormatDetector):
 
 
 
+class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
+    """Detector for Muse Glimmer's ATEM tool-call protocol.
+
+    Wire format (inside a ``<|start|>assistant to=<tool><|message|> ... <|eot|>``
+    channel; the ``MuseGlimmerReasoningParser`` upstream preserves such blocks
+    verbatim and unwraps everything else):
+
+    ```
+    <atem:function_calls>
+    <atem:invoke name="tool.fn">
+    <atem:parameter name="param">value</atem:parameter>
+    </atem:invoke>
+    </atem:function_calls>
+    ```
+
+    The invoke/parameter body is the InvokeParamStreamMixin grammar; per the
+    template's own contract values are parsed with regexes (not strict XML) and
+    string values are NOT whitespace-trimmed (``_ps_trim = ""``). A thin channel
+    layer around the mixin swallows the ``<|start|>...<|message|>`` headers and
+    the ``<|eot|>/<|eom|>`` terminators, streams ``to=user`` bodies as text, and
+    drops ``to=self`` bodies (they only reach this detector when no reasoning
+    parser runs upstream, matching detect_and_parse). The stream's bare first
+    segment (generation resumes after the template's ``<|start|>assistant``) is
+    recognized by its ``to=...<|message|>`` head.
+    """
+
+    toolcall_opener = "<atem:function_calls>"
+    _ps_trim = ""  # "spaces for string values are not stripped" (chat-template contract)
+    _ps_missing_type = "string"
+
+    _CH_START = "<|start|>"
+    _CH_MESSAGE = "<|message|>"
+    _CH_CLOSERS = ("<|eot|>", "<|eom|>", "<|end_of_text|>")
+    _recipient_re = re.compile(r"to=([^\s<]+)")
+    _HEADER_HEADS = ("to=", "assistant", "<|message|>")
+
+    _invoke_re = re.compile(r'<atem:invoke name="([^"]*)">(.*?)(?:</atem:invoke>|$)', re.DOTALL)
+    _param_re = re.compile(
+        r'<atem:parameter name="([^"]*)">(.*?)'
+        r"(?:</atem:parameter>|(?=<atem:parameter)|(?=</atem:invoke>)|$)",
+        re.DOTALL,
+    )
+    _block_re = re.compile(r"<atem:function_calls>(.*?)(?:</atem:function_calls>|$)", re.DOTALL)
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = "<atem:function_calls>"
+        self.eot_token = "</atem:function_calls>"
+        self.tool_call_separator = "\n"
+
+        # InvokeParamStreamMixin grammar
+        self._ps_outer_open = "<atem:function_calls>"
+        self._ps_outer_close = "</atem:function_calls>"
+        self._ps_invoke_open_prefix = "<atem:invoke"
+        self._ps_invoke_open_re = re.compile(r'<atem:invoke name="([^"]*)">')
+        self._ps_invoke_close = "</atem:invoke>"
+        self._ps_param_open_prefix = "<atem:parameter"
+        self._ps_param_open_re = re.compile(r'<atem:parameter name="([^"]*)">')
+        self._ps_param_close = "</atem:parameter>"
+        self._ps_reset()
+
+        # Channel layer state: "text" | "skip" (non-user channel body) | "tool"
+        # (tool channel body, delegated to the mixin).
+        self._ch_mode = "text"
+        self._at_stream_start = True
+
+    def has_tool_call(self, text: str) -> bool:
+        return self.bot_token in text
+
+    def block_close_tokens(self) -> tuple:
+        return (self.eot_token,) + self._CH_CLOSERS
+
+    @staticmethod
+    def _partial_suffix(text: str, tokens) -> int:
+        best = 0
+        for tok in tokens:
+            for k in range(min(len(tok) - 1, len(text)), best, -1):
+                if text.endswith(tok[:k]):
+                    best = k
+                    break
+        return best
+
+    @staticmethod
+    def _earliest(text: str, tokens):
+        best_pos, best_tok = -1, None
+        for tok in tokens:
+            pos = text.find(tok)
+            if pos != -1 and (best_pos == -1 or pos < best_pos):
+                best_pos, best_tok = pos, tok
+        return best_pos, best_tok
+
+    def _parse_invoke_calls(self, block_body: str, tools: List[Tool]) -> List[ToolCallItem]:
+        """One-shot: every complete-enough invoke in one ATEM block body."""
+        tool_indices = self._get_tool_indices(tools)
+        calls: List[ToolCallItem] = []
+        for func_name, invoke_body in self._invoke_re.findall(block_body):
+            func_name = func_name.strip()
+            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
+                logger.warning(f"Model attempted to call undefined function: {func_name}")
+                continue
+            param_config = self._get_param_config(func_name, tools)
+            params = {
+                name: self._convert_param_value(value, name, param_config, func_name)
+                for name, value in self._param_re.findall(invoke_body)
+            }
+            calls.append(
+                ToolCallItem(
+                    tool_index=tool_indices.get(func_name, -1),
+                    name=func_name,
+                    parameters=json.dumps(params, ensure_ascii=False),
+                )
+            )
+        return calls
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        idx = _first_existing_pos(text, [self._CH_START, self.bot_token])
+        normal_text = text[:idx].strip() if idx != -1 else text
+        if not self.has_tool_call(text):
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+        calls: List[ToolCallItem] = []
+        for block_body in self._block_re.findall(text):
+            for item in self._parse_invoke_calls(block_body, tools):
+                item.tool_index = len(calls)
+                calls.append(item)
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def _run_mixin(self, atem_part: str, remainder: str, tools: List[Tool]) -> StreamingParseResult:
+        """Feed ``atem_part`` through the invoke/parameter machinery; whatever the
+        mixin leaves unconsumed stays buffered ahead of ``remainder``."""
+        self._buffer = atem_part
+        result = InvokeParamStreamMixin.parse_streaming_increment(self, "", tools)
+        self._buffer += remainder
+        return result
+
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        self._buffer += new_text
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
+        normal_parts: List[str] = []
+        calls: List[ToolCallItem] = []
+        openers = (self._CH_START, self.bot_token) + self._CH_CLOSERS
+        while True:
+            buf = self._buffer
+            if not buf:
+                break
+
+            if self._ch_mode == "text":
+                if calls:
+                    break  # text after a call defers to the next step (wire order)
+                if self._at_stream_start:
+                    # Bare first-segment header: generation resumed after
+                    # ``<|start|>assistant``, so the header arrives without its opener.
+                    head = buf.lstrip()
+                    if head.startswith(self._HEADER_HEADS):
+                        msg = buf.find(self._CH_MESSAGE)
+                        if msg == -1:
+                            break  # header still streaming
+                        self._enter_channel(buf[:msg])
+                        self._buffer = buf[msg + len(self._CH_MESSAGE):]
+                        self._at_stream_start = False
+                        continue
+                    if not head or any(p.startswith(head) for p in self._HEADER_HEADS):
+                        break  # could still grow into a bare header: hold
+                    self._at_stream_start = False
+                pos, tok = self._earliest(buf, openers)
+                if pos == -1:
+                    hold = self._partial_suffix(buf, openers)
+                    release = buf[: len(buf) - hold] if hold else buf
+                    if release:
+                        normal_parts.append(release)
+                        self._buffer = buf[len(release):]
+                    break
+                if pos > 0:
+                    normal_parts.append(buf[:pos])
+                    self._buffer = buf[pos:]
+                    continue
+                if tok in self._CH_CLOSERS:
+                    self._buffer = buf[len(tok):]  # stray terminator: drop
+                    continue
+                if tok == self.bot_token:
+                    # Bare ATEM block (no channel header): straight to the mixin.
+                    self._ch_mode = "tool"
+                    continue
+                # tok == <|start|>: parse the channel header.
+                msg = buf.find(self._CH_MESSAGE)
+                if msg == -1:
+                    break  # header still streaming
+                self._enter_channel(buf[len(self._CH_START):msg])
+                self._buffer = buf[msg + len(self._CH_MESSAGE):]
+                continue
+
+            boundary_pos, boundary_tok = self._earliest(buf, self._CH_CLOSERS + (self._CH_START,))
+
+            if self._ch_mode == "skip":
+                if boundary_pos == -1:
+                    hold = self._partial_suffix(buf, self._CH_CLOSERS + (self._CH_START,))
+                    self._buffer = buf[len(buf) - hold:] if hold else ""
+                    break
+                drop_to = boundary_pos
+                if boundary_tok in self._CH_CLOSERS:
+                    drop_to += len(boundary_tok)
+                self._buffer = buf[drop_to:]
+                self._ch_mode = "text"
+                continue
+
+            # self._ch_mode == "tool": the body up to the channel boundary belongs to
+            # the ATEM machinery; text the mixin releases inside the channel is markup
+            # whitespace between blocks and is dropped.
+            if boundary_pos == -1:
+                hold = self._partial_suffix(buf, self._CH_CLOSERS + (self._CH_START,))
+                atem_part = buf[: len(buf) - hold] if hold else buf
+                if not atem_part:
+                    break
+                result = self._run_mixin(atem_part, buf[len(atem_part):], tools)
+                calls.extend(result.calls)
+                if self._buffer == buf:
+                    break  # no progress: the mixin is holding a partial marker
+                continue
+            result = self._run_mixin(buf[:boundary_pos], "", tools)
+            calls.extend(result.calls)
+            # The channel is closing: unconsumed residue is markup debris of a
+            # truncated block -- never leaked as content.
+            self._ps_reset()
+            drop_to = boundary_pos
+            if boundary_tok in self._CH_CLOSERS:
+                drop_to += len(boundary_tok)
+            self._buffer = buf[drop_to:]
+            self._ch_mode = "text"
+            continue
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def _enter_channel(self, header: str) -> None:
+        m = self._recipient_re.search(header)
+        recipient = m.group(1) if m else "user"
+        if recipient == "user":
+            self._ch_mode = "text"  # body streams live; terminators dropped in text mode
+        elif recipient == "self":
+            self._ch_mode = "skip"  # reasoning: only reaches us with no reasoning parser upstream
+        else:
+            self._ch_mode = "tool"
+
+    def finish_streaming(self) -> str:
+        residual, self._buffer = self._buffer, ""
+        ch_mode, self._ch_mode = self._ch_mode, "text"
+        ps_mode = getattr(self, "_ps_mode", "idle")
+        self._ps_reset()
+        if ch_mode != "text" or ps_mode != "idle":
+            return ""
+        if self.has_tool_call(residual) or self._CH_START in residual:
+            return ""
+        for tok in self._CH_CLOSERS:
+            residual = residual.replace(tok, "")
+        if self.prev_tool_call_arr and residual.strip() == "":
+            return ""
+        return residual
+
+
 class FunctionCallParser:
     """
     Parser for function/tool calls in model outputs.
@@ -3061,6 +3319,7 @@ class FunctionCallParser:
         "minimax": MiniMaxDetector,
         "minimax_m3": MiniMaxM3Detector,
         "mistral": MistralDetector,
+        "muse_glimmer": MuseGlimmerDetector,
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,

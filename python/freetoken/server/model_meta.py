@@ -26,6 +26,10 @@ def think_spec(reasoning_parser: str | None) -> Tuple[Tuple[str, ...], str | Non
         # M3's template takes thinking_mode disabled/adaptive/enabled; adaptive
         # (the template's own default) lets the model decide per turn.
         return ("off", "adaptive", "on"), "adaptive"
+    if reasoning_parser == "muse_glimmer":
+        # Always-on reasoning; the template's reasoning_strength kwarg grades it
+        # (its own default is high).
+        return ("low", "medium", "high", "xhigh"), "high"
     if reasoning_parser == "gemma4":
         return ("off", "on"), "off"  # gemma's template defaults thinking off
     if reasoning_parser in ("qwen3", "glm"):
@@ -48,6 +52,8 @@ def think_chat_template_kwargs(reasoning_parser: str | None, gear: str | None) -
     if reasoning_parser == "minimax_m3":
         mode = {"off": "disabled", "adaptive": "adaptive", "on": "enabled"}[gear]
         return {"thinking_mode": mode}
+    if reasoning_parser == "muse_glimmer":
+        return {"reasoning_strength": gear}
     return {"enable_thinking": gear == "on"}  # qwen3, glm, gemma4
 
 
@@ -67,7 +73,9 @@ def think_toggle_kwargs(reasoning_parser: str | None, enabled: bool) -> dict:
     return think_chat_template_kwargs(reasoning_parser, gear)
 
 
-_THINKING_KWARG_KEYS = ("enable_thinking", "thinking", "thinking_mode", "reasoning_effort")
+_THINKING_KWARG_KEYS = (
+    "enable_thinking", "thinking", "thinking_mode", "reasoning_effort", "reasoning_strength",
+)
 _DISABLE_EFFORTS = ("none", "off")
 
 
@@ -79,7 +87,9 @@ def effort_toggle_kwargs(
     """Fold a protocol-level reasoning-effort request into the template kwargs.
     An explicit thinking-related key wins wholesale; unrelated extras ride along.
     Effort "none"/"off" (case-insensitive) disables thinking; any other or absent
-    effort enables it, forwarded for templates that grade it (gpt-oss)."""
+    effort enables it, forwarded for templates that grade it (gpt-oss's
+    ``reasoning_effort``; muse-glimmer reads the same idea as ``reasoning_strength``,
+    with OpenAI's "minimal" folded to its lowest gear)."""
     ctk = dict(chat_template_kwargs or {})
     if any(key in ctk for key in _THINKING_KWARG_KEYS):
         return ctk
@@ -88,7 +98,12 @@ def effort_toggle_kwargs(
     disabled = effort in _DISABLE_EFFORTS
     mapped = dict(think_toggle_kwargs(reasoning_parser, not disabled))
     if effort and not disabled:
-        mapped.setdefault("reasoning_effort", effort)
+        if reasoning_parser == "muse_glimmer":
+            gears, default_gear = think_spec(reasoning_parser)
+            gear = effort if effort in gears else ("low" if effort == "minimal" else default_gear)
+            mapped.setdefault("reasoning_strength", gear)
+        else:
+            mapped.setdefault("reasoning_effort", effort)
     mapped.update(ctk)
     return mapped
 
