@@ -3167,7 +3167,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             return -1, None, None
         return best
 
-    def _finalize_truncated_invoke(self) -> List[ToolCallItem]:
+    def _finalize_truncated_invoke(self, reason: str = "tool channel closed") -> List[ToolCallItem]:
         """The channel (or the whole stream) ended while the ATEM machinery was
         mid-flight. If an invoke already streamed its Start, close its argument
         JSON so the streamed fragments stay valid (never emit broken arguments),
@@ -3201,15 +3201,28 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             self.current_tool_id += 1
             while len(self.streamed_args_for_tool) <= self.current_tool_id:
                 self.streamed_args_for_tool.append("")
-            logger.warning(
-                "muse_glimmer: tool channel closed mid-invoke; arguments truncated"
-            )
+            logger.warning("muse_glimmer: %s mid-invoke; arguments truncated", reason)
         else:  # block / invoke_skip / pskip: no open call, just partial markup
-            logger.warning(
-                "muse_glimmer: tool channel closed mid-block; partial tool markup dropped"
-            )
+            logger.warning("muse_glimmer: %s mid-block; partial tool markup dropped", reason)
         self._ps_reset()
         return calls
+
+    def finalize_streaming(self) -> List[ToolCallItem]:
+        """End-of-stream hook (FunctionCallParser.finalize_stream): the generation
+        ran out (max_tokens) while an invoke was still streaming -- close it the
+        same way a channel boundary would, so the client's concatenated argument
+        fragments end as valid JSON instead of an unterminated string."""
+        return self._finalize_truncated_invoke("generation ended")
+
+    def _drop_channel_prose(self, text: str) -> None:
+        """Text inside a tool channel that is not ATEM markup is discarded (only
+        tool-recipient markup is executed; the template puts nothing else there).
+        Non-whitespace prose is worth a log line -- silent loss costs the next
+        person a debugging session."""
+        if text and text.strip():
+            logger.warning(
+                "muse_glimmer: dropping prose inside a tool channel: %.120r", text
+            )
 
     def _run_mixin(self, atem_part: str, remainder: str, tools: List[Tool]) -> StreamingParseResult:
         """Feed ``atem_part`` through the invoke/parameter machinery; whatever the
@@ -3290,27 +3303,31 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
 
             # self._ch_mode == "tool": the body up to the channel boundary belongs
             # to the ATEM machinery; text the mixin releases inside the channel is
-            # markup whitespace between blocks and is dropped.
+            # not executed (only tool-recipient markup is) and is dropped.
             if pos == -1:
                 hold = atem_hold_len(buf)
                 atem_part = buf[: len(buf) - hold] if hold else buf
                 if not atem_part:
                     break
                 result = self._run_mixin(atem_part, buf[len(atem_part):], tools)
+                self._drop_channel_prose(result.normal_text)
                 calls.extend(result.calls)
                 if self._buffer == buf:
                     break  # no progress: the mixin is holding a partial marker
                 continue
             result = self._run_mixin(buf[:pos], buf[pos:], tools)
+            self._drop_channel_prose(result.normal_text)
             calls.extend(result.calls)
-            # The channel is closing: finalize a mid-flight invoke (its Start
-            # already streamed) instead of letting the next call merge into it.
+            if self._buffer != buf:
+                # The mixin advanced (it stops after each call's close, wire-order):
+                # more blocks may still precede the boundary -- a second invoke block
+                # in the same undrained buffer must parse, not vanish as debris.
+                continue
+            # Inert: nothing before the boundary the machinery can still consume.
+            # Finalize a mid-flight invoke (its Start already streamed) instead of
+            # letting the next channel's call merge into it, then transition; any
+            # residue ahead of the boundary is markup debris and drops with it.
             calls.extend(self._finalize_truncated_invoke())
-            # _run_mixin left any unconsumed markup debris buffered ahead of the
-            # boundary; the transitions below drop the debris with it.
-            buf = self._buffer
-            pos, kind, payload = self._channel_boundary(buf)
-            assert pos != -1  # the boundary that ended the mixin run is still here
             if kind == "closer":
                 self._buffer = buf[pos + len(payload):]
                 self._ch_mode = "text"
@@ -3326,15 +3343,16 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
     def finish_streaming(self) -> str:
         residual, self._buffer = self._buffer, ""
         ch_mode, self._ch_mode = self._ch_mode, "text"
-        at_start, self._at_stream_start = self._at_stream_start, True
+        self._at_stream_start = True
         ps_mode = getattr(self, "_ps_mode", "idle")
         self._ps_reset()
         if ch_mode != "text" or ps_mode != "idle":
             return ""
-        if at_start and residual and atem_bare_start_state(residual) == "undecided":
-            return ""  # stream died inside the bare header: debris
         if ATEM_START in residual or ATEM_MESSAGE in residual:
-            return ""
+            return ""  # incomplete channel markup: debris
+        # Deliver, don't drop: a whole reply that merely LOOKS like a bare-header
+        # prefix ("assistant", "to=me@example.com") was held undecided and lands
+        # here at end-of-stream -- it is content.
         for tok in ATEM_CLOSING_TOKENS:
             residual = residual.replace(tok, "")
         if self.prev_tool_call_arr and residual.strip() == "":
@@ -3363,7 +3381,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 break
             normal_parts.append(result.normal_text)
             raw_calls.extend(result.calls)
-        raw_calls.extend(clone._finalize_truncated_invoke())  # input ended mid-invoke
+        raw_calls.extend(clone._finalize_truncated_invoke("input ended"))  # mid-invoke
         normal_parts.append(clone.finish_streaming())
 
         order: List[int] = []
@@ -3555,9 +3573,20 @@ class FunctionCallParser:
         arr = self.detector.prev_tool_call_arr
         if 0 <= tool_ordinal < len(arr):
             args = arr[tool_ordinal].get("arguments")
-            if args:
+            # `is not None`, not truthiness: {} is a legitimate ledger entry (an
+            # empty-argument call) and must serialize instead of falling through.
+            if args is not None:
                 return json.dumps(args, ensure_ascii=False)
         return None
+
+    def finalize_stream(self) -> List[ToolCallItem]:
+        """End-of-stream finalize: argument fragments that CLOSE a call cut off
+        mid-arguments, from detectors that can (muse_glimmer closes the streamed
+        JSON so the fragments the client concatenated stay valid). The serving
+        layer routes these before it closes the open call; [] for detectors
+        without the hook."""
+        finalize = getattr(self.detector, "finalize_streaming", None)
+        return finalize() if finalize is not None else []
 
 
 SUPPORTED_TOOL_CALL_PARSERS = list(FunctionCallParser.ToolCallParserEnum.keys())

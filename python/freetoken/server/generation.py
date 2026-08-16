@@ -648,9 +648,15 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     finish_reason = engine_finish_reason or "stop"
 
     if tool_parser is not None:
-        # End-of-stream drain: close a call whose end marker never arrived (truncated
-        # generation), best-effort recover a call cut off inside an unterminated tag
-        # block, then release text still held back for tag disambiguation.
+        # End-of-stream drain: let the detector finalize a call cut off mid-arguments
+        # (closing fragments keep the client's concatenated JSON valid), close a call
+        # whose end marker never arrived (truncated generation), best-effort recover a
+        # call cut off inside an unterminated tag block, then release text still held
+        # back for tag disambiguation.
+        for frag in tool_parser.finalize_stream():
+            if open_call is not None and frag.parameters:
+                open_call["params"] += frag.parameters
+                yield ToolCallArgsDelta(tool_index=open_call["ordinal"], fragment=frag.parameters)
         done = _close_open_call()
         if done is not None:
             yield done

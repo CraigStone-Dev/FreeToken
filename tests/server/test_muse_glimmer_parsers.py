@@ -165,11 +165,13 @@ def test_reasoning_streaming_holds_partial_markers():
     assert r.normal_text == "" and r.reasoning_text == ""
 
 
-def test_reasoning_truncated_header_dropped_at_flush():
+def test_reasoning_undecided_header_delivered_at_flush():
+    # Held while it could still become a bare header; at end-of-stream it is a
+    # (short) reply and must be delivered, not dropped.
     p = MuseGlimmerReasoningParser()
     assert p.parse_streaming_increment(" to=se").normal_text == ""
     r = p.flush()
-    assert r.normal_text == "" and r.reasoning_text == ""
+    assert r.normal_text == " to=se" and r.reasoning_text == ""
 
 
 def test_reasoning_multiple_self_segments_concatenate():
@@ -549,6 +551,182 @@ def test_truncated_tool_channel_warns(caplog):
     with caplog.at_level(logging.WARNING):
         _stream_detect(det, text, _tools())
     assert any("mid-invoke" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Review regressions (PR #4, round 2)
+# ---------------------------------------------------------------------------
+def _pipe(text, tools, step=3):
+    """The serving pipeline shape: reasoning parser first, its content feeds the
+    detector; returns (reasoning, detector_normal, assembled_calls)."""
+    rp = MuseGlimmerReasoningParser()
+    det = MuseGlimmerDetector()
+    reasoning, normal, calls = "", [], []
+
+    def feed(piece):
+        if not piece:
+            return
+        r = det.parse_streaming_increment(piece, tools)
+        normal.append(r.normal_text)
+        calls.extend(r.calls)
+
+    for i in range(0, len(text), step):
+        r = rp.parse_streaming_increment(text[i : i + step])
+        reasoning += r.reasoning_text
+        feed(r.normal_text)
+    r = rp.flush()
+    reasoning += r.reasoning_text
+    feed(r.normal_text)
+    while True:
+        r = det.parse_streaming_increment("", tools)
+        if not r.normal_text and not r.calls:
+            break
+        normal.append(r.normal_text)
+        calls.extend(r.calls)
+    calls.extend(det.finalize_streaming())
+    normal.append(det.finish_streaming())
+    return reasoning, "".join(normal), calls
+
+
+@pytest.mark.parametrize(
+    "switch",
+    [
+        "<|start|>assistant to=user<|message|>",  # abutting header, no <|eom|>
+        "to=user<|message|>",  # headerless switch
+    ],
+)
+def test_tool_channel_without_terminator_keeps_rest_of_turn(switch):
+    """R2 HIGH-1: a tool channel ending via an abutting header (no closer) must
+    reach the detector as a delimited block -- the rest of the turn survives."""
+    text = (
+        " to=weather.get<|message|>"
+        + _atem("weather.get", {"city": "Paris"})
+        + switch
+        + "visible answer<|eot|>"
+    )
+    reasoning, normal, calls = _pipe(text, _tools())
+    assert _assemble(calls) == [("weather.get", {"city": "Paris"})]
+    assert normal.strip() == "visible answer"
+    assert reasoning == ""
+
+
+def test_eos_mid_invoke_finalizes_with_valid_fragments():
+    """R2 HIGH-2: max_tokens mid-invoke -- finalize_streaming emits the closing
+    fragments so the client's concatenated argument JSON ends valid, and the
+    parse ledger serves unstreamed_arguments (even for an empty-dict call)."""
+    parser = FunctionCallParser(_tools(), "muse_glimmer")
+    det = parser.detector
+    truncated = (
+        "<|start|>assistant to=weather.get<|message|><atem:function_calls>\n"
+        '<atem:invoke name="weather.get">\n<atem:parameter name="city">Par'
+    )
+    frags = ""
+    for i in range(0, len(truncated), 7):
+        r = det.parse_streaming_increment(truncated[i : i + 7], _tools())
+        frags += "".join(c.parameters or "" for c in r.calls)
+    closing = parser.finalize_stream()
+    frags += "".join(c.parameters or "" for c in closing)
+    assert json.loads(frags) == {"city": "Par"}  # valid, truncated value closed
+    assert json.loads(parser.unstreamed_arguments(0)) == {"city": "Par"}
+    assert det.finish_streaming() == ""
+
+    # empty-dict ledger entries serve too ({} used to be falsy-skipped)
+    parser2 = FunctionCallParser(_tools(), "muse_glimmer")
+    det2 = parser2.detector
+    trunc2 = (
+        "<|start|>assistant to=weather.get<|message|><atem:function_calls>\n"
+        '<atem:invoke name="weather.get">\n'
+    )
+    for i in range(0, len(trunc2), 7):
+        det2.parse_streaming_increment(trunc2[i : i + 7], _tools())
+    frags2 = "".join(c.parameters or "" for c in parser2.finalize_stream())
+    assert json.loads(frags2) == {}
+    assert parser2.unstreamed_arguments(0) == "{}"
+
+
+def test_one_shot_keeps_second_invoke_block_in_one_channel():
+    """R2 HIGH-3: two <atem:function_calls> blocks inside ONE channel -- the
+    one-shot path (a streaming replay over an undrained buffer) must parse both,
+    not discard the second as markup debris at the channel close."""
+    text = (
+        "<|start|>assistant to=weather.get<|message|>"
+        + _atem("weather.get", {"city": "Paris"})
+        + "\n"
+        + _atem("weather.get", {"city": "Rome"})
+        + "<|eot|>"
+    )
+    res = MuseGlimmerDetector().detect_and_parse(text, _tools())
+    assert [json.loads(c.parameters)["city"] for c in res.calls] == ["Paris", "Rome"]
+    assert [c.tool_index for c in res.calls] == [0, 1]
+    # streaming agrees
+    _, calls = _stream_detect(MuseGlimmerDetector(), text, _tools())
+    assert [a[1]["city"] for a in _assemble(calls)] == ["Paris", "Rome"]
+
+
+def test_reasoning_strength_key_only_gates_muse():
+    """R2 HIGH-4: a muse-style reasoning_strength kwarg forwarded to another
+    family must not swallow that family's own thinking toggle."""
+    from freetoken.server.model_meta import effort_toggle_kwargs
+
+    out = effort_toggle_kwargs("qwen3", "high", {"reasoning_strength": "high"})
+    assert out.get("enable_thinking") is True  # qwen3's toggle still maps
+    out = effort_toggle_kwargs("minimax_m3", "high", {"reasoning_strength": "high"})
+    assert out.get("thinking_mode") == "enabled"
+    # for muse itself the explicit kwarg still wins wholesale
+    assert effort_toggle_kwargs("muse_glimmer", "low", {"reasoning_strength": "high"}) == {
+        "reasoning_strength": "high"
+    }
+
+
+def test_reasoning_streaming_buffer_stays_trimmed():
+    """R2 MED-5: streaming must consume the buffer as it emits (the full-buffer
+    re-scan per chunk was quadratic and stalled the serving loop on long CoT)."""
+    p = MuseGlimmerReasoningParser()
+    p.parse_streaming_increment(" to=self<|message|>")
+    for _ in range(2000):
+        p.parse_streaming_increment("think " * 4)
+    assert len(p._buffer) < 256  # consumed, not accumulated
+
+
+def test_flush_delivers_stray_closer_tail():
+    """R2 MED-6(b): prose stranded after a literal closer is delivered at
+    end-of-stream instead of dropped."""
+    text = "The token <|eot|> ends a turn."
+    p = MuseGlimmerReasoningParser()
+    content = ""
+    for i in range(0, len(text), 5):
+        content += p.parse_streaming_increment(text[i : i + 5]).normal_text
+    content += p.flush().normal_text
+    assert "The token " in content and " ends a turn." in content
+
+
+def test_flush_delivers_header_lookalike_reply():
+    """R2 MED-6(a): a complete reply that merely looks like a bare-header prefix
+    is content at end-of-stream, in both parsers."""
+    for reply in ("assistant", "to=me@example.com"):
+        p = MuseGlimmerReasoningParser()
+        out = p.parse_streaming_increment(reply)
+        got = out.normal_text + p.flush().normal_text
+        assert got == reply
+        det = MuseGlimmerDetector()
+        r = det.parse_streaming_increment(reply, _tools())
+        assert (r.normal_text + det.finish_streaming()) == reply
+
+
+def test_channel_prose_drop_warns(caplog):
+    """R2 small: discarded tool-channel prose leaves a log line."""
+    import logging
+
+    text = (
+        "<|start|>assistant to=weather.get<|message|>calling now: "
+        + _atem("weather.get", {"city": "Paris"})
+        + "<|eot|>"
+    )
+    det = MuseGlimmerDetector()
+    with caplog.at_level(logging.WARNING):
+        _, calls = _stream_detect(det, text, _tools())
+    assert _assemble(calls) == [("weather.get", {"city": "Paris"})]
+    assert any("prose inside a tool channel" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

@@ -39,9 +39,12 @@ def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
     Muse-Glimmer-30B-NVFP4, ...).
 
     llm-compressor stores ``quant_method == "compressed-tensors"`` with a ``config_groups``
-    map whose ``weights`` are ``num_bits=4, type="float", group_size=16`` -- the NVFP4 layout
-    (``weight_packed`` uint8 + ``weight_scale`` fp8 block + scalar ``weight_global_scale``).
-    All ``targets: ["Linear"]`` are NVFP4 except the per-module ``ignore`` list."""
+    map whose ``weights`` are ``num_bits=4, type="float", group_size=16,
+    strategy="tensor_group"`` -- the NVFP4 layout (``weight_packed`` uint8 +
+    ``weight_scale`` fp8 block + scalar ``weight_global_scale``). All ``targets:
+    ["Linear"]`` are NVFP4 except the per-module ``ignore`` list. A 4-bit float scheme
+    with a DIFFERENT geometry (MXFP4: group_size 32, real since LLM Compressor 0.9)
+    raises instead of routing into the NVFP4 loader and dying in a shape assert."""
     quant = getattr(hf_config, "quantization_config", None)
     if quant is None:
         return False
@@ -51,8 +54,18 @@ def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
     groups = get("config_groups") or {}
     for g in (groups.values() if isinstance(groups, dict) else []):
         w = (g or {}).get("weights") or {}
-        if int(w.get("num_bits", 0) or 0) == 4 and str(w.get("type", "")).lower() == "float":
+        if int(w.get("num_bits", 0) or 0) != 4 or str(w.get("type", "")).lower() != "float":
+            continue
+        # vLLM's _is_nvfp4_format gates on the same two fields.
+        group_size = int(w.get("group_size", 0) or 0)
+        strategy = str(w.get("strategy", "")).lower()
+        if group_size == 16 and strategy == "tensor_group":
             return True
+        raise ValueError(
+            "unsupported compressed-tensors 4-bit float scheme "
+            f"(group_size={group_size}, strategy={strategy!r}); FreeToken serves "
+            "NVFP4 (group_size=16, strategy=tensor_group) only"
+        )
     return False
 
 

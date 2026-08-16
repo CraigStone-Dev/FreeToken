@@ -645,13 +645,22 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
     Routes ``to=self`` segments to ``reasoning_text`` and ``to=user`` (or
     recipient-less) segments, unwrapped, to ``normal_text``. A tool-recipient
     segment (``to=<tool>``, carrying an ``<atem:function_calls>`` block) is
-    preserved verbatim (its header shape included) in ``normal_text`` for the
-    downstream ``MuseGlimmerDetector``. Segments open with ``<|start|>...``
-    headers, with a bare stream-start header (generation resumes after the
-    template's ``<|start|>assistant``), or with a headerless ``to=X<|message|>``
-    switch (the model leaves a channel without ``<|eom|>``; vLLM's rule). Text
-    with no ATEM markers at all (raw, non-templated prompts) passes through as
-    content. All three methods are overridden; the base ``<think>`` machinery
+    preserved verbatim (header included) in ``normal_text`` for the downstream
+    ``MuseGlimmerDetector`` -- when the channel ends without its own terminator
+    (an abutting ``<|start|>`` header or a headerless switch), a synthetic
+    ``<|eom|>`` is appended so the detector always receives a delimited block.
+    Segments open with ``<|start|>...`` headers, with a bare stream-start header
+    (generation resumes after the template's ``<|start|>assistant``), or with a
+    headerless ``to=X<|message|>`` switch (the model leaves a channel without
+    ``<|eom|>``; vLLM's rule). Text with no ATEM markers at all (raw,
+    non-templated prompts) passes through as content.
+
+    Streaming consumes the buffer as it emits (O(n) over the stream; the naive
+    re-scan of the full buffer per chunk was quadratic and stalled the serving
+    loop on this family's long default CoT). At end-of-stream, held text is
+    delivered as content rather than dropped -- a whole reply that merely looks
+    like a bare-header prefix, or prose stranded after a literal closer, must
+    not vanish. All three methods are overridden; the base ``<think>`` machinery
     is unused.
     """
 
@@ -663,142 +672,147 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
             stream_reasoning=stream_reasoning,
         )
         self._buffer = ""
-        self._emitted_reasoning = 0
-        self._emitted_content = 0
+        # "start" (resolving the bare stream-start header) | "body" (streaming a
+        # segment body) | "seek" (between segments, looking for the next header).
+        self._mode = "start"
+        self._recipient = "user"
 
     def detect_and_parse(self, text: str) -> ReasoningParseResult:
         if ATEM_MESSAGE not in text and ATEM_START not in text:
             return ReasoningParseResult(normal_text=text)
-        reasoning, content = self._scan(text, hold_partial=False)
+        clone = type(self)()
+        first = clone.parse_streaming_increment(text)
+        rest = clone.flush()
         return ReasoningParseResult(
-            reasoning_text=reasoning.strip(), normal_text=content.strip()
+            reasoning_text=(first.reasoning_text + rest.reasoning_text).strip(),
+            normal_text=(first.normal_text + rest.normal_text).strip(),
         )
 
     def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
         self._buffer += new_text
-        reasoning, content = self._scan(self._buffer, hold_partial=True)
-        result = ReasoningParseResult(
-            reasoning_text=reasoning[self._emitted_reasoning :],
-            normal_text=content[self._emitted_content :],
-        )
-        self._emitted_reasoning = len(reasoning)
-        self._emitted_content = len(content)
-        return result
+        return self._drain(final=False)
 
     def flush(self) -> ReasoningParseResult:
-        reasoning, content = self._scan(self._buffer, hold_partial=False)
-        result = ReasoningParseResult(
-            reasoning_text=reasoning[self._emitted_reasoning :],
-            normal_text=content[self._emitted_content :],
-        )
-        self._emitted_reasoning = len(reasoning)
-        self._emitted_content = len(content)
-        return result
+        return self._drain(final=True)
 
     @staticmethod
-    def _segment_body_end(text: str, start: int):
-        """Earliest segment-body boundary from ``start``.
-
-        Returns ``(end, kind, payload)``: kind "closer" (payload = the token),
-        "start" (an abutting ``<|start|>``), "inline" (payload = the headerless
-        ``to=X<|message|>`` match), or ``(len(text), None, None)`` while the last
-        segment is still streaming."""
-        best = (len(text), None, None)
+    def _segment_body_end(buf: str):
+        """Earliest segment-body boundary in ``buf``: ``(end, kind, payload)`` with
+        kind "closer" (payload = the token), "start" (an abutting ``<|start|>``),
+        "inline" (payload = the headerless ``to=X<|message|>`` match), or
+        ``(len(buf), None, None)`` while the body is still streaming."""
+        best = (len(buf), None, None)
         for tok in ATEM_CLOSING_TOKENS:
-            pos = text.find(tok, start)
+            pos = buf.find(tok)
             if pos != -1 and pos < best[0]:
                 best = (pos, "closer", tok)
-        pos = text.find(ATEM_START, start)
+        pos = buf.find(ATEM_START)
         if pos != -1 and pos < best[0]:
             best = (pos, "start", None)
-        m = ATEM_INLINE_HEADER_RE.search(text, start)
+        m = ATEM_INLINE_HEADER_RE.search(buf)
         if m is not None and m.start() < best[0]:
             best = (m.start(), "inline", m)
         return best
 
-    @staticmethod
-    def _next_segment(text: str, i: int):
-        """Locate the next segment header at/after ``i``: the earlier of a
-        ``<|start|>...<|message|>`` header and a headerless ``to=X<|message|>``
-        switch. Returns ``(recipient, seg_start, body_start)`` or None while no
-        further complete header exists (an incomplete one keeps streaming; at
-        flush it is protocol debris and is dropped)."""
-        s = text.find(ATEM_START, i)
-        m = ATEM_INLINE_HEADER_RE.search(text, i)
-        if m is not None and (s == -1 or m.start() < s):
-            return m.group(1), m.start(), m.end()
-        if s == -1:
-            return None
-        msg = text.find(ATEM_MESSAGE, s + len(ATEM_START))
-        if msg == -1:
-            return None  # header still streaming
-        header = text[s + len(ATEM_START) : msg]
-        rm = ATEM_RECIPIENT_RE.search(header)
-        return (rm.group(1) if rm else "user"), s, msg + len(ATEM_MESSAGE)
+    def _drain(self, *, final: bool) -> ReasoningParseResult:
+        out_reasoning: list[str] = []
+        out_content: list[str] = []
 
-    def _scan(self, text: str, *, hold_partial: bool) -> tuple[str, str]:
-        reasoning: list[str] = []
-        content: list[str] = []
+        def emit(recipient: str, piece: str) -> None:
+            if not piece:
+                return
+            if recipient == "self":
+                out_reasoning.append(piece)
+            else:  # user bodies unwrapped, tool slices verbatim
+                out_content.append(piece)
 
-        def emit_body(recipient: str, body_start: int, end: int, terminated: bool) -> None:
-            body = text[body_start:end]
-            if not terminated and hold_partial:
-                held = atem_hold_len(body)
-                if held:
-                    body = body[:-held]
-            (reasoning if recipient == "self" else content).append(body)
-
-        def emit_tool(seg_start: int, end: int, closer: str | None, terminated: bool) -> None:
-            # Preserved verbatim for the tool parser. A CLOSING terminator belongs
-            # to the block; an abutting <|start|>/headerless switch does not. The
-            # unterminated tail holds back a partial marker just like plain bodies
-            # -- without it the emitted block could grow a "<|start|" that the next
-            # chunk reveals to be the NEXT segment's opener (a non-monotonic emit).
-            slice_end = end + (len(closer) if closer else 0)
-            block = text[seg_start:slice_end]
-            if not terminated and hold_partial:
-                held = atem_hold_len(block)
-                if held:
-                    block = block[:-held]
-            content.append(block)
-
-        # --- segment 0: the bare stream-start header, or plain content ---
-        cur: tuple[str, int, int] | None = None  # (recipient, seg_start, body_start)
-        i = 0
-        if not text.startswith(ATEM_START):
-            m = ATEM_BARE_START_RE.match(text)
-            if m:
-                cur = (m.group(1) or "user", 0, m.end())
-                i = m.end()
-            elif atem_bare_start_state(text) == "undecided":
-                if hold_partial:
-                    return "", ""
-                # Flush mid-header ("assis" / " to=we"): debris; whitespace stays content.
-                return "", text if not text.strip() else ""
-            else:
-                cur = ("user", 0, 0)
+        def begin_body(recipient: str, header_text: str) -> None:
+            self._recipient = recipient
+            self._mode = "body"
+            if recipient not in ("self", "user"):
+                emit(recipient, header_text)  # tool slices keep their header
 
         while True:
-            if cur is None:
-                cur = self._next_segment(text, i)
-                if cur is None:
-                    break  # no further segment (inter-segment debris is dropped)
-            recipient, seg_start, body_start = cur
-            end, kind, payload = self._segment_body_end(text, body_start)
-            if recipient in ("self", "user"):
-                emit_body(recipient, body_start, end, kind is not None)
-            else:
-                closer = payload if kind == "closer" else None
-                emit_tool(seg_start, end, closer, kind is not None)
-            if kind is None:
+            buf = self._buffer
+            if not buf:
                 break
+
+            if self._mode == "start":
+                if buf.startswith(ATEM_START):
+                    self._mode = "seek"
+                    continue
+                m = ATEM_BARE_START_RE.match(buf)
+                if m:
+                    begin_body(m.group(1) or "user", buf[: m.end()])
+                    self._buffer = buf[m.end():]
+                    continue
+                if atem_bare_start_state(buf) == "undecided":
+                    if final:
+                        # Deliver, don't drop: a reply that merely looks like a
+                        # bare-header prefix ("assistant", "to=me@example.com").
+                        emit("user", buf)
+                        self._buffer = ""
+                    break
+                begin_body("user", "")
+                continue
+
+            if self._mode == "seek":
+                s = buf.find(ATEM_START)
+                m = ATEM_INLINE_HEADER_RE.search(buf)
+                if m is not None and (s == -1 or m.start() < s):
+                    self._buffer = buf[m.end():]
+                    begin_body(m.group(1), buf[m.start(): m.end()])
+                    continue
+                if s != -1:
+                    msg = buf.find(ATEM_MESSAGE, s + len(ATEM_START))
+                    if msg == -1:
+                        if s > 0:
+                            self._buffer = buf[s:]  # drop inter-segment debris
+                        if final:
+                            self._buffer = ""  # incomplete header at EOS: debris
+                        break  # header still streaming
+                    header = buf[s + len(ATEM_START): msg]
+                    rm = ATEM_RECIPIENT_RE.search(header)
+                    body_start = msg + len(ATEM_MESSAGE)
+                    self._buffer = buf[body_start:]
+                    begin_body(rm.group(1) if rm else "user", buf[s:body_start])
+                    continue
+                # No header yet: hold. Real inter-segment debris is dropped when a
+                # header arrives; at EOS the held text is delivered as content
+                # instead (prose stranded after a literal closer is still a reply).
+                if final:
+                    emit("user", buf)
+                    self._buffer = ""
+                break
+
+            # self._mode == "body"
+            recipient = self._recipient
+            end, kind, payload = self._segment_body_end(buf)
+            if kind is None:
+                hold = 0 if final else atem_hold_len(buf)
+                piece = buf[: len(buf) - hold] if hold else buf
+                emit(recipient, piece)
+                self._buffer = buf[len(piece):]
+                break
+            body = buf[:end]
+            if recipient not in ("self", "user"):
+                # A closing terminator belongs to the preserved block; a channel
+                # left without one (abutting header / headerless switch) gets a
+                # synthetic <|eom|> so the detector still sees a delimited block.
+                body += payload if kind == "closer" else "<|eom|>"
+            emit(recipient, body)
             if kind == "closer":
-                cur, i = None, end + len(payload)
+                self._buffer = buf[end + len(payload):]
+                self._mode = "seek"
             elif kind == "start":
-                cur, i = None, end
+                self._buffer = buf[end:]
+                self._mode = "seek"
             else:  # headerless switch: the next segment is fully known
-                cur, i = (payload.group(1), payload.start(), payload.end()), payload.end()
-        return "".join(reasoning), "".join(content)
+                self._buffer = buf[payload.end():]
+                begin_body(payload.group(1), buf[end: payload.end()])
+        return ReasoningParseResult(
+            reasoning_text="".join(out_reasoning), normal_text="".join(out_content)
+        )
 
 
 class ReasoningParser:

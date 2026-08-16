@@ -19,7 +19,7 @@ from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
 from .attention import MuseGlimmerAttention
-from .quant import make_col_merged, make_replicated
+from freetoken.models.quant_linear import make_col_merged, make_replicated
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig

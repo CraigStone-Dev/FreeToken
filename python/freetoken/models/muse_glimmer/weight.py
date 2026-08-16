@@ -1,15 +1,20 @@
 from __future__ import annotations
 
-import json
-import os
 from typing import Iterator
 
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.models.config import detect_compressed_tensors_nvfp4
-from freetoken.models.loader import ct_nvfp4_fuse, iter_weight_files, nvfp4_parts_ct
-from freetoken.utils import cached_load_hf_config, download_hf_weight
+from freetoken.models.loader import (
+    CT_SCALE_SUFFIXES,
+    ShardReader,
+    ct_bf16_fuse,
+    ct_nvfp4_fuse,
+    iter_weight_files,
+    nvfp4_parts_ct,
+)
+from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
 
 # Vision stack of the multimodal wrapper -- served text-only, always dropped.
@@ -33,12 +38,6 @@ _FUSIONS: dict[str, tuple[str, ...]] = {
     ".mlp.gate_up_proj": (".mlp.gate_proj", ".mlp.up_proj"),
 }
 
-# compressed-tensors quant scales, consumed with their ``weight_packed`` (the input
-# scales are for W4A4 activation quant, which FreeToken does not run).
-_CT_SCALE_SUFFIXES = (
-    ".weight_scale", ".weight_global_scale", ".input_global_scale", ".input_scale",
-)
-
 
 def _rename(raw_name: str) -> str | None:
     """HF key -> FreeToken state-dict key, or None to skip (vision stack)."""
@@ -49,25 +48,6 @@ def _rename(raw_name: str) -> str | None:
     if raw_name.startswith("language_model."):
         return "model." + raw_name[len("language_model.") :]
     return raw_name  # lm_head.weight
-
-
-def _try_fuse(
-    name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]]
-) -> tuple[str, torch.Tensor] | tuple[()] | None:
-    """Buffer a bf16 fusion part; return the merged ``(name, tensor)`` once all parts
-    arrive, ``()`` while incomplete, ``None`` if not a fusion part."""
-    base = name[: -len(".weight")]
-    for fused_suffix, parts in _FUSIONS.items():
-        for idx, part in enumerate(parts):
-            if base.endswith(part):
-                key = base[: -len(part)] + fused_suffix + ".weight"
-                slots = buf.setdefault(key, {})
-                slots[idx] = tensor
-                if len(slots) == len(parts):
-                    del buf[key]
-                    return key, torch.cat([slots[i] for i in range(len(parts))], dim=0)
-                return ()
-    return None
 
 
 def iter_weights(
@@ -86,7 +66,7 @@ def iter_weights(
         yield from _iter_weights_compressed_tensors(model_path, device)
         return
 
-    fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
+    fuse_buf: dict = {}
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -99,65 +79,15 @@ def iter_weights(
                     continue
                 tensor = f.get_tensor(raw_name)
                 if name.endswith(".weight"):
-                    fused = _try_fuse(name, tensor, fuse_buf)
-                    if fused is not None:
-                        if fused != ():  # () means buffered, not yet complete
-                            yield fused
+                    emit = ct_bf16_fuse(name[: -len(".weight")], tensor, fuse_buf, _FUSIONS)
+                    if emit is not None:
+                        yield from emit
                         continue
                 # All norms pass through raw: the decoder's centered (1+w) norms apply the
                 # +1 at runtime (GemmaPlusOneRMSNorm), the final norm / qk norms need none.
                 yield name, tensor
 
     assert not fuse_buf, f"Incomplete projection fusions: {list(fuse_buf.keys())}"
-
-
-class _ShardReader:
-    """Serves tensors by name across safetensors shards (handles opened lazily).
-
-    The quant scales of a ``weight_packed`` can land in a DIFFERENT shard than the
-    packed weight itself (Muse-Glimmer-30B-NVFP4 splits layer 49's down_proj across
-    the shard boundary), so sibling lookups must go through the index's weight_map
-    rather than the shard the packed weight came from."""
-
-    def __init__(self, model_path: str, device: torch.device):
-        folder = download_hf_weight(model_path)
-        index = os.path.join(folder, "model.safetensors.index.json")
-        if os.path.exists(index):
-            with open(index, encoding="utf-8") as f:
-                weight_map = json.load(f)["weight_map"]
-            self._map = {
-                name: os.path.join(folder, shard) for name, shard in weight_map.items()
-            }
-        else:  # single-file checkpoint
-            self._map = {}
-            for file in iter_weight_files(model_path):
-                with safetensors.safe_open(file, framework="pt", device="cpu") as f:
-                    for name in f.keys():
-                        self._map[name] = file
-        self._device = str(device)
-        self._handles: dict[str, object] = {}
-
-    def files(self) -> list[str]:
-        return sorted(set(self._map.values()))
-
-    def names_in(self, file: str) -> list[str]:
-        return [name for name, shard in self._map.items() if shard == file]
-
-    def get_tensor(self, name: str) -> torch.Tensor:
-        file = self._map[name]
-        h = self._handles.get(file)
-        if h is None:
-            h = safetensors.safe_open(file, framework="pt", device=self._device).__enter__()
-            self._handles[file] = h
-        return h.get_tensor(name)
-
-    def close(self) -> None:
-        for h in self._handles.values():
-            try:
-                h.__exit__(None, None, None)
-            except Exception:  # noqa: BLE001 -- best-effort handle cleanup
-                pass
-        self._handles.clear()
 
 
 def _iter_weights_compressed_tensors(
@@ -170,9 +100,10 @@ def _iter_weights_compressed_tensors(
     (fp16 per-row, the reciprocal of the stored quant-side global). q/k/v/gate fuse into
     ``qkvg_proj`` and gate/up into ``gate_up_proj`` on the output dim, each part keeping
     its own scales, so the fused FP4 weights are exact. Embeddings, norms and lm_head are
-    bf16 (the checkpoint's ignore list)."""
-    nvfp4_buf: dict[str, dict[int, tuple]] = {}
-    reader = _ShardReader(model_path, device)
+    bf16 (the checkpoint's ignore list). Scale lookups go through the shard-map reader:
+    they can land in a different shard than their weight_packed."""
+    nvfp4_buf: dict = {}
+    reader = ShardReader(model_path, device)
     try:
         for file in tqdm(
             reader.files(),
@@ -180,7 +111,7 @@ def _iter_weights_compressed_tensors(
             disable=not get_tp_info().is_primary(),
         ):
             for raw_name in reader.names_in(file):
-                if raw_name.endswith(_CT_SCALE_SUFFIXES):
+                if raw_name.endswith(CT_SCALE_SUFFIXES):
                     continue  # consumed with their weight_packed
                 name = _rename(raw_name)
                 if name is None:

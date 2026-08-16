@@ -119,6 +119,18 @@ def test_parse_config_nvfp4_checkpoint():
     assert cfg.lm_head_quant == "none"
 
 
+def test_non_nvfp4_4bit_scheme_is_a_clear_error():
+    # A compressed-tensors MXFP4 checkpoint (group_size 32, real since LLM Compressor
+    # 0.9) must fail with a clear "unsupported scheme" error instead of routing into
+    # the NVFP4 loader and dying in a shape assert.
+    hf = _hf_config(quantized=True)
+    weights = hf.quantization_config["config_groups"]["group_0"]["weights"]
+    weights["group_size"] = 32
+    weights["strategy"] = "group"
+    with pytest.raises(ValueError, match="unsupported compressed-tensors"):
+        parse_config(hf)
+
+
 def test_per_layer_theta_beats_shared_rope_theta():
     # layer_rope_theta is the source of truth: a hypothetical checkpoint giving the
     # full layers a real theta must not be forced to NoPE.
@@ -165,7 +177,8 @@ def test_aot_table_covers_the_checkpoints():
 def test_weight_rename_and_fusion():
     import torch
 
-    from freetoken.models.muse_glimmer.weight import _rename, _try_fuse
+    from freetoken.models.loader import ct_bf16_fuse
+    from freetoken.models.muse_glimmer.weight import _FUSIONS, _rename
 
     # Text tower renamed, vision dropped, lm_head untouched.
     assert _rename("model.language_model.layers.0.self_attn.q_proj.weight") == (
@@ -187,10 +200,10 @@ def test_weight_rename_and_fusion():
     }
     fused = None
     for name, tensor in parts.items():
-        out = _try_fuse(f"model.layers.0.self_attn.{name}.weight", tensor, buf)
+        out = ct_bf16_fuse(f"model.layers.0.self_attn.{name}", tensor, buf, _FUSIONS)
         assert out is not None
-        if out != ():
-            fused = out
+        if out:
+            fused = out[0]
     assert fused is not None and not buf
     key, tensor = fused
     assert key == "model.layers.0.self_attn.qkvg_proj.weight"
@@ -200,8 +213,8 @@ def test_weight_rename_and_fusion():
 
     # The MLP's own gate_proj is a different fusion (gate|up), not the attention one.
     buf2: dict = {}
-    assert _try_fuse("model.layers.0.mlp.gate_proj.weight", torch.zeros(3, 2), buf2) == ()
-    out = _try_fuse("model.layers.0.mlp.up_proj.weight", torch.ones(3, 2), buf2)
+    assert ct_bf16_fuse("model.layers.0.mlp.gate_proj", torch.zeros(3, 2), buf2, _FUSIONS) == []
+    (out,) = ct_bf16_fuse("model.layers.0.mlp.up_proj", torch.ones(3, 2), buf2, _FUSIONS)
     key2, tensor2 = out
     assert key2 == "model.layers.0.mlp.gate_up_proj.weight" and tensor2.shape == (6, 2)
 

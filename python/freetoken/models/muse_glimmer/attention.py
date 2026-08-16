@@ -10,7 +10,7 @@ from freetoken.layers.rotary import get_rope
 from freetoken.models.config import SWAAttentionGroupConfig
 from freetoken.utils import nvtx_annotate
 
-from .quant import make_col_merged, make_replicated
+from freetoken.models.quant_linear import make_col_merged, make_replicated
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig

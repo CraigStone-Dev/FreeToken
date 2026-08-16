@@ -73,9 +73,7 @@ def think_toggle_kwargs(reasoning_parser: str | None, enabled: bool) -> dict:
     return think_chat_template_kwargs(reasoning_parser, gear)
 
 
-_THINKING_KWARG_KEYS = (
-    "enable_thinking", "thinking", "thinking_mode", "reasoning_effort", "reasoning_strength",
-)
+_THINKING_KWARG_KEYS = ("enable_thinking", "thinking", "thinking_mode", "reasoning_effort")
 _DISABLE_EFFORTS = ("none", "off")
 
 
@@ -91,7 +89,13 @@ def effort_toggle_kwargs(
     ``reasoning_effort``; muse-glimmer reads the same idea as ``reasoning_strength``,
     with OpenAI's "minimal" folded to its lowest gear)."""
     ctk = dict(chat_template_kwargs or {})
-    if any(key in ctk for key in _THINKING_KWARG_KEYS):
+    # reasoning_strength is a thinking key only for the family whose template reads
+    # it -- treating it globally would let a muse-style kwarg forwarded to another
+    # family's server silently disable that family's own toggle mapping.
+    thinking_keys = _THINKING_KWARG_KEYS
+    if reasoning_parser == "muse_glimmer":
+        thinking_keys = thinking_keys + ("reasoning_strength",)
+    if any(key in ctk for key in thinking_keys):
         return ctk
     if isinstance(effort, str):
         effort = effort.strip().lower()
