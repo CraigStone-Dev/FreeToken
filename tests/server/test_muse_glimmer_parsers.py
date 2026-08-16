@@ -663,19 +663,15 @@ def test_one_shot_keeps_second_invoke_block_in_one_channel():
     assert [a[1]["city"] for a in _assemble(calls)] == ["Paris", "Rome"]
 
 
-def test_reasoning_strength_key_only_gates_muse():
-    """R2 HIGH-4: a muse-style reasoning_strength kwarg forwarded to another
-    family must not swallow that family's own thinking toggle."""
+def test_reasoning_strength_kwarg_does_not_swallow_the_thinking_toggle():
+    """R2 HIGH-4 (post effort-unification): a muse-style reasoning_strength kwarg
+    riding along must not disable the broadcast thinking toggle."""
     from freetoken.server.model_meta import effort_toggle_kwargs
 
-    out = effort_toggle_kwargs("qwen3", "high", {"reasoning_strength": "high"})
-    assert out.get("enable_thinking") is True  # qwen3's toggle still maps
-    out = effort_toggle_kwargs("minimax_m3", "high", {"reasoning_strength": "high"})
-    assert out.get("thinking_mode") == "enabled"
-    # for muse itself the explicit kwarg still wins wholesale
-    assert effort_toggle_kwargs("muse_glimmer", "low", {"reasoning_strength": "high"}) == {
-        "reasoning_strength": "high"
-    }
+    out = effort_toggle_kwargs("high", {"reasoning_strength": "high"})
+    assert out.get("enable_thinking") is True  # the toggle broadcast still maps
+    assert out.get("reasoning_strength") == "high"  # the explicit kwarg rides along
+    assert out.get("reasoning_effort") == "high"
 
 
 def test_reasoning_streaming_buffer_stays_trimmed():
@@ -751,23 +747,58 @@ def test_auto_selection_picks_muse_glimmer():
     assert args.reasoning_parser == "muse_glimmer"
 
 
-@pytest.mark.parametrize("gear", ["low", "medium", "high", "xhigh"])
-def test_think_gears(gear):
-    from freetoken.server.model_meta import think_chat_template_kwargs, think_spec
+class _MuseLikeTokenizer:
+    """The muse template's effort surface: grades ``reasoning_strength`` (default
+    high), validates nothing, ignores the thinking-toggle spellings."""
 
-    gears, default = think_spec("muse_glimmer")
-    assert gears == ("low", "medium", "high", "xhigh") and default == "high"
-    assert think_chat_template_kwargs("muse_glimmer", gear) == {"reasoning_strength": gear}
+    chat_template = "muse"  # non-empty: the dsv4 encoder probe must not engage
+    name_or_path = "muse-like"
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        strength = kwargs.get("reasoning_strength") or "high"
+        return f"<|begin_of_text|>system: Reasoning strength: {strength}. user: ping"
+
+    def encode(self, prompt, return_tensors=None, add_special_tokens=True):
+        import torch
+
+        assert add_special_tokens is False  # the template owns the bos
+        return torch.tensor([[1, 2, 3]], dtype=torch.long)
 
 
-def test_reasoning_effort_maps_to_reasoning_strength():
-    from freetoken.server.model_meta import effort_toggle_kwargs
+def test_effort_broadcast_reaches_reasoning_strength():
+    """The render layer broadcasts reasoning_effort in every spelling the
+    ecosystem's templates read (the thinking-toggle rule); muse's template picks
+    up ``reasoning_strength``. An explicit caller spelling wins."""
+    from freetoken.tokenizer.tokenize import TokenizeManager
 
-    assert effort_toggle_kwargs("muse_glimmer", "xhigh", None) == {"reasoning_strength": "xhigh"}
-    assert effort_toggle_kwargs("muse_glimmer", "minimal", None) == {"reasoning_strength": "low"}
-    # an explicit template kwarg wins wholesale
-    assert effort_toggle_kwargs("muse_glimmer", "low", {"reasoning_strength": "high"}) == {
-        "reasoning_strength": "high"
-    }
-    # muse has no off gear: effort "none" maps to no toggle at all
-    assert effort_toggle_kwargs("muse_glimmer", "none", None) == {}
+    manager = TokenizeManager(_MuseLikeTokenizer())
+    prompt = manager._render([{"role": "user", "content": "hi"}], None, {"reasoning_effort": "low"})
+    assert "Reasoning strength: low." in prompt
+    prompt = manager._render(
+        [{"role": "user", "content": "hi"}],
+        None,
+        {"reasoning_effort": "low", "reasoning_strength": "xhigh"},
+    )
+    assert "Reasoning strength: xhigh." in prompt
+
+
+def test_probed_muse_gears_and_effort_vocabulary():
+    """The checkpoint-probing pipeline derives muse's gears through the broadcast:
+    the template grades effort without validating it, so it gets the OpenAI
+    triple with the template's own default (high)."""
+    from freetoken.server.model_meta import derive_think_gears
+    from freetoken.tokenizer.effort import quantize_effort
+    from freetoken.tokenizer.tokenize import TokenizeManager
+
+    manager = TokenizeManager(_MuseLikeTokenizer())
+    profile = manager.thinking_profile()
+    assert profile.efforts.consumes_effort and not profile.efforts.validates
+    assert profile.efforts.default == "high"
+    assert not profile.toggleable  # the template reads no on/off spelling
+
+    gears, default, kwargs = derive_think_gears(profile, parser_configured=True)
+    assert gears == ("low", "medium", "high") and default == "high"
+    assert kwargs["low"] == {"reasoning_effort": "low"}
+    # the template validates nothing, so its native four-level vocabulary passes
+    # through quantization untouched
+    assert quantize_effort("xhigh", profile.efforts) == "xhigh"
