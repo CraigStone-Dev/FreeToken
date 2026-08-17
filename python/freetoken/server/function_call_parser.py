@@ -3223,6 +3223,34 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         fragments end as valid JSON instead of an unterminated string."""
         return self._finalize_truncated_invoke("generation ended")
 
+    # The truncated channel's trailing-markup shapes: what a broken-off invoke
+    # leaves behind when the model closes the tags it opened.
+    _CLOSING_MARKUP = ("</atem:parameter>", "</atem:invoke>", "</atem:function_calls>")
+
+    @classmethod
+    def _channel_residue_end(cls, buf: str) -> tuple[int, bool]:
+        """Length of the leading run of ATEM closing markup (closing tags plus
+        whitespace) in ``buf``, and whether the scan DECIDED. False means the
+        buffer ends inside the run or a partial tag: hold for more input."""
+        i = 0
+        while i < len(buf):
+            if buf[i] in " \t\r\n":
+                i += 1
+                continue
+            matched = False
+            for tag in cls._CLOSING_MARKUP:
+                if buf.startswith(tag, i):
+                    i += len(tag)
+                    matched = True
+                    break
+            if matched:
+                continue
+            rest = buf[i:]
+            if any(tag.startswith(rest) for tag in cls._CLOSING_MARKUP):
+                return i, False  # a partial closing tag at the end: hold
+            return i, True  # first non-markup character: the residue ended
+        return i, False  # consumed the whole buffer; the run may continue
+
     def _drop_channel_prose(self, text: str) -> None:
         """Text inside a tool channel that is not ATEM markup is discarded (only
         tool-recipient markup is executed; the template puts nothing else there).
@@ -3264,6 +3292,20 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             if self._ch_mode == "text":
                 if calls:
                     break  # text after a call defers to the next step (wire order)
+                if self._truncated_channel:
+                    # After a mid-invoke channel break, drop the broken channel's
+                    # trailing markup BY SHAPE (closing tags + whitespace) and
+                    # clear at the first non-markup character -- a real reply
+                    # following the break must flow, not be swallowed until some
+                    # later boundary that the production pipeline never delivers.
+                    consumed, decided = self._channel_residue_end(buf)
+                    if consumed:
+                        self._buffer = buf[consumed:]
+                    if not decided:
+                        break
+                    self._truncated_channel = False
+                    self._warn_dropped_prose()
+                    continue
                 if self._at_stream_start:
                     # Bare first-segment header: generation resumed after
                     # ``<|start|>assistant``. Commit only on a FULL header match;
@@ -3284,52 +3326,43 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     hold = atem_hold_len(buf)
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
-                        # Until the next boundary, text after a mid-invoke channel
-                        # break is the broken channel's residue (raw ATEM markup),
-                        # never user content.
-                        if self._truncated_channel:
-                            self._drop_channel_prose(release)
-                        else:
-                            normal_parts.append(release)
+                        normal_parts.append(release)
                         self._buffer = buf[len(release):]
                     break
                 if pos > 0:
-                    if self._truncated_channel:
-                        self._drop_channel_prose(buf[:pos])
-                    else:
-                        normal_parts.append(buf[:pos])
+                    normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
                 if kind == "closer":
                     self._buffer = buf[len(payload):]  # stray terminator: drop
-                    self._truncated_channel = False
-                    self._warn_dropped_prose()
                     continue
                 if kind == "inline":
                     self._enter_recipient(payload.group(1))
                     self._buffer = buf[payload.end():]
-                    self._truncated_channel = False
-                    self._warn_dropped_prose()
                     continue
                 # kind == "start": parse the channel header.
                 msg = buf.find(ATEM_MESSAGE)
                 if msg == -1:
-                    if len(buf) > len(ATEM_START) + ATEM_HEADER_SPAN:
+                    # +len(<|message|>) slack: a protocol-legal header whose marker
+                    # is still mid-arrival must not be cut at the nominal span.
+                    if len(buf) > len(ATEM_START) + ATEM_HEADER_SPAN + len(ATEM_MESSAGE):
                         # Past a plausible header span the marker cannot open a
                         # header anymore: release it as literal text and move on
                         # (mirrors the reasoning parser's bound).
-                        if self._truncated_channel:
-                            self._drop_channel_prose(ATEM_START)
-                        else:
-                            normal_parts.append(ATEM_START)
+                        normal_parts.append(ATEM_START)
                         self._buffer = buf[len(ATEM_START):]
                         continue
                     break  # header still streaming
+                if msg - len(ATEM_START) > ATEM_HEADER_SPAN:
+                    # The found <|message|> is too far away to belong to THIS
+                    # marker (a stray literal <|start|> followed by junk, then the
+                    # NEXT segment's real header): the marker is literal text.
+                    normal_parts.append(ATEM_START)
+                    self._buffer = buf[len(ATEM_START):]
+                    continue
                 m = ATEM_RECIPIENT_RE.search(buf[len(ATEM_START):msg])
                 self._enter_recipient(m.group(1) if m else "user")
                 self._buffer = buf[msg + len(ATEM_MESSAGE):]
-                self._truncated_channel = False
-                self._warn_dropped_prose()
                 continue
 
             pos, kind, payload = self._channel_boundary(buf)
@@ -3374,6 +3407,12 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             if kind == "closer":
                 self._buffer = buf[pos + len(payload):]
                 self._ch_mode = "text"
+                # NOTE: the truncation mark (when finalize set it) survives the
+                # closer on purpose: on the production pipeline the broken
+                # channel's markup residue arrives AFTER the reasoning parser's
+                # synthetic terminator. Text mode clears the mark by SHAPE -- at
+                # the first non-markup character -- so a real reply flows
+                # immediately while trailing closing tags are dropped.
             elif kind == "inline":
                 self._enter_recipient(payload.group(1))
                 self._buffer = buf[payload.end():]
@@ -3393,8 +3432,18 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         self._ps_reset()
         if ch_mode != "text" or ps_mode != "idle" or truncated:
             return ""
-        if ATEM_START in residual or ATEM_MESSAGE in residual:
+        if ATEM_MESSAGE in residual:
             return ""  # incomplete channel markup: debris
+        s = residual.find(ATEM_START)
+        if s != -1:
+            # Mirror the capped-debris rule instead of a blanket drop: deliver the
+            # text and discard at most the <|start|>+span candidate the stream died
+            # inside -- the layer above may have DELIVERED that text deliberately
+            # (its span runs on raw bytes; ours runs after closer stripping).
+            tail = residual[s:]
+            if len(tail) - len(ATEM_START) <= ATEM_HEADER_SPAN + len(ATEM_MESSAGE):
+                residual = residual[:s]
+            # else: ruled non-header upstream; deliver it verbatim
         # Deliver, don't drop: a whole reply that merely LOOKS like a bare-header
         # prefix ("assistant", "to=me@example.com") was held undecided and lands
         # here at end-of-stream -- it is content.

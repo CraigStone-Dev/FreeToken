@@ -559,7 +559,10 @@ ATEM_START = "<|start|>"
 ATEM_MESSAGE = "<|message|>"
 ATEM_CLOSING_TOKENS = ("<|eot|>", "<|eom|>", "<|end_of_text|>")
 ATEM_ALL_TOKENS = (ATEM_START, ATEM_MESSAGE) + ATEM_CLOSING_TOKENS
-ATEM_RECIPIENT_RE = re.compile(r"to=([^\s<]+)")
+# Recipient names cap at 64 chars in EVERY header shape (inline switches and the
+# bare stream-start header use the same bound below), so streaming and one-shot
+# agree on which recipients are valid and >64 degrades identically everywhere.
+ATEM_RECIPIENT_RE = re.compile(r"to=([^\s<]{1,64})")
 # A complete headerless channel switch: ``to=<name>`` abutting ``<|message|>``.
 # The name length is capped so the streaming hold-back below can bound how much
 # tail it withholds while a potential switch is still arriving.
@@ -781,6 +784,16 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                     continue
                 if s != -1:
                     msg = buf.find(ATEM_MESSAGE, s + len(ATEM_START))
+                    if msg != -1 and msg - s - len(ATEM_START) > ATEM_HEADER_SPAN:
+                        # The found <|message|> is too far away to belong to THIS
+                        # marker (a stray literal <|start|>, junk, then the NEXT
+                        # segment's real header): the marker is literal content --
+                        # the span bound applies whether or not a <|message|> is
+                        # already in the buffer, or one-shot and streaming diverge.
+                        emit_seek(buf[:s])
+                        out_content.append(ATEM_START)
+                        self._buffer = buf[s + len(ATEM_START):]
+                        continue
                     if msg != -1:
                         emit_seek(buf[:s])
                         header = buf[s + len(ATEM_START): msg]
@@ -791,13 +804,14 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                         continue
                     # A complete <|start|> whose <|message|> hasn't arrived: text
                     # before it is content NOW (never re-dropped), the candidate is
-                    # held -- bounded. Past a plausible header span it cannot open a
-                    # header anymore: release the marker as literal content and
-                    # resume scanning behind it, so a degenerate wire neither stalls
-                    # the stream nor eats the rest of the turn.
+                    # held -- bounded, with slack for a <|message|> mid-arrival (a
+                    # protocol-legal long-name header must not be cut at the nominal
+                    # span). Past the bound it cannot open a header anymore: release
+                    # the marker as literal content and resume scanning behind it,
+                    # so a degenerate wire neither stalls nor eats the turn.
                     emit_seek(buf[:s])
                     self._buffer = buf[s:]
-                    if len(self._buffer) - len(ATEM_START) > ATEM_HEADER_SPAN:
+                    if len(self._buffer) - len(ATEM_START) > ATEM_HEADER_SPAN + len(ATEM_MESSAGE):
                         out_content.append(ATEM_START)  # verbatim: deliver, don't drop
                         self._buffer = self._buffer[len(ATEM_START):]
                         continue

@@ -765,17 +765,17 @@ def test_seek_mode_eos_around_incomplete_header():
     assert "The token " in c2 and tail in c2
 
 
-def test_truncated_channel_residue_never_reaches_content(caplog):
-    """R3 MED-4: a literal channel marker inside a parameter value splits the
-    call (known string-level ambiguity), but the broken channel's markup residue
-    must be dropped -- with a warning -- not delivered as user content."""
+def test_truncated_channel_markup_residue_dropped_reply_kept(caplog):
+    """R3 MED-4 (as re-scoped by R4 HIGH-1): when a literal channel marker cuts an
+    invoke exactly at a value's end, the broken channel's CLOSING-MARKUP residue
+    is dropped by shape -- and the turn's real reply always survives."""
     import logging
 
     text = (
         "<|start|>assistant to=fs.write<|message|><atem:function_calls>\n"
         '<atem:invoke name="fs.write">\n'
         '<atem:parameter name="path">/tmp/t</atem:parameter>\n'
-        '<atem:parameter name="content">send to=user<|message|> please</atem:parameter>\n'
+        '<atem:parameter name="content">send to=user<|message|></atem:parameter>\n'
         "</atem:invoke>\n</atem:function_calls><|eot|>"
         "<|start|>assistant to=user<|message|>Done.<|eot|>"
     )
@@ -789,6 +789,21 @@ def test_truncated_channel_residue_never_reaches_content(caplog):
             assert "</atem:" not in normal and "<atem:" not in normal  # no markup leak
             assert normal.strip() == "Done."  # the real content after the channel survives
     assert any("mid-invoke" in r.message for r in caplog.records)
+
+
+def test_reply_right_after_midinvoke_switch_is_never_swallowed():
+    """R4 HIGH-1 companion: an inline switch fired mid-invoke followed directly by
+    a real reply (no markup residue) -- the reply must flow immediately, not be
+    held hostage for a boundary that never comes."""
+    text = (
+        " to=weather.get<|message|><atem:function_calls>\n"
+        '<atem:invoke name="weather.get">\n<atem:parameter name="city">Par'
+        "to=user<|message|>The weather tool is on it.<|eot|>"
+    )
+    for step in (1, 3, 64):
+        normal, calls = _stream_detect(MuseGlimmerDetector(), text, _tools(), step=step)
+        assert normal.strip() == "The weather tool is on it."
+        assert [c.name for c in calls if c.name] == ["weather.get"]
 
 
 def test_redundant_closer_stripped_from_seek_delivery():
@@ -838,6 +853,156 @@ def test_mixed_quant_groups_rejected_in_any_order():
 
         with pytest.raises(ValueError, match="unsupported compressed-tensors"):
             pc(hf)
+
+
+# ---------------------------------------------------------------------------
+# Review regressions (PR #4, round 4)
+# ---------------------------------------------------------------------------
+def test_pipeline_delivers_reply_after_truncated_invoke():
+    """R4 HIGH-1, PRODUCTION ORDER (reasoning parser first, its content feeds the
+    detector -- the shape standalone-detector tests missed twice): a truncated
+    invoke must never swallow the rest of the turn's reply."""
+    # reviewer wire 1: literal marker cuts the value, closing tags follow
+    wire1 = (
+        "<|start|>assistant to=fs.write<|message|><atem:function_calls>\n"
+        '<atem:invoke name="fs.write">\n'
+        '<atem:parameter name="path">/tmp/t</atem:parameter>\n'
+        '<atem:parameter name="content">send to=user<|message|></atem:parameter>\n'
+        "</atem:invoke>\n</atem:function_calls><|eot|>"
+        "<|start|>assistant to=user<|message|>Done.<|eot|>"
+    )
+    # reviewer wire 2: invoke left unclosed before an abutting user header
+    wire2 = (
+        " to=weather.get<|message|><atem:function_calls>\n"
+        '<atem:invoke name="weather.get">\n<atem:parameter name="city">Par'
+        "<|start|>assistant to=user<|message|>The weather tool is on it.<|eot|>"
+    )
+    for wire, reply, first_call in (
+        (wire1, "Done.", "fs.write"),
+        (wire2, "The weather tool is on it.", "weather.get"),
+    ):
+        for step in (1, 3, 64):
+            _, normal, calls = _pipe(wire, _tools(), step=step)
+            assert reply in normal, (wire[:40], step, normal)
+            assert "<atem:" not in normal and "</atem:" not in normal
+            named = [c.name for c in calls if c.name]
+            assert named and named[0] == first_call
+
+
+def test_stray_start_before_a_real_header_does_not_form_a_giant_header():
+    """R4 MED-2: the span bound applies even when a <|message|> is already in the
+    buffer -- a literal <|start|> + junk + the NEXT segment's header must not be
+    parsed as one giant header (which also let a to= inside the junk hijack the
+    recipient), and streaming must agree with one-shot."""
+    junk = "P" * 300
+    text = (
+        " to=user<|message|>ok<|eom|><|start|>" + junk
+        + "<|start|>assistant to=user<|message|>more<|eot|>"
+    )
+    p = MuseGlimmerReasoningParser()
+    streamed_r, streamed_c = "", ""
+    for i in range(0, len(text), 5):
+        r = p.parse_streaming_increment(text[i : i + 5])
+        streamed_r += r.reasoning_text
+        streamed_c += r.normal_text
+    fl = p.flush()
+    streamed_r += fl.reasoning_text
+    streamed_c += fl.normal_text
+    one = MuseGlimmerReasoningParser().detect_and_parse(text)
+    assert "ok" in streamed_c and "more" in streamed_c
+    assert junk in streamed_c  # delivered, not silently swallowed
+    assert one.normal_text == streamed_c.strip()
+
+    # a to=self inside the junk must not hijack the following user reply
+    hijack = (
+        " to=user<|message|>first.<|eom|><|start|>x to=self y" + "Q" * 250
+        + "<|start|>assistant to=user<|message|>the actual answer<|eot|>"
+    )
+    one = MuseGlimmerReasoningParser().detect_and_parse(hijack)
+    assert "the actual answer" in one.normal_text
+    assert "the actual answer" not in one.reasoning_text
+
+
+@pytest.mark.parametrize("name_len", [64, 100, 110])
+def test_protocol_legal_long_tool_names_survive_streaming(name_len):
+    """R4 MED-3: headers stay parseable up to the span bound even when their
+    <|message|> is still mid-arrival; the tool call AND the trailing reply
+    survive at every step size, matching one-shot."""
+    name = "t" * name_len
+    tools = [Tool(function=Function(name=name, parameters={
+        "type": "object", "properties": {"city": {"type": "string"}},
+    }))]
+    text = (
+        f" to=self<|message|>go<|eom|><|start|>assistant to={name}<|message|>"
+        + _atem(name, {"city": "Paris"})
+        + "<|eot|><|start|>assistant to=user<|message|>done<|eot|>"
+    )
+    one_r = MuseGlimmerReasoningParser().detect_and_parse(text)
+    assert "done" in one_r.normal_text
+    for step in (1, 5, 64):
+        reasoning, normal, calls = _pipe(text, tools, step=step)
+        assert reasoning.strip() == "go"
+        assert normal.strip() == "done", (name_len, step, normal)
+        named = [c.name for c in calls if c.name]
+        assert named and named[0].startswith("t" * 64)
+
+
+def test_eos_capped_debris_agrees_across_layers():
+    """R4 MED-4: the detector's finish_streaming mirrors the capped-debris rule --
+    text the reasoning parser deliberately delivered is not re-swallowed just
+    because a released <|start|> sits in it at EOS."""
+    text = (
+        " to=user<|message|>answer<|eot|>prose <|start|>" + "x" * 50
+        + "<|eom|>" * 15
+    )
+    parser_only = ""
+    p = MuseGlimmerReasoningParser()
+    for i in range(0, len(text), 7):
+        parser_only += p.parse_streaming_increment(text[i : i + 7]).normal_text
+    parser_only += p.flush().normal_text
+    _, piped, _ = _pipe(text, _tools(), step=7)
+    assert "answer" in piped and "prose " in piped
+    # the layer above delivered the released marker + tail; the detector may trim
+    # at most the capped header candidate, never the delivered prose
+    assert piped.strip("x").rstrip() .endswith("prose") or "x" * 50 in piped
+
+
+_CORPUS_REPLY = "All good."
+# Historical degenerate shapes x chunkings: streaming, one-shot and the production
+# pipeline must agree on the reply and the calls (the regression class that bit
+# this PR twice was "standalone green, pipeline broken").
+_WIRE_CORPUS = [
+    # clean turn
+    " to=self<|message|>think<|eom|><|start|>assistant to=user<|message|>All good.<|eot|>",
+    # tool channel then reply
+    " to=self<|message|>t<|eom|>" + _tool_channel("weather.get", {"city": "P"}, closer="<|eom|>")
+    + "<|start|>assistant to=user<|message|>All good.<|eot|>",
+    # headerless switches everywhere
+    " to=self<|message|>t to=weather.get<|message|>"
+    + _atem("weather.get", {"city": "P"}) + "to=user<|message|>All good.<|eot|>",
+    # truncated invoke then abutting user header
+    " to=weather.get<|message|><atem:function_calls>\n"
+    '<atem:invoke name="weather.get">\n<atem:parameter name="city">P'
+    "<|start|>assistant to=user<|message|>All good.<|eot|>",
+    # stray literal closer inside the reply
+    " to=user<|message|>All good.<|eot|>",
+    # bare first segment is the reply
+    " to=user<|message|>All good.<|eom|>",
+]
+
+
+@pytest.mark.parametrize("wire_idx", range(len(_WIRE_CORPUS)))
+@pytest.mark.parametrize("step", [1, 7, 4096])
+def test_wire_corpus_pipeline_consistency(wire_idx, step):
+    wire = _WIRE_CORPUS[wire_idx]
+    reasoning, normal, calls = _pipe(wire, _tools(), step=step)
+    assert _CORPUS_REPLY in normal, (wire_idx, step, normal)
+    assert "<atem:" not in normal and "<|" not in normal.replace("<|start|>", "")
+    # one-shot detector agrees on the calls for the same classified content
+    rp = MuseGlimmerReasoningParser().detect_and_parse(wire)
+    one = MuseGlimmerDetector().detect_and_parse(rp.normal_text, _tools())
+    assert [c.name for c in one.calls] == [c.name for c in calls if c.name]
+    assert _CORPUS_REPLY in one.normal_text or _CORPUS_REPLY in rp.normal_text
 
 
 # ---------------------------------------------------------------------------
