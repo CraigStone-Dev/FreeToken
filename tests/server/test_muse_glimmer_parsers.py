@@ -722,7 +722,122 @@ def test_channel_prose_drop_warns(caplog):
     with caplog.at_level(logging.WARNING):
         _, calls = _stream_detect(det, text, _tools())
     assert _assemble(calls) == [("weather.get", {"city": "Paris"})]
-    assert any("prose inside a tool channel" in r.message for r in caplog.records)
+    prose_warnings = [r for r in caplog.records if "inside a tool channel" in r.message]
+    assert len(prose_warnings) == 1  # accumulated: ONE warning, not one per fragment
+
+
+# ---------------------------------------------------------------------------
+# Review regressions (PR #4, round 3)
+# ---------------------------------------------------------------------------
+def test_seek_mode_streams_eagerly_and_stays_trimmed():
+    """R3 MED-1: text after a closer (a headerless continuation, e.g. a
+    repetition loop) must stream live with a bounded buffer, not accumulate
+    until flush."""
+    p = MuseGlimmerReasoningParser()
+    p.parse_streaming_increment(" to=user<|message|>answer<|eom|>")
+    streamed = ""
+    for _ in range(500):
+        streamed += p.parse_streaming_increment("loop ").normal_text
+    assert len(p._buffer) < 256  # consumed, not held until EOS
+    assert len(streamed) > 2000  # and the client actually saw it live
+    assert "loop loop" in streamed
+
+
+def test_seek_mode_eos_around_incomplete_header():
+    """R3 MED-2: at EOS, text before a complete <|start|> whose <|message|>
+    never arrived is delivered; the discard is capped at a plausible header
+    span instead of eating the rest of the turn."""
+    # prose before the marker survives
+    p = MuseGlimmerReasoningParser()
+    content = p.parse_streaming_increment(
+        " to=user<|message|>answer<|eom|>more text <|start|>assistant"
+    ).normal_text
+    content += p.flush().normal_text
+    assert "more text " in content
+
+    # a huge tail after the marker cannot be a header: it is not discarded
+    p2 = MuseGlimmerReasoningParser()
+    tail = "x" * 400
+    c2 = p2.parse_streaming_increment(
+        " to=user<|message|>The token <|start|> opens a segment. " + tail
+    ).normal_text
+    c2 += p2.flush().normal_text
+    assert "The token " in c2 and tail in c2
+
+
+def test_truncated_channel_residue_never_reaches_content(caplog):
+    """R3 MED-4: a literal channel marker inside a parameter value splits the
+    call (known string-level ambiguity), but the broken channel's markup residue
+    must be dropped -- with a warning -- not delivered as user content."""
+    import logging
+
+    text = (
+        "<|start|>assistant to=fs.write<|message|><atem:function_calls>\n"
+        '<atem:invoke name="fs.write">\n'
+        '<atem:parameter name="path">/tmp/t</atem:parameter>\n'
+        '<atem:parameter name="content">send to=user<|message|> please</atem:parameter>\n'
+        "</atem:invoke>\n</atem:function_calls><|eot|>"
+        "<|start|>assistant to=user<|message|>Done.<|eot|>"
+    )
+    with caplog.at_level(logging.WARNING):
+        for step in (4, len(text)):
+            det = MuseGlimmerDetector()
+            normal, calls = _stream_detect(det, text, _tools(), step=step)
+            assembled = _assemble(calls)
+            assert assembled[0][0] == "fs.write"
+            assert assembled[0][1]["path"] == "/tmp/t"  # completed param survives
+            assert "</atem:" not in normal and "<atem:" not in normal  # no markup leak
+            assert normal.strip() == "Done."  # the real content after the channel survives
+    assert any("mid-invoke" in r.message for r in caplog.records)
+
+
+def test_redundant_closer_stripped_from_seek_delivery():
+    """R3 small: a doubled closer from a degenerate decode must not leak the
+    second token into content (the detector already filters; the reasoning
+    parser's seek path now does too)."""
+    text = " to=user<|message|>The answer is 42.<|eot|><|eot|>"
+    p = MuseGlimmerReasoningParser()
+    content = ""
+    for i in range(0, len(text), 5):
+        content += p.parse_streaming_increment(text[i : i + 5]).normal_text
+    content += p.flush().normal_text
+    assert content == "The answer is 42."
+    one = MuseGlimmerReasoningParser().detect_and_parse(text)
+    assert one.normal_text == "The answer is 42."
+
+
+def test_stray_closer_one_shot_matches_streaming():
+    """R3 small: the one-shot passthrough shortcut must route closer-containing
+    text through the replay, matching the streamed result."""
+    text = "The token <|eot|> ends a turn."
+    one = MuseGlimmerReasoningParser().detect_and_parse(text)
+    p = MuseGlimmerReasoningParser()
+    streamed = ""
+    for i in range(0, len(text), 5):
+        streamed += p.parse_streaming_increment(text[i : i + 5]).normal_text
+    streamed += p.flush().normal_text
+    assert one.normal_text == streamed.strip()
+    assert "<|eot|>" not in one.normal_text
+
+
+def test_mixed_quant_groups_rejected_in_any_order():
+    """R3 small: a {nvfp4, mxfp4} mixed checkpoint must raise regardless of the
+    groups' key order (the first-group short-circuit accepted one order)."""
+    import tests.models.test_muse_glimmer as m
+
+    for order in (("group_0", "group_1"), ("group_1", "group_0")):
+        hf = m._hf_config(quantized=True)
+        groups = hf.quantization_config["config_groups"]
+        nvfp4 = groups["group_0"]
+        mxfp4 = {"weights": {"num_bits": 4, "type": "float", "group_size": 32, "strategy": "group"}}
+        hf.quantization_config["config_groups"] = {
+            order[0]: nvfp4 if order[0] == "group_0" else mxfp4,
+            order[1]: mxfp4 if order[1] == "group_1" else nvfp4,
+        }
+        from freetoken.models.muse_glimmer.config import parse_config as pc
+
+        with pytest.raises(ValueError, match="unsupported compressed-tensors"):
+            pc(hf)
 
 
 # ---------------------------------------------------------------------------
@@ -784,10 +899,12 @@ def test_effort_broadcast_reaches_reasoning_strength():
 
 def test_probed_muse_gears_and_effort_vocabulary():
     """The checkpoint-probing pipeline derives muse's gears through the broadcast:
-    the template grades effort without validating it, so it gets the OpenAI
-    triple with the template's own default (high)."""
+    the template grades effort without validating it, so it is served the graded
+    ladder (the model card's trained levels, xhigh included) with the template's
+    own default (high); never-advertised dialects quantize onto the ladder
+    instead of reaching the model verbatim."""
     from freetoken.server.model_meta import derive_think_gears
-    from freetoken.tokenizer.effort import quantize_effort
+    from freetoken.tokenizer.effort import effective_efforts, quantize_effort
     from freetoken.tokenizer.tokenize import TokenizeManager
 
     manager = TokenizeManager(_MuseLikeTokenizer())
@@ -797,8 +914,12 @@ def test_probed_muse_gears_and_effort_vocabulary():
     assert not profile.toggleable  # the template reads no on/off spelling
 
     gears, default, kwargs = derive_think_gears(profile, parser_configured=True)
-    assert gears == ("low", "medium", "high") and default == "high"
+    assert gears == ("low", "medium", "high", "xhigh") and default == "high"
     assert kwargs["low"] == {"reasoning_effort": "low"}
-    # the template validates nothing, so its native four-level vocabulary passes
-    # through quantization untouched
+    assert effective_efforts(profile.efforts) == frozenset({"low", "medium", "high", "xhigh"})
+    # the native vocabulary passes through untouched...
     assert quantize_effort("xhigh", profile.efforts) == "xhigh"
+    # ...while off-ladder dialects quantize instead of interpolating verbatim
+    assert quantize_effort("minimal", profile.efforts) == "low"
+    assert quantize_effort("max", profile.efforts) == "xhigh"
+    assert quantize_effort("none", profile.efforts) is None  # template default applies

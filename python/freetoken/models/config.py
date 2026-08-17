@@ -52,6 +52,10 @@ def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
     if str(get("quant_method") or "").lower() != "compressed-tensors":
         return False
     groups = get("config_groups") or {}
+    # Verdicts are collected across ALL groups before returning: an early return on
+    # the first NVFP4 group would accept a mixed {nvfp4, mxfp4} checkpoint (and the
+    # error would depend on the groups' key order).
+    saw_nvfp4 = False
     for g in (groups.values() if isinstance(groups, dict) else []):
         w = (g or {}).get("weights") or {}
         if int(w.get("num_bits", 0) or 0) != 4 or str(w.get("type", "")).lower() != "float":
@@ -60,13 +64,14 @@ def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
         group_size = int(w.get("group_size", 0) or 0)
         strategy = str(w.get("strategy", "")).lower()
         if group_size == 16 and strategy == "tensor_group":
-            return True
+            saw_nvfp4 = True
+            continue
         raise ValueError(
             "unsupported compressed-tensors 4-bit float scheme "
             f"(group_size={group_size}, strategy={strategy!r}); FreeToken serves "
             "NVFP4 (group_size=16, strategy=tensor_group) only"
         )
-    return False
+    return saw_nvfp4
 
 
 @dataclass(frozen=True)

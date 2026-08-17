@@ -572,6 +572,10 @@ ATEM_BARE_START_RE = re.compile(
     r"^[ \t\r\n]{0,8}(?:assistant\b)?[ \t]*(?:to=([^\s<]{1,64}))?[ \t]*<\|message\|>"
 )
 _ATEM_MAX_BARE_HEADER = 96
+# Longest span after "<|start|>" a real header can occupy before its <|message|>
+# arrives ("assistant to=<name>" + slack). Past this, the marker cannot open a
+# header anymore and is released as literal content instead of held forever.
+ATEM_HEADER_SPAN = 128
 
 
 def _longest_atem_partial_suffix(text: str) -> int:
@@ -678,7 +682,9 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
         self._recipient = "user"
 
     def detect_and_parse(self, text: str) -> ReasoningParseResult:
-        if ATEM_MESSAGE not in text and ATEM_START not in text:
+        # Closers count as markers too: a literal stray <|eot|> must take the same
+        # replay path as streaming (which strips it), not pass through verbatim.
+        if not any(tok in text for tok in ATEM_ALL_TOKENS):
             return ReasoningParseResult(normal_text=text)
         clone = type(self)()
         first = clone.parse_streaming_increment(text)
@@ -732,6 +738,15 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
             if recipient not in ("self", "user"):
                 emit(recipient, header_text)  # tool slices keep their header
 
+        def emit_seek(piece: str) -> None:
+            # Inter-segment text is content (deliver, don't drop); redundant closer
+            # tokens in it are protocol debris and are stripped -- the same filter
+            # the detector applies on its text path.
+            for tok in ATEM_CLOSING_TOKENS:
+                piece = piece.replace(tok, "")
+            if piece:
+                out_content.append(piece)
+
         while True:
             buf = self._buffer
             if not buf:
@@ -760,29 +775,44 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                 s = buf.find(ATEM_START)
                 m = ATEM_INLINE_HEADER_RE.search(buf)
                 if m is not None and (s == -1 or m.start() < s):
+                    emit_seek(buf[: m.start()])
                     self._buffer = buf[m.end():]
                     begin_body(m.group(1), buf[m.start(): m.end()])
                     continue
                 if s != -1:
                     msg = buf.find(ATEM_MESSAGE, s + len(ATEM_START))
-                    if msg == -1:
-                        if s > 0:
-                            self._buffer = buf[s:]  # drop inter-segment debris
-                        if final:
-                            self._buffer = ""  # incomplete header at EOS: debris
-                        break  # header still streaming
-                    header = buf[s + len(ATEM_START): msg]
-                    rm = ATEM_RECIPIENT_RE.search(header)
-                    body_start = msg + len(ATEM_MESSAGE)
-                    self._buffer = buf[body_start:]
-                    begin_body(rm.group(1) if rm else "user", buf[s:body_start])
-                    continue
-                # No header yet: hold. Real inter-segment debris is dropped when a
-                # header arrives; at EOS the held text is delivered as content
-                # instead (prose stranded after a literal closer is still a reply).
-                if final:
-                    emit("user", buf)
-                    self._buffer = ""
+                    if msg != -1:
+                        emit_seek(buf[:s])
+                        header = buf[s + len(ATEM_START): msg]
+                        rm = ATEM_RECIPIENT_RE.search(header)
+                        body_start = msg + len(ATEM_MESSAGE)
+                        self._buffer = buf[body_start:]
+                        begin_body(rm.group(1) if rm else "user", buf[s:body_start])
+                        continue
+                    # A complete <|start|> whose <|message|> hasn't arrived: text
+                    # before it is content NOW (never re-dropped), the candidate is
+                    # held -- bounded. Past a plausible header span it cannot open a
+                    # header anymore: release the marker as literal content and
+                    # resume scanning behind it, so a degenerate wire neither stalls
+                    # the stream nor eats the rest of the turn.
+                    emit_seek(buf[:s])
+                    self._buffer = buf[s:]
+                    if len(self._buffer) - len(ATEM_START) > ATEM_HEADER_SPAN:
+                        out_content.append(ATEM_START)  # verbatim: deliver, don't drop
+                        self._buffer = self._buffer[len(ATEM_START):]
+                        continue
+                    if final:
+                        self._buffer = ""  # died inside a plausible header: capped debris
+                    break
+                # No marker in sight: stream eagerly as content, holding only the
+                # tail that could still grow into one. The buffer is CONSUMED here
+                # -- the previous hold-until-flush was quadratic (re-scanned from
+                # byte 0 per chunk) and stalled the stream on long headerless
+                # continuations.
+                hold = 0 if final else atem_hold_len(buf)
+                piece = buf[: len(buf) - hold] if hold else buf
+                emit_seek(piece)
+                self._buffer = buf[len(piece):]
                 break
 
             # self._mode == "body"

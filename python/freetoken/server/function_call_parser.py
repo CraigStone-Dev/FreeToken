@@ -30,6 +30,7 @@ from .api_models import Function, Tool
 from .reasoning_parser import (
     ATEM_BARE_START_RE,
     ATEM_CLOSING_TOKENS,
+    ATEM_HEADER_SPAN,
     ATEM_INLINE_HEADER_RE,
     ATEM_MESSAGE,
     ATEM_RECIPIENT_RE,
@@ -3118,6 +3119,12 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         # delegated to the mixin).
         self._ch_mode = "text"
         self._at_stream_start = True
+        # A channel boundary fired mid-invoke: until the NEXT boundary, incoming
+        # text is that broken channel's residue (raw ATEM markup), not content.
+        self._truncated_channel = False
+        # Dropped tool-channel prose, accumulated for ONE warning per channel
+        # (a per-fragment warning logs once per generated character).
+        self._dropped_prose: List[str] = []
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -3174,9 +3181,11 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         ledger the completed parameters, and advance the ordinal so the next
         call cannot merge into this one. Anything less than an open invoke is
         markup debris: warn and reset."""
+        self._warn_dropped_prose()
         mode = getattr(self, "_ps_mode", "idle")
         if mode == "idle":
             return []
+        self._truncated_channel = True  # what follows is the broken channel's residue
         calls: List[ToolCallItem] = []
         if mode in ("invoke", "pstr", "pbuf"):
             ledger = self.streamed_args_for_tool[self.current_tool_id]
@@ -3217,12 +3226,21 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
     def _drop_channel_prose(self, text: str) -> None:
         """Text inside a tool channel that is not ATEM markup is discarded (only
         tool-recipient markup is executed; the template puts nothing else there).
-        Non-whitespace prose is worth a log line -- silent loss costs the next
-        person a debugging session."""
+        Accumulated and logged ONCE per channel by ``_warn_dropped_prose`` --
+        token-by-token serving would otherwise warn per generated character."""
         if text and text.strip():
-            logger.warning(
-                "muse_glimmer: dropping prose inside a tool channel: %.120r", text
-            )
+            self._dropped_prose.append(text)
+
+    def _warn_dropped_prose(self) -> None:
+        if not self._dropped_prose:
+            return
+        dropped = "".join(self._dropped_prose)
+        self._dropped_prose = []
+        logger.warning(
+            "muse_glimmer: dropped %d chars of non-markup text inside a tool channel: %.120r",
+            len(dropped),
+            dropped,
+        )
 
     def _run_mixin(self, atem_part: str, remainder: str, tools: List[Tool]) -> StreamingParseResult:
         """Feed ``atem_part`` through the invoke/parameter machinery; whatever the
@@ -3266,27 +3284,52 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     hold = atem_hold_len(buf)
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
-                        normal_parts.append(release)
+                        # Until the next boundary, text after a mid-invoke channel
+                        # break is the broken channel's residue (raw ATEM markup),
+                        # never user content.
+                        if self._truncated_channel:
+                            self._drop_channel_prose(release)
+                        else:
+                            normal_parts.append(release)
                         self._buffer = buf[len(release):]
                     break
                 if pos > 0:
-                    normal_parts.append(buf[:pos])
+                    if self._truncated_channel:
+                        self._drop_channel_prose(buf[:pos])
+                    else:
+                        normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
                 if kind == "closer":
                     self._buffer = buf[len(payload):]  # stray terminator: drop
+                    self._truncated_channel = False
+                    self._warn_dropped_prose()
                     continue
                 if kind == "inline":
                     self._enter_recipient(payload.group(1))
                     self._buffer = buf[payload.end():]
+                    self._truncated_channel = False
+                    self._warn_dropped_prose()
                     continue
                 # kind == "start": parse the channel header.
                 msg = buf.find(ATEM_MESSAGE)
                 if msg == -1:
+                    if len(buf) > len(ATEM_START) + ATEM_HEADER_SPAN:
+                        # Past a plausible header span the marker cannot open a
+                        # header anymore: release it as literal text and move on
+                        # (mirrors the reasoning parser's bound).
+                        if self._truncated_channel:
+                            self._drop_channel_prose(ATEM_START)
+                        else:
+                            normal_parts.append(ATEM_START)
+                        self._buffer = buf[len(ATEM_START):]
+                        continue
                     break  # header still streaming
                 m = ATEM_RECIPIENT_RE.search(buf[len(ATEM_START):msg])
                 self._enter_recipient(m.group(1) if m else "user")
                 self._buffer = buf[msg + len(ATEM_MESSAGE):]
+                self._truncated_channel = False
+                self._warn_dropped_prose()
                 continue
 
             pos, kind, payload = self._channel_boundary(buf)
@@ -3341,12 +3384,14 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
     def finish_streaming(self) -> str:
+        self._warn_dropped_prose()
         residual, self._buffer = self._buffer, ""
         ch_mode, self._ch_mode = self._ch_mode, "text"
         self._at_stream_start = True
+        truncated, self._truncated_channel = self._truncated_channel, False
         ps_mode = getattr(self, "_ps_mode", "idle")
         self._ps_reset()
-        if ch_mode != "text" or ps_mode != "idle":
+        if ch_mode != "text" or ps_mode != "idle" or truncated:
             return ""
         if ATEM_START in residual or ATEM_MESSAGE in residual:
             return ""  # incomplete channel markup: debris
