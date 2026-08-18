@@ -549,12 +549,14 @@ class GemmaThoughtReasoningParser(BaseReasoningParser):
 
 # Muse Glimmer ATEM protocol control tokens. Generation starts right after the
 # template's ``<|start|>assistant``, so the FIRST segment arrives as a bare header
-# continuation (`` to=self<|message|>...``). Later segments open with a full
-# ``<|start|>assistant to=X<|message|>`` -- or, when the model leaves a channel
-# without emitting ``<|eom|>`` first, with a bare ``to=X<|message|>`` (a complete
-# match of that shape is a segment boundary; vLLM applies the same rule).
-# ``<|eom|>`` separates segments within one turn; ``<|eot|>`` / ``<|end_of_text|>``
-# are the stops.
+# continuation (`` to=self<|message|>...``) -- the parser is constructed
+# header-open and seeds a synthetic ``<|start|>`` so those bytes go through the
+# ordinary full-header machinery instead of a duplicate guessing path. Later
+# segments open with a full ``<|start|>assistant to=X<|message|>`` -- or, when
+# the model leaves a channel without emitting ``<|eom|>`` first, with a bare
+# ``to=X<|message|>`` (a complete match of that shape is a segment boundary;
+# vLLM applies the same rule). ``<|eom|>`` separates segments within one turn;
+# ``<|eot|>`` / ``<|end_of_text|>`` are the stops.
 ATEM_START = "<|start|>"
 ATEM_MESSAGE = "<|message|>"
 ATEM_CLOSING_TOKENS = ("<|eot|>", "<|eom|>", "<|end_of_text|>")
@@ -567,18 +569,25 @@ ATEM_RECIPIENT_RE = re.compile(r"to=([^\s<]{1,64})")
 # The name length is capped so the streaming hold-back below can bound how much
 # tail it withholds while a potential switch is still arriving.
 ATEM_INLINE_HEADER_RE = re.compile(r"to=([^\s<]{1,64})<\|message\|>")
-# The bare stream-start header (generation resumed after "<|start|>assistant"):
-# optional "assistant", optional recipient, then <|message|>. Committing to
-# "header" requires this FULL match -- prefix sniffing alone ate ordinary
-# content that merely started with "assistant"/"to=".
-ATEM_BARE_START_RE = re.compile(
-    r"^[ \t\r\n]{0,8}(?:assistant\b)?[ \t]*(?:to=([^\s<]{1,64}))?[ \t]*<\|message\|>"
-)
-_ATEM_MAX_BARE_HEADER = 96
+# Lookback window for the streaming hold-back's inline-switch scan: a headerless
+# ``to=<name><|message|>`` switch can occupy at most this many trailing bytes.
+_ATEM_HOLD_WINDOW = 96
 # Longest span after "<|start|>" a real header can occupy before its <|message|>
 # arrives ("assistant to=<name>" + slack). Past this, the marker cannot open a
 # header anymore and is released as literal content instead of held forever.
 ATEM_HEADER_SPAN = 128
+
+
+def atem_marker_inside(text: str, start: int, end: int) -> bool:
+    """True when a complete ATEM control token lies fully inside ``text[start:end]``.
+    A channel header can never contain one, so a header candidate with a marker
+    before its ``<|message|>`` is not a header."""
+    for tok in ATEM_ALL_TOKENS:
+        if tok == ATEM_MESSAGE:
+            continue  # the terminator being sought, not a header byte
+        if text.find(tok, start, end) != -1:
+            return True
+    return False
 
 
 def _longest_atem_partial_suffix(text: str) -> int:
@@ -599,7 +608,7 @@ def atem_hold_len(text: str) -> int:
     text is re-examined on the next chunk, so an emitted body never has to shrink
     when the boundary completes."""
     best = _longest_atem_partial_suffix(text)
-    window = text[-_ATEM_MAX_BARE_HEADER:]
+    window = text[-_ATEM_HOLD_WINDOW:]
     i = window.rfind("to=")
     if i != -1:
         tail = window[i:]
@@ -615,37 +624,6 @@ def atem_hold_len(text: str) -> int:
     return best
 
 
-def atem_bare_start_state(text: str) -> str:
-    """Classify the head of a stream that does not open with ``<|start|>`` and does
-    not (yet) fully match ``ATEM_BARE_START_RE``: "undecided" while the text is still
-    a prefix of a possible bare header (or of ``<|start|>``), else "content"."""
-    if len(text) > _ATEM_MAX_BARE_HEADER:
-        return "content"
-    s = text.lstrip(" \t\r\n")
-    if not s:
-        return "undecided"
-    if ATEM_START.startswith(s):
-        return "undecided"
-    if "assistant".startswith(s):
-        return "undecided"  # partial "assistant"
-    if s.startswith("assistant"):
-        s = s[len("assistant") :].lstrip(" \t")
-        if not s:
-            return "undecided"
-    if "to=".startswith(s):
-        return "undecided"  # "t" / "to"
-    if s.startswith("to="):
-        j = 3
-        while j < len(s) and s[j] not in " \t\r\n<":
-            j += 1
-        s = s[j:].lstrip(" \t")
-        if not s:
-            return "undecided"  # recipient name still streaming
-    if ATEM_MESSAGE.startswith(s):
-        return "undecided"  # partial <|message|>
-    return "content"
-
-
 class MuseGlimmerReasoningParser(BaseReasoningParser):
     """Reasoning parser for Muse Glimmer's ATEM channel output.
 
@@ -656,11 +634,20 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
     ``MuseGlimmerDetector`` -- when the channel ends without its own terminator
     (an abutting ``<|start|>`` header or a headerless switch), a synthetic
     ``<|eom|>`` is appended so the detector always receives a delimited block.
-    Segments open with ``<|start|>...`` headers, with a bare stream-start header
-    (generation resumes after the template's ``<|start|>assistant``), or with a
-    headerless ``to=X<|message|>`` switch (the model leaves a channel without
-    ``<|eom|>``; vLLM's rule). Text with no ATEM markers at all (raw,
-    non-templated prompts) passes through as content.
+    Segments open with ``<|start|>...`` headers or with a headerless
+    ``to=X<|message|>`` switch (the model leaves a channel without ``<|eom|>``;
+    vLLM's rule). The parser is initialized from the prompt it continues:
+    every request that reaches it is a templated chat generation whose prompt
+    ends with ``<|start|>assistant``, so ``header_open=True`` (the default)
+    seeds a synthetic ``<|start|>`` and the turn's first bytes go through the
+    ordinary full-header machinery -- a real ``<|message|>`` closes the header
+    (a junk recipient yields the empty channel the model asked for), and a
+    header that never gets its ``<|message|>`` falls to the unfinished-header
+    end-of-stream rule below. This replaces a prefix-guessing "start" mode that
+    kept misclassifying content shaped like a header (the same mechanism
+    ``force_reasoning`` is for the ``<think>`` families, read from the prompt
+    instead of re-derived). Text with no ATEM markers at all passes through as
+    content.
 
     Streaming consumes the buffer as it emits (O(n) over the stream; the naive
     re-scan of the full buffer per chunk was quadratic and stalled the serving
@@ -671,17 +658,30 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
     is unused.
     """
 
-    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+    def __init__(
+        self,
+        force_reasoning: bool = False,
+        stream_reasoning: bool = True,
+        header_open: bool = True,
+    ) -> None:
         super().__init__(
             think_start_token="",
             think_end_token="",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
         )
-        self._buffer = ""
-        # "start" (resolving the bare stream-start header) | "body" (streaming a
-        # segment body) | "seek" (between segments, looking for the next header).
-        self._mode = "start"
+        self._header_open = header_open
+        # header_open: the prompt ended inside a channel header (the template's
+        # ``<|start|>assistant``); seed the marker so the turn's first bytes are
+        # parsed by the same machinery as every later header. The seed is
+        # synthetic -- if it is ever ruled a non-header (released past the span
+        # bound, or unfinished at end of stream), the marker text itself is NOT
+        # delivered: the model never emitted it.
+        self._buffer = ATEM_START if header_open else ""
+        self._synthetic_open = header_open
+        # "body" (streaming a segment body) | "seek" (between segments, looking
+        # for the next header).
+        self._mode = "seek"
         self._recipient = "user"
 
     def detect_and_parse(self, text: str) -> ReasoningParseResult:
@@ -689,7 +689,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
         # replay path as streaming (which strips it), not pass through verbatim.
         if not any(tok in text for tok in ATEM_ALL_TOKENS):
             return ReasoningParseResult(normal_text=text)
-        clone = type(self)()
+        clone = type(self)(header_open=self._header_open)
         first = clone.parse_streaming_increment(text)
         rest = clone.flush()
         return ReasoningParseResult(
@@ -755,25 +755,6 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
             if not buf:
                 break
 
-            if self._mode == "start":
-                if buf.startswith(ATEM_START):
-                    self._mode = "seek"
-                    continue
-                m = ATEM_BARE_START_RE.match(buf)
-                if m:
-                    begin_body(m.group(1) or "user", buf[: m.end()])
-                    self._buffer = buf[m.end():]
-                    continue
-                if atem_bare_start_state(buf) == "undecided":
-                    if final:
-                        # Deliver, don't drop: a reply that merely looks like a
-                        # bare-header prefix ("assistant", "to=me@example.com").
-                        emit("user", buf)
-                        self._buffer = ""
-                    break
-                begin_body("user", "")
-                continue
-
             if self._mode == "seek":
                 s = buf.find(ATEM_START)
                 m = ATEM_INLINE_HEADER_RE.search(buf)
@@ -783,7 +764,25 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                     begin_body(m.group(1), buf[m.start(): m.end()])
                     continue
                 if s != -1:
+                    # While the header-open seed is unconsumed it is the leftmost
+                    # marker, so every consuming branch below owns clearing the
+                    # synthetic flag; a synthetic marker ruled a non-header is
+                    # dropped, never delivered (the model did not emit it).
+                    synthetic = self._synthetic_open
                     msg = buf.find(ATEM_MESSAGE, s + len(ATEM_START))
+                    if atem_marker_inside(
+                        buf, s + len(ATEM_START), msg if msg != -1 else len(buf)
+                    ):
+                        # A control token inside the candidate: headers never
+                        # contain markers, so this <|start|> is literal content
+                        # (and a synthetic seed is simply dropped). Decides
+                        # immediately -- no waiting for the span bound or EOS.
+                        emit_seek(buf[:s])
+                        if not synthetic:
+                            out_content.append(ATEM_START)
+                        self._synthetic_open = False
+                        self._buffer = buf[s + len(ATEM_START):]
+                        continue
                     if msg != -1 and msg - s - len(ATEM_START) > ATEM_HEADER_SPAN:
                         # The found <|message|> is too far away to belong to THIS
                         # marker (a stray literal <|start|>, junk, then the NEXT
@@ -791,7 +790,9 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                         # the span bound applies whether or not a <|message|> is
                         # already in the buffer, or one-shot and streaming diverge.
                         emit_seek(buf[:s])
-                        out_content.append(ATEM_START)
+                        if not synthetic:
+                            out_content.append(ATEM_START)
+                        self._synthetic_open = False
                         self._buffer = buf[s + len(ATEM_START):]
                         continue
                     if msg != -1:
@@ -800,6 +801,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                         rm = ATEM_RECIPIENT_RE.search(header)
                         body_start = msg + len(ATEM_MESSAGE)
                         self._buffer = buf[body_start:]
+                        self._synthetic_open = False
                         begin_body(rm.group(1) if rm else "user", buf[s:body_start])
                         continue
                     # A complete <|start|> whose <|message|> hasn't arrived: text
@@ -812,7 +814,9 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                     emit_seek(buf[:s])
                     self._buffer = buf[s:]
                     if len(self._buffer) - len(ATEM_START) > ATEM_HEADER_SPAN + len(ATEM_MESSAGE):
-                        out_content.append(ATEM_START)  # verbatim: deliver, don't drop
+                        if not synthetic:
+                            out_content.append(ATEM_START)  # verbatim: deliver, don't drop
+                        self._synthetic_open = False
                         self._buffer = self._buffer[len(ATEM_START):]
                         continue
                     if final:
@@ -822,6 +826,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                         # whose edge moved between layers; removing it makes the
                         # detector's agreement trivial -- both deliver.)
                         emit_seek(self._buffer[len(ATEM_START):])
+                        self._synthetic_open = False
                         self._buffer = ""
                     break
                 # No marker in sight: stream eagerly as content, holding only the

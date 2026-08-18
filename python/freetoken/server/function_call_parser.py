@@ -28,15 +28,14 @@ from pydantic import BaseModel
 
 from .api_models import Function, Tool
 from .reasoning_parser import (
-    ATEM_BARE_START_RE,
     ATEM_CLOSING_TOKENS,
     ATEM_HEADER_SPAN,
     ATEM_INLINE_HEADER_RE,
     ATEM_MESSAGE,
     ATEM_RECIPIENT_RE,
     ATEM_START,
-    atem_bare_start_state,
     atem_hold_len,
+    atem_marker_inside,
 )
 
 try:
@@ -3080,10 +3079,16 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
     around the mixin swallows the ``<|start|>...<|message|>`` headers and the
     ``<|eot|>/<|eom|>`` terminators, streams ``to=user`` bodies as text, and drops
     ``to=self`` bodies (they only reach this detector when no reasoning parser
-    runs upstream). Channels also open headerless: the stream's bare first
-    segment (generation resumes after the template's ``<|start|>assistant``) and
-    mid-stream ``to=X<|message|>`` switches (the model leaves a channel without
-    ``<|eom|>``).
+    runs upstream). Channels also open with a mid-stream headerless
+    ``to=X<|message|>`` switch (the model leaves a channel without ``<|eom|>``).
+
+    ``header_open`` initializes the detector from the prompt it continues:
+    True when the detector receives the raw turn bytes directly (no muse
+    reasoning parser stacked above), whose templated prompt ends with
+    ``<|start|>assistant`` -- a synthetic ``<|start|>`` is seeded so the bare
+    first header goes through the ordinary full-header machinery. False (the
+    default) downstream of ``MuseGlimmerReasoningParser``, which delivers tool
+    slices with their full headers and everything else already classified.
 
     ATEM markup is EXECUTED only inside a tool-recipient channel (vLLM's rule).
     A block quoted in a ``to=user`` body -- or the system prompt's own ATEM
@@ -3096,8 +3101,9 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
     toolcall_opener = None
     _ps_trim = ""  # "spaces for string values are not stripped" (chat-template contract)
     _ps_missing_type = "string"
+    accepts_header_open = True  # FunctionCallParser passes the turn-start state
 
-    def __init__(self):
+    def __init__(self, header_open: bool = False):
         super().__init__()
         self.bot_token = "<atem:function_calls>"
         self.eot_token = "</atem:function_calls>"
@@ -3118,7 +3124,11 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         # (non-user, non-tool channel body) | "tool" (tool channel body,
         # delegated to the mixin).
         self._ch_mode = "text"
-        self._at_stream_start = True
+        self._header_open = header_open
+        # The seed is synthetic: if it is ever ruled a non-header, the marker
+        # text itself is not delivered -- the model never emitted it.
+        self._buffer = ATEM_START if header_open else ""
+        self._synthetic_open = header_open
         # A channel boundary fired mid-invoke: until the NEXT boundary, incoming
         # text is that broken channel's residue (raw ATEM markup), not content.
         self._truncated_channel = False
@@ -3313,21 +3323,6 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     self._truncated_channel = False
                     self._warn_dropped_prose()
                     continue
-                if self._at_stream_start:
-                    # Bare first-segment header: generation resumed after
-                    # ``<|start|>assistant``. Commit only on a FULL header match;
-                    # ordinary content that merely starts with "assistant"/"to="
-                    # falls through and streams as text.
-                    if not buf.startswith(ATEM_START):
-                        m = ATEM_BARE_START_RE.match(buf)
-                        if m:
-                            self._enter_recipient(m.group(1) or "user")
-                            self._buffer = buf[m.end():]
-                            self._at_stream_start = False
-                            continue
-                        if atem_bare_start_state(buf) == "undecided":
-                            break  # could still grow into a header: hold
-                    self._at_stream_start = False
                 pos, kind, payload = self._channel_boundary(buf)
                 if pos == -1:
                     hold = atem_hold_len(buf)
@@ -3347,8 +3342,23 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     self._enter_recipient(payload.group(1))
                     self._buffer = buf[payload.end():]
                     continue
-                # kind == "start": parse the channel header.
+                # kind == "start": parse the channel header. While the header-open
+                # seed is unconsumed it is the leftmost marker, so each consuming
+                # branch owns the synthetic flag: a synthetic marker ruled a
+                # non-header is dropped, never delivered (the model never emitted it).
+                synthetic = self._synthetic_open
                 msg = buf.find(ATEM_MESSAGE)
+                if atem_marker_inside(
+                    buf, len(ATEM_START), msg if msg != -1 else len(buf)
+                ):
+                    # A control token inside the candidate: headers never contain
+                    # markers, so this <|start|> is literal text (a synthetic
+                    # seed is simply dropped) -- mirrors the reasoning parser.
+                    if not synthetic:
+                        normal_parts.append(ATEM_START)
+                    self._synthetic_open = False
+                    self._buffer = buf[len(ATEM_START):]
+                    continue
                 if msg == -1:
                     # +len(<|message|>) slack: a protocol-legal header whose marker
                     # is still mid-arrival must not be cut at the nominal span.
@@ -3356,7 +3366,9 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                         # Past a plausible header span the marker cannot open a
                         # header anymore: release it as literal text and move on
                         # (mirrors the reasoning parser's bound).
-                        normal_parts.append(ATEM_START)
+                        if not synthetic:
+                            normal_parts.append(ATEM_START)
+                        self._synthetic_open = False
                         self._buffer = buf[len(ATEM_START):]
                         continue
                     break  # header still streaming
@@ -3364,11 +3376,14 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     # The found <|message|> is too far away to belong to THIS
                     # marker (a stray literal <|start|> followed by junk, then the
                     # NEXT segment's real header): the marker is literal text.
-                    normal_parts.append(ATEM_START)
+                    if not synthetic:
+                        normal_parts.append(ATEM_START)
+                    self._synthetic_open = False
                     self._buffer = buf[len(ATEM_START):]
                     continue
                 m = ATEM_RECIPIENT_RE.search(buf[len(ATEM_START):msg])
                 self._enter_recipient(m.group(1) if m else "user")
+                self._synthetic_open = False
                 self._buffer = buf[msg + len(ATEM_MESSAGE):]
                 continue
 
@@ -3431,25 +3446,22 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
 
     def finish_streaming(self) -> str:
         self._warn_dropped_prose()
-        residual, self._buffer = self._buffer, ""
+        residual, self._buffer = self._buffer, ATEM_START if self._header_open else ""
         ch_mode, self._ch_mode = self._ch_mode, "text"
-        self._at_stream_start = True
+        synthetic, self._synthetic_open = self._synthetic_open, self._header_open
         truncated, self._truncated_channel = self._truncated_channel, False
         ps_mode = getattr(self, "_ps_mode", "idle")
         self._ps_reset()
         if ch_mode != "text" or ps_mode != "idle" or truncated:
             return ""
-        if ATEM_MESSAGE in residual:
-            return ""  # incomplete channel markup: debris
+        if synthetic:
+            residual = residual[len(ATEM_START):]  # the seed: never model output
         # At end of stream a <|start|> that never received its <|message|> is NOT
         # a header: deliver the text, drop only the marker(s). Any capped discard
         # here diverged from the layer above -- its span runs on raw bytes while
         # this layer sees closer-stripped text, so the two edges can never agree;
         # removing the drop window entirely makes the agreement trivial.
         residual = residual.replace(ATEM_START, "")
-        # Deliver, don't drop: a whole reply that merely LOOKS like a bare-header
-        # prefix ("assistant", "to=me@example.com") was held undecided and lands
-        # here at end-of-stream -- it is content.
         for tok in ATEM_CLOSING_TOKENS:
             residual = residual.replace(tok, "")
         if self.prev_tool_call_arr and residual.strip() == "":
@@ -3466,7 +3478,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         semantics. Streamed fragments are reassembled into complete calls; a
         call truncated by end-of-input closes from the parse ledger, exactly as
         the serving layer would."""
-        clone = type(self)()
+        clone = type(self)(header_open=self._header_open)
         raw_calls: List[ToolCallItem] = []
         normal_parts: List[str] = []
         result = clone.parse_streaming_increment(text, tools)
@@ -3525,13 +3537,18 @@ class FunctionCallParser:
         "qwen3_coder": Qwen3CoderDetector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str):
+    def __init__(self, tools: List[Tool], tool_call_parser: str, turn_starts_open: bool = False):
         detector: Type[BaseFormatDetector] = None
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
-        if detector_class:
-            detector = detector_class()
-        else:
+        if detector_class is None:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+        if getattr(detector_class, "accepts_header_open", False):
+            # Turn-start parse state read from the prompt: the templated chat
+            # prompt ends inside a channel header (``<|start|>assistant``), so a
+            # detector that receives the raw turn bytes starts header-open.
+            detector = detector_class(header_open=turn_starts_open)
+        else:
+            detector = detector_class()
 
         self.detector = detector
         self.tools = _coerce_tools(tools)

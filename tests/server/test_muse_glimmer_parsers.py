@@ -14,7 +14,11 @@ from freetoken.server.function_call_parser import (
     MuseGlimmerDetector,
     Tool,
 )
-from freetoken.server.reasoning_parser import MuseGlimmerReasoningParser, ReasoningParser
+from freetoken.server.reasoning_parser import (
+    ATEM_START,
+    MuseGlimmerReasoningParser,
+    ReasoningParser,
+)
 
 
 def _tools():
@@ -136,11 +140,12 @@ def test_reasoning_tool_channel_preserved_verbatim():
     assert r.normal_text.startswith("<|start|>assistant to=weather.get<|message|>")
     assert "<atem:function_calls>" in r.normal_text and r.normal_text.endswith("<|eot|>")
 
-    # A tool call as the FIRST (bare) segment stays verbatim too; the detector's
-    # bare-header rule picks it up without an opener.
+    # A tool call as the FIRST (bare) segment: the header-open parser completes
+    # the bare header with its synthetic <|start|> seed, so the detector always
+    # receives a fully delimited channel -- no bare-header guessing downstream.
     bare = " to=weather.get<|message|>" + _atem("weather.get", {"city": "Rome"}) + "<|eot|>"
     r2 = MuseGlimmerReasoningParser().detect_and_parse(bare)
-    assert r2.normal_text.startswith("to=weather.get<|message|>")
+    assert r2.normal_text.startswith("<|start|> to=weather.get<|message|>")
     assert r2.normal_text.endswith("<|eot|>")
 
 
@@ -1023,8 +1028,11 @@ def test_reply_after_stray_start_junk_segment_survives(junk_len):
 def test_detector_giant_header_bound_pinned():
     """R5 test-integrity: the detector's own msg-too-far bound. A stray
     <|start|> + junk ahead of a real tool channel in ONE detector buffer must
-    not merge into a giant header -- without the bound the junk swallows the
-    channel opener and the tool call silently never executes."""
+    not merge into a giant header. NOTE which assertion is load-bearing: with
+    the bound deleted the tool call still executes correctly -- what breaks is
+    the ~300 chars of user content silently vanishing into the giant header, so
+    it is the junk/content assertion below that pins the bound, not the calls
+    assertion."""
     junk = "J" * 300
     text = (
         "ok<|eom|><|start|>" + junk
@@ -1036,6 +1044,94 @@ def test_detector_giant_header_bound_pinned():
         normal, calls = _stream_detect(det, text, _tools(), step=step)
         assert _assemble(calls) == [("weather.get", {"city": "P"})], (step,)
         assert "done" in normal and junk in normal
+
+
+# ---------------------------------------------------------------------------
+# Review regressions (PR #4, round 6): turn-start state is read from the
+# prompt (header-open), not guessed from the first bytes. The bare-header
+# lookalike family -- shapes the old prefix-guessing blanked to an empty turn.
+# ---------------------------------------------------------------------------
+def test_junk_recipient_past_cap_yields_empty_channel_not_empty_turn():
+    """``to=`` + 70 chars + <|message|>: the recipient (capped at 64) is a junk
+    tool name, so the channel body is not user-visible -- but the turn is NOT
+    blanked: a following real reply flows."""
+    wire = (
+        "to=" + "j" * 70 + "<|message|>hidden<|eot|>"
+        "<|start|>assistant to=user<|message|>Real reply.<|eot|>"
+    )
+    for step in (1, 7, 4096):
+        _, piped, calls = _pipe(wire, _tools(), step=step)
+        assert "Real reply." in piped, (step, piped)
+        assert "hidden" not in piped  # the junk channel is what the model said
+    rp = MuseGlimmerReasoningParser().detect_and_parse(wire)
+    one = MuseGlimmerDetector().detect_and_parse(rp.normal_text, _tools())
+    assert "Real reply." in one.normal_text and "hidden" not in one.normal_text
+
+
+def test_glued_assistant_recipient_header_parses():
+    """``assistantto=x<|message|>``: the recipient regex still finds to=x, so
+    the segment routes as a (junk) tool channel and the next reply flows."""
+    wire = (
+        "assistantto=x<|message|>hello<|eot|>"
+        "<|start|>assistant to=user<|message|>Hi.<|eot|>"
+    )
+    for step in (1, 7, 4096):
+        _, piped, _ = _pipe(wire, _tools(), step=step)
+        assert "Hi." in piped, (step, piped)
+        assert "hello" not in piped
+
+
+def test_deep_leading_whitespace_header_delivers_reply():
+    """>8 leading newlines before ``to=user<|message|>``: the old bare-header
+    regex allowed at most 8 whitespace chars while the undecided hold lstripped
+    unbounded, blanking the turn; the full-header machinery has no such split."""
+    wire = "\n" * 9 + "to=user<|message|>Hello!<|eot|>"
+    for step in (1, 7, 4096):
+        _, piped, _ = _pipe(wire, _tools(), step=step)
+        assert "Hello!" in piped, (step, piped)
+    rp = MuseGlimmerReasoningParser().detect_and_parse(wire)
+    assert "Hello!" in rp.normal_text
+
+
+def test_prose_before_first_full_header_not_swallowed_into_seed():
+    """The header-open seed must not merge turn-start prose with the FIRST real
+    header into one giant header: a control token inside a header candidate
+    voids the candidate (headers never contain markers). Without the parser's
+    marker-inside rule, 'Pre. ' is swallowed into the seed's header -- here the
+    header routes to=self, so the swallowed prefix vanishes entirely (a tool
+    channel would carry it verbatim and mask the loss downstream)."""
+    wire = (
+        "Pre. <|start|>assistant to=self<|message|>think<|eom|>"
+        "<|start|>assistant to=user<|message|>Post.<|eot|>"
+    )
+    for step in (1, 7, 4096):
+        reasoning, piped, _ = _pipe(wire, _tools(), step=step)
+        assert "Pre. " in piped and "Post." in piped, (step, piped)
+        assert "think" in reasoning and "Pre" not in reasoning
+    r = MuseGlimmerReasoningParser().detect_and_parse(wire)
+    assert "Pre." in r.normal_text and "think" in r.reasoning_text
+    # and with a tool channel: the call still parses, the prose still flows
+    wire2 = (
+        "Pre. " + _tool_channel("weather.get", {"city": "P"})
+        + "<|start|>assistant to=user<|message|>Post.<|eot|>"
+    )
+    for step in (1, 7, 4096):
+        _, piped2, calls2 = _pipe(wire2, _tools(), step=step)
+        assert _assemble(calls2) == [("weather.get", {"city": "P"})], (step,)
+        assert "Pre. " in piped2 and "Post." in piped2, (step, piped2)
+
+
+def test_headerless_turn_delivers_and_seed_never_leaks():
+    """Degenerate output that never emits <|message|>: the header-open seed is
+    ruled a non-header and only the model's own bytes are delivered -- the
+    synthetic <|start|> must not leak into content at any length."""
+    for text in ("Just prose, no protocol.", "x" * 200):
+        for step in (1, 7, 4096):
+            _, piped, _ = _pipe(text, _tools(), step=step)
+            assert piped == text, (len(text), step, piped)
+            assert ATEM_START not in piped
+        rp = MuseGlimmerReasoningParser().detect_and_parse(text)
+        assert rp.normal_text == text
 
 
 _CORPUS_REPLY = "All good."
@@ -1061,6 +1157,19 @@ _WIRE_CORPUS = [
     " to=user<|message|>All good.<|eot|>",
     # bare first segment is the reply
     " to=user<|message|>All good.<|eom|>",
+    # stray <|start|>+junk segment ahead of the real reply (R5 HIGH-1 shape)
+    " to=user<|message|>prelude<|eom|><|start|>" + "J" * 115
+    + "<|start|>assistant to=user<|message|>All good.<|eot|>",
+    # stream dies inside an unfinished header candidate (R5 EOS-family shape)
+    " to=user<|message|>All good.<|eot|><|start|>" + "p" * 119 + "<|end_of_text|>",
+    # truncated invoke leaving real closing tags before the reply (exercises
+    # the </atem: leak clause below)
+    " to=fs.write<|message|><atem:function_calls>\n"
+    '<atem:invoke name="fs.write">\n'
+    '<atem:parameter name="path">/tmp/t</atem:parameter>\n'
+    '<atem:parameter name="content">send to=user<|message|></atem:parameter>\n'
+    "</atem:invoke>\n</atem:function_calls><|eot|>"
+    "<|start|>assistant to=user<|message|>All good.<|eot|>",
 ]
 
 
@@ -1076,7 +1185,9 @@ def test_wire_corpus_pipeline_consistency(wire_idx, step):
     rp = MuseGlimmerReasoningParser().detect_and_parse(wire)
     one = MuseGlimmerDetector().detect_and_parse(rp.normal_text, _tools())
     assert [(c.name, json.loads(c.parameters)) for c in one.calls] == _assemble(calls)
-    assert _CORPUS_REPLY in one.normal_text or _CORPUS_REPLY in rp.normal_text
+    # the one-shot DETECTOR's content must carry the reply itself (the parser's
+    # content always does, so an or-check here would never fail)
+    assert _CORPUS_REPLY in one.normal_text, (wire_idx, one.normal_text)
 
 
 # ---------------------------------------------------------------------------
