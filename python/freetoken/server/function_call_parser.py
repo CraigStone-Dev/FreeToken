@@ -3231,7 +3231,14 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
     def _channel_residue_end(cls, buf: str) -> tuple[int, bool]:
         """Length of the leading run of ATEM closing markup (closing tags plus
         whitespace) in ``buf``, and whether the scan DECIDED. False means the
-        buffer ends inside the run or a partial tag: hold for more input."""
+        buffer ends inside the run or a partial tag: hold for more input.
+
+        Known cost of shape-based dropping: a reply that literally BEGINS with a
+        complete closing tag ("</atem:parameter> is the closing tag") loses that
+        leading tag. Partial-tag-shaped prose ("</a", "</atem") is held and
+        released intact, so no ordinary word can be eaten -- only a verbatim
+        full tag right after a truncated invoke, which is indistinguishable from
+        the residue this filter exists to drop."""
         i = 0
         while i < len(buf):
             if buf[i] in " \t\r\n":
@@ -3434,16 +3441,12 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             return ""
         if ATEM_MESSAGE in residual:
             return ""  # incomplete channel markup: debris
-        s = residual.find(ATEM_START)
-        if s != -1:
-            # Mirror the capped-debris rule instead of a blanket drop: deliver the
-            # text and discard at most the <|start|>+span candidate the stream died
-            # inside -- the layer above may have DELIVERED that text deliberately
-            # (its span runs on raw bytes; ours runs after closer stripping).
-            tail = residual[s:]
-            if len(tail) - len(ATEM_START) <= ATEM_HEADER_SPAN + len(ATEM_MESSAGE):
-                residual = residual[:s]
-            # else: ruled non-header upstream; deliver it verbatim
+        # At end of stream a <|start|> that never received its <|message|> is NOT
+        # a header: deliver the text, drop only the marker(s). Any capped discard
+        # here diverged from the layer above -- its span runs on raw bytes while
+        # this layer sees closer-stripped text, so the two edges can never agree;
+        # removing the drop window entirely makes the agreement trivial.
+        residual = residual.replace(ATEM_START, "")
         # Deliver, don't drop: a whole reply that merely LOOKS like a bare-header
         # prefix ("assistant", "to=me@example.com") was held undecided and lands
         # here at end-of-stream -- it is content.

@@ -816,7 +816,13 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                         self._buffer = self._buffer[len(ATEM_START):]
                         continue
                     if final:
-                        self._buffer = ""  # died inside a plausible header: capped debris
+                        # At end of stream a candidate that never received its
+                        # <|message|> is NOT a header: deliver the tail, drop only
+                        # the marker. (A capped discard here kept a drop window
+                        # whose edge moved between layers; removing it makes the
+                        # detector's agreement trivial -- both deliver.)
+                        emit_seek(self._buffer[len(ATEM_START):])
+                        self._buffer = ""
                     break
                 # No marker in sight: stream eagerly as content, holding only the
                 # tail that could still grow into one. The buffer is CONSUMED here
