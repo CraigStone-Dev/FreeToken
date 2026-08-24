@@ -90,7 +90,10 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             try:
                 from freetoken.kvcache.cache_status import compute_cache_status_meta
 
-                ack_queue.put(("meta", compute_cache_status_meta(scheduler.engine)))
+                meta = compute_cache_status_meta(scheduler.engine)
+                # the parent must not touch CUDA to learn this
+                meta["gpus"] = scheduler.gpus
+                ack_queue.put(("meta", meta))
             except Exception:  # noqa: BLE001 -- metadata is a nicety; readiness is not
                 pass
             ack_queue.put("Scheduler is ready")
@@ -126,6 +129,20 @@ def launch_server(
         prog=prog,
     )
     logger = init_logger(__name__, "initializer")
+
+    if server_args.gpu:
+        # set here so the spawned workers inherit it; validate first so a typo is one clear error
+        from freetoken.gpu_select import apply_gpu_selection, validate_gpu_selection
+
+        try:
+            apply_gpu_selection(server_args.gpu)
+            validate_gpu_selection(server_args.tp_info.size)
+        except (ValueError, RuntimeError) as exc:
+            raise SystemExit(f"{prog or 'ft serve'}: error: {exc}") from exc
+        logger.info(
+            f"--gpu {','.join(server_args.gpu)} -> "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}"
+        )
 
     def start_subprocess() -> "BackendHandle":
         import multiprocessing as mp

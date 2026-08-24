@@ -10,6 +10,7 @@ import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
@@ -601,8 +602,10 @@ class Engine:
             return  # explicit fixed cap
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 
-        gpu_name = torch.cuda.get_device_name(self.device) if torch.cuda.is_available() else None
-        fraction = load_hybrid_fetch_fraction(cache.quant_format, gpu_name=gpu_name)
+        gpu_name, gpu_uuid = _profile_gpu(self.device.index)
+        fraction = load_hybrid_fetch_fraction(
+            cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
+        )
         if fraction is None:
             cache.hybrid_max_fetch = 1
             logger.warning_rank0(
@@ -945,6 +948,14 @@ class Engine:
         destroy_distributed()
 
 
+def _profile_gpu(index: int) -> Tuple[str | None, str | None]:
+    """(name, uuid) of visible device ``index``; (None, None) without CUDA."""
+    if not torch.cuda.is_available():
+        return None, None
+    ident = gpu_identity(index)
+    return ident["name"], ident["uuid"]
+
+
 def _ensure_expandable_segments() -> None:
     """Default the CUDA allocator to expandable segments.
 
@@ -1245,8 +1256,9 @@ def _adjust_config(config: EngineConfig):
         bench_fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
         from freetoken.moe.bench_profile import load_backend_recommendation
 
-        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name) == "hybrid":
+        # cuda:<rank>, not device 0: --gpu narrows the visible set
+        gpu_name, gpu_uuid = _profile_gpu(config.tp_info.rank)
+        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid) == "hybrid":
             from freetoken.moe.cpu_executor import compiled_extension_supports
 
             _act = getattr(model_config, "hidden_act", "silu")
