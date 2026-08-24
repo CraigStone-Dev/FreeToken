@@ -1,13 +1,13 @@
 """--gpu for ft serve / bench bw / checkpoint: resolve entries to GPU UUIDs, bind by UUID at CUDA init.
 
 Three device-id namespaces, converted explicitly:
-- logical: position in the --gpu list == TP rank.
-- physical: NVML / nvidia-smi order; not affected by CUDA_VISIBLE_DEVICES.
-- visible: CUDA ordinal in this process, what torch.device("cuda", n) means.
+- logical: position in the --gpu list == TP rank; each worker takes its own entry by rank and the id ends there.
+- physical: NVML / nvidia-smi order, carried as a GPU UUID (_assigned_physical); not affected by CUDA_VISIBLE_DEVICES.
+- visible: CUDA ordinal in this process (_assigned_visible), what torch.device("cuda", n) means.
 
 The parent resolves --gpu entries to full UUIDs via NVML (resolve_gpu_uuids) and fails fast on a typo.
 Each worker publishes its own entry (set_assigned_gpu / assign_gpu) and binds it when CUDA comes up (bind_assigned_gpu) by matching the UUID against CUDA's visible devices.
-Binding is unconditional: a process that publishes nothing binds a default ordinal and records it, so assigned_visible_gpus() names one card in every case.
+One process runs on one GPU. Binding is unconditional: a process that publishes nothing binds a default ordinal and records it, so assigned_visible_gpu() names that card in every case.
 No process mutates CUDA_VISIBLE_DEVICES, and the UUID match holds under any CUDA_DEVICE_ORDER.
 
 Stdlib only (torch is imported lazily); not under freetoken.utils, which imports transformers.
@@ -188,18 +188,24 @@ def _preset_entry(spec: str, preset: "list[str]", preset_raw: str) -> str:
     return hits[0]
 
 
-# The GPU this process was assigned (a full UUID, a raw --gpu entry when NVML could not resolve it, or the ordinal bind_assigned_gpu defaulted to) and the visible ordinal it was bound to.
-# Process-global on purpose: publishing is torch-free so a worker can do it before heavy imports, and kernel-compat checks (e4m3_native) need the span of devices this process will use.
-_assigned_target: "str | None" = None
+# The GPU this process was assigned, in whichever namespace it arrived in; bind_assigned_gpu fills in the visible one.
+# Process-global on purpose: publishing is torch-free so a worker can do it before heavy imports, and kernel-compat checks (e4m3_native) need the device this process will use.
+_assigned_physical: "str | None" = None
 _assigned_visible: "int | None" = None
 
 
 def set_assigned_gpu(target: str) -> None:
-    """Publish this process's GPU before CUDA init; second call must agree."""
-    global _assigned_target
-    if _assigned_target is not None and _assigned_target != target:
-        raise RuntimeError(f"set_assigned_gpu called twice: {_assigned_target!r} then {target!r}")
-    _assigned_target = target
+    """Publish this process's GPU before CUDA init; second call must agree.
+
+    A UUID names a physical GPU and is converted at bind time; a bare index is already a visible ordinal (a preset CUDA_VISIBLE_DEVICES has narrowed to it).
+    """
+    global _assigned_physical, _assigned_visible
+    physical = target if is_gpu_uuid(target) else None
+    visible = None if physical is not None else int(target)
+    current = (_assigned_physical, _assigned_visible)
+    if current not in ((None, None), (physical, visible)):
+        raise RuntimeError(f"set_assigned_gpu called twice: {current} then {target!r}")
+    _assigned_physical, _assigned_visible = physical, visible
 
 
 def assign_gpu(spec: "str | None") -> None:
@@ -210,65 +216,57 @@ def assign_gpu(spec: "str | None") -> None:
     set_assigned_gpu(resolved[0] if resolved else parse_gpu_spec(spec)[0])
 
 
-def _visible_ordinal(target: str) -> int:
-    """CUDA ordinal of ``target`` among this process's visible devices; RuntimeError when absent or ambiguous."""
+def _visible_of_physical(uuid: str) -> int:
+    """CUDA ordinal of the physical GPU ``uuid`` (or unique prefix) among this process's visible devices."""
     import torch
 
-    if is_gpu_uuid(target):
-        seen: list[str] = []
-        hits: list[int] = []
-        for v in range(torch.cuda.device_count()):
-            u = format_gpu_uuid(getattr(torch.cuda.get_device_properties(v), "uuid", None))
-            seen.append(u or "?")
-            if u is not None and u.upper().startswith(target.upper()):
-                hits.append(v)
-        if len(hits) == 1:
-            return hits[0]
-        if hits:
-            raise RuntimeError(f"--gpu {target}: not a unique prefix (visible: {', '.join(seen)})")
-        raise RuntimeError(
-            f"GPU {target} is not visible to CUDA in this process "
-            f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}, "
-            f"visible: {', '.join(seen) or 'none'})"
-        )
-    idx = int(target)
-    if idx >= torch.cuda.device_count():
-        raise RuntimeError(
-            f"cannot use CUDA device {target}: only {torch.cuda.device_count()} device(s) visible "
-            f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r})"
-        )
-    return idx
+    seen: list[str] = []
+    hits: list[int] = []
+    for v in range(torch.cuda.device_count()):
+        u = format_gpu_uuid(getattr(torch.cuda.get_device_properties(v), "uuid", None))
+        seen.append(u or "?")
+        if u is not None and u.upper().startswith(uuid.upper()):
+            hits.append(v)
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        raise RuntimeError(f"--gpu {uuid}: not a unique prefix (visible: {', '.join(seen)})")
+    raise RuntimeError(
+        f"GPU {uuid} is not visible to CUDA in this process "
+        f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}, "
+        f"visible: {', '.join(seen) or 'none'})"
+    )
 
 
 def bind_assigned_gpu(default: int = 0):
     """torch.cuda.set_device this process's GPU and return the device.
 
-    Binds the published entry, or visible ordinal ``default`` when nothing was published; the fallback is recorded too, so the process always knows which card it runs on.
-    A UUID (or prefix) is matched against CUDA's visible devices, so the result is right under any CUDA_DEVICE_ORDER.
-    A bare index is a CUDA ordinal, which under a preset CUDA_VISIBLE_DEVICES is a position in that list.
+    ``default`` is a visible ordinal, used and recorded when nothing was published, so the process always knows which card it runs on.
+    A published UUID (or prefix) is matched against CUDA's own device list, so the result is right under any CUDA_DEVICE_ORDER.
     """
-    global _assigned_target, _assigned_visible
+    global _assigned_visible
     import torch
 
-    if _assigned_target is None:
-        _assigned_target = str(default)
     if _assigned_visible is None:
-        _assigned_visible = _visible_ordinal(_assigned_target)
+        _assigned_visible = default if _assigned_physical is None else _visible_of_physical(_assigned_physical)
+    if not 0 <= _assigned_visible < torch.cuda.device_count():
+        raise RuntimeError(
+            f"cannot use CUDA device {_assigned_visible}: only {torch.cuda.device_count()} device(s) visible "
+            f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r})"
+        )
     device = torch.device("cuda", _assigned_visible)
     torch.cuda.set_device(device)
     return device
 
 
-def assigned_visible_gpus() -> "tuple[int, ...] | None":
-    """Visible ordinals this process is pinned to, or None before it publishes or binds a GPU (= all devices).
+def assigned_visible_gpu() -> "int | None":
+    """Visible ordinal this process is pinned to, or None before it publishes or binds a GPU (= the current device).
 
-    Published-but-not-yet-bound still counts: compat checks in the window between publish and bind must judge the assigned card, not the whole machine.
+    Published-but-not-yet-bound still counts: compat checks in the window between publish and bind must judge the assigned card, not whatever the calling thread happens to sit on.
     """
     if _assigned_visible is not None:
-        return (_assigned_visible,)
-    if _assigned_target is None:
-        return None
-    return (_visible_ordinal(_assigned_target),)
+        return _assigned_visible
+    return None if _assigned_physical is None else _visible_of_physical(_assigned_physical)
 
 
 def format_gpu_uuid(raw) -> str | None:
