@@ -60,8 +60,11 @@ def e4m3_native() -> bool:
         if FORCE_EMU:
             _native = False
         else:
+            from freetoken.gpu_select import assigned_visible_gpus
+
+            devices = assigned_visible_gpus()
             native = {torch.cuda.get_device_capability(i) >= (8, 9)
-                      for i in range(torch.cuda.device_count())}
+                      for i in (range(torch.cuda.device_count()) if devices is None else devices)}
             if len(native) > 1:
                 raise NotImplementedError(
                     "GPUs on both sides of the sm_89 fp8 boundary in one process: "

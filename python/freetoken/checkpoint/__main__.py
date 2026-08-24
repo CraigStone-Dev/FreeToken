@@ -14,7 +14,7 @@ import time
 
 import torch
 
-from freetoken.gpu_select import apply_gpu_selection, single_gpu_arg, validate_gpu_selection
+from freetoken.gpu_select import assign_gpu, bind_assigned_gpu, single_gpu_arg
 
 from .convert import convert_checkpoint
 
@@ -34,20 +34,19 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
                         "an nvidia-smi index (default: the first visible GPU)")
     ns = p.parse_args(argv)
 
-    if ns.gpu is not None:
-        try:
-            # same as ft serve --gpu: narrow CUDA_VISIBLE_DEVICES before CUDA init, repack on cuda:0
-            apply_gpu_selection([ns.gpu])
-            validate_gpu_selection(1)
-        except (ValueError, RuntimeError) as e:
-            p.error(str(e))
+    # same as ft serve --gpu: resolve, then bind by UUID at CUDA init
+    try:
+        assign_gpu(ns.gpu)
+        device = f"cuda:{bind_assigned_gpu().index}"
+    except (ValueError, RuntimeError) as e:
+        p.error(str(e))
 
     shard_limit = int(ns.shard_gib * (1 << 30))
     shard_limit -= shard_limit % 4096  # keep aligned
     t = time.perf_counter()
     index = convert_checkpoint(
         ns.model, ns.out, dtype=_DTYPES[ns.dtype],
-        moe_backend=ns.moe_backend, shard_limit=shard_limit,
+        moe_backend=ns.moe_backend, shard_limit=shard_limit, device=device,
     )
     dt = time.perf_counter() - t
     c = index["counts"]

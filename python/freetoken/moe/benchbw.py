@@ -50,10 +50,10 @@ from types import SimpleNamespace
 import torch
 
 from freetoken.gpu_select import (
-    apply_gpu_selection,
+    assign_gpu,
+    bind_assigned_gpu,
     gpu_identity,
     single_gpu_arg,
-    validate_gpu_selection,
 )
 from freetoken.kernel.pinned import alloc_pinned_tensor
 from freetoken.moe.cpu_executor import physical_core_cpus, resolve_threads_and_affinity
@@ -710,7 +710,7 @@ def run_benchbw(
         )
     if not 0 <= device_index < torch.cuda.device_count():
         raise RuntimeError(
-            f"--device {device_index} out of range (found {torch.cuda.device_count()} CUDA devices)."
+            f"device_index {device_index} out of range (found {torch.cuda.device_count()} CUDA devices)."
         )
     device = torch.device("cuda", device_index)
     torch.cuda.set_device(device)
@@ -779,7 +779,7 @@ def run_benchbw(
         "timestamp": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "epoch": int(time.time()),
         "host": socket.gethostname(),
-        # index is the visible-set position (0 after --gpu); uuid keys the profile file
+        # index is the CUDA ordinal the bench ran on; uuid keys the profile file
         "gpu": {"index": device_index, "name": gpu["name"], "uuid": gpu["uuid"]},
         "cpu": {"physical_cores": len(physical_core_cpus()), "threads_used": cpu["threads"]},
         "threshold": threshold,
@@ -949,8 +949,6 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
     p.add_argument("--gpu", type=single_gpu_arg, default=None,
                    help="GPU to bench: a GPU UUID (GPU-xxxx..., as nvidia-smi -L prints) or an "
                         "nvidia-smi index (default: the first visible GPU)")
-    p.add_argument("--device", type=_nonneg_int, default=None,
-                   help="deprecated: CUDA device ordinal (use --gpu, which takes nvidia-smi numbers)")
     p.add_argument("--cpu-threads", type=_nonneg_int, default=0,
                    help="CPU worker threads (0 = one per physical core)")
     p.add_argument("--cpu-iters", type=_positive_int, default=8, help="STREAM read passes to time")
@@ -962,17 +960,12 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
                    help="fast_index_copy gather passes to time")
     ns = p.parse_args(argv)
 
-    if ns.gpu is not None and ns.device is not None:
-        p.error("--device is deprecated in favour of --gpu; give only one")
-    if ns.gpu is not None:
-        # same as ft serve --gpu: narrow CUDA_VISIBLE_DEVICES before CUDA init, bench cuda:0
-        try:
-            apply_gpu_selection([ns.gpu])
-            validate_gpu_selection(1)
-        except (ValueError, RuntimeError) as e:
-            p.error(str(e))
-    # --device keeps its old meaning, a CUDA ordinal: no env narrowing, so old scripts pick the same card
-    device_index = ns.device or 0
+    # same as ft serve --gpu: resolve, then bind by UUID at CUDA init
+    try:
+        assign_gpu(ns.gpu)
+        device_index = bind_assigned_gpu().index
+    except (ValueError, RuntimeError) as e:
+        p.error(str(e))
 
     models = ns.model or ()
     dtypes = ns.dtype

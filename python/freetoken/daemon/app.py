@@ -70,11 +70,21 @@ def _bench_profile_path(gpu_uuid: str | None) -> str | None:
 
 
 def _serve_gpu_uuid(args: list[str]) -> str | None:
-    """The UUID a serve's `--gpu` pins, or None (absent, or an index the daemon cannot resolve)."""
+    """The full UUID a serve's `--gpu` pins, or None when there is none or it cannot be resolved."""
     for i, a in enumerate(args):
         val = a[len("--gpu="):] if a.startswith("--gpu=") else (args[i + 1] if a == "--gpu" and i + 1 < len(args) else None)
-        if val and val.upper().startswith("GPU-"):
-            return "GPU-" + val[len("GPU-"):]  # the profile file name uses the canonical prefix
+        if not val:
+            continue
+        from freetoken.gpu_select import resolve_gpu_uuids
+
+        try:
+            resolved = resolve_gpu_uuids([val])
+        except ValueError:
+            return None
+        if resolved:
+            return resolved[0]
+        # no NVML: a UUID value still keys the profile file (canonical prefix), an index cannot
+        return "GPU-" + val[len("GPU-"):] if val.upper().startswith("GPU-") else None
     return None
 
 

@@ -295,10 +295,11 @@ class Engine:
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
-        _adjust_config(config)
 
-        self.device = torch.device(f"cuda:{config.tp_info.rank}")
-        torch.cuda.set_device(self.device)
+        from freetoken.gpu_select import bind_assigned_gpu
+
+        self.device = bind_assigned_gpu(config.tp_info.rank)
+        _adjust_config(config)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -948,11 +949,11 @@ class Engine:
         destroy_distributed()
 
 
-def _profile_gpu(index: int) -> Tuple[str | None, str | None]:
-    """(name, uuid) of visible device ``index``; (None, None) without CUDA."""
+def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
+    """(name, uuid) of visible device ``index`` (default: the current, i.e. bound, device); (None, None) without CUDA."""
     if not torch.cuda.is_available():
         return None, None
-    ident = gpu_identity(index)
+    ident = gpu_identity(torch.cuda.current_device() if index is None else index)
     return ident["name"], ident["uuid"]
 
 
@@ -1256,8 +1257,7 @@ def _adjust_config(config: EngineConfig):
         bench_fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
         from freetoken.moe.bench_profile import load_backend_recommendation
 
-        # cuda:<rank>, not device 0: --gpu narrows the visible set
-        gpu_name, gpu_uuid = _profile_gpu(config.tp_info.rank)
+        gpu_name, gpu_uuid = _profile_gpu()
         if load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid) == "hybrid":
             from freetoken.moe.cpu_executor import compiled_extension_supports
 

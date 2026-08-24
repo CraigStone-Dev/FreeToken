@@ -40,8 +40,9 @@ class ServerArgs(SchedulerConfig):
     # app). Empty string disables CORS headers entirely; "*" allows any origin.
     cors_origins: str = "tauri://localhost,http://tauri.localhost,http://localhost:1420"
     # --gpu entries in TP-rank order, empty = not given
-    # env only, not config: the parent writes CUDA_VISIBLE_DEVICES before the workers spawn
     gpu: tuple[str, ...] = ()
+    # full UUIDs resolved from --gpu, entry i = TP rank i; None = NVML unavailable, each worker then resolves its raw entry against CUDA's own enumeration
+    gpu_assigned: "tuple[str, ...] | None" = None
 
     @property
     def share_tokenizer(self) -> bool:
