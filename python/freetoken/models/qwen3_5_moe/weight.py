@@ -422,7 +422,8 @@ def _per_row_scale(scalar: torch.Tensor, rows: int) -> torch.Tensor:
 
 
 def _pt_fp8_fuse(base: str, weight: torch.Tensor, scalar: torch.Tensor,
-                 act_scale: torch.Tensor | None, buf: dict):
+                 act_scale: torch.Tensor | None, buf: dict,
+                 tp_info=None, local_part_sizes: tuple | None = None):
     """Buffer an fp8 fusion part ``(weight, scalar, act_scale)``; once all parts arrive emit
     the concatenated ``(.weight fp8, .weight_scale per-row fp32)`` plus the shared
     ``.input_scale``. ``[]`` while incomplete, ``None`` if ``base`` is not an fp8 fusion part.
@@ -430,7 +431,17 @@ def _pt_fp8_fuse(base: str, weight: torch.Tensor, scalar: torch.Tensor,
     The fused parts all read the *same* activation, so modelopt calibrates one activation
     range for all of them and their ``input_scale`` values come out bit-identical (verified on
     Qwen3.8-27B-NVFP4: q/k/v all 0.2053571492, GDN qkv/z both 0.1121651828). Taking the max is
-    therefore exact here, and stays correct if a future checkpoint lets them drift."""
+    therefore exact here, and stays correct if a future checkpoint lets them drift.
+
+    Under TP>1 (``tp_info.size > 1``) each sub-part is sharded along the output dim BEFORE
+    concatenation, so the emitted fused weight is already TP-local:
+      * ``qkv_proj``: parts q|k|v; ``local_part_sizes`` gives the per-part local row count
+        (k/v may be replicated under GQA when ``num_kv_heads < tp_size``; a ``None`` entry
+        means a plain /tp split);
+      * ``in_proj_qkvz``: the qkv part is expanded into (key_dim, key_dim, value_dim) and
+        every sub-part (plus z) takes a plain /tp split.
+    Each sub-part carries its own scalar, so the per-row scale is re-broadcast at the local
+    size -- no slicing of the scale is needed."""
     for fused_suffix, parts in _PT_FP8_FUSE.items():
         for idx, part in enumerate(parts):
             if base.endswith(part):
@@ -440,8 +451,33 @@ def _pt_fp8_fuse(base: str, weight: torch.Tensor, scalar: torch.Tensor,
                 if len(slots) < len(parts):
                     return []
                 del buf[key]
-                ws = [slots[i][0] for i in range(len(parts))]
-                ss = [_per_row_scale(slots[i][1], slots[i][0].shape[0]) for i in range(len(parts))]
+                rank = tp_info.rank if tp_info is not None else 0
+                world = tp_info.size if tp_info is not None else 1
+                # (sub-part weight rows, scalar, local row count) in output order
+                if key.endswith(".qkv_proj"):
+                    subs = []
+                    for i in range(len(parts)):
+                        w = slots[i][0]
+                        local = (local_part_sizes[i] if local_part_sizes is not None
+                                 else None)
+                        subs.append((w, slots[i][1],
+                                     local if local is not None
+                                     else div_even(w.shape[0], world)))
+                else:  # in_proj_qkvz: expand qkv into (key_dim, key_dim, value_dim)
+                    qkv_w, qkv_s = slots[0][0], slots[0][1]
+                    z_w, z_s = slots[1][0], slots[1][1]
+                    value_dim = z_w.shape[0]
+                    key_dim = (qkv_w.shape[0] - value_dim) // 2
+                    subs = [
+                        (qkv_w[:key_dim], qkv_s, div_even(key_dim, world)),
+                        (qkv_w[key_dim:2 * key_dim], qkv_s, div_even(key_dim, world)),
+                        (qkv_w[2 * key_dim:], qkv_s, div_even(value_dim, world)),
+                        (z_w, z_s, div_even(value_dim, world)),
+                    ]
+                ws = [_shard_tp_parts(w, (w.shape[0],), rank=rank, world_size=world,
+                                      local_part_sizes=(local,))
+                      for w, _, local in subs]
+                ss = [_per_row_scale(s, local) for _, s, local in subs]
                 emit = [
                     (key + ".weight", torch.cat(ws, dim=0)),
                     (key + ".weight_scale", torch.cat(ss, dim=0).contiguous()),
@@ -544,12 +580,19 @@ def _iter_weights_attn_fp8(
     (fp8 block) + ``.weight_global`` (fp16 per-row) for the W4A16 kernels -- when
     ``dense_nvfp4`` else dequantized to bf16. Routed NVFP4 experts are excluded (served by
     the offload cache). Gemma (1+w) norms get +1."""
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen3_5_moe weight loading currently supports TP=1 only")
     if not include_non_moe:
         return  # experts-only call: NVFP4 experts are loaded by the offload bank provider
 
     tp_info = get_tp_info()
+    config = parse_config(cached_load_hf_config(model_path))
+    # qkv_proj local part sizes (TP>1): q takes a plain /tp split; k/v take the GQA
+    # KV-head-replicated local size (num_kv_heads < tp_size -> replicated heads).
+    qkv_local: tuple | None = None
+    if tp_info.size > 1:
+        local_kv = div_even(config.num_kv_heads, tp_info.size, allow_replicate=True) \
+            * config.head_dim
+        qkv_local = (None, local_kv, local_kv)
+    gdn = config.linear_attention_group()
     fp8_buf: dict[str, dict[int, tuple]] = {}
     bf16_buf: dict[str, dict[int, torch.Tensor]] = {}
     shared_buf: dict[str, dict[str, torch.Tensor]] = {}
@@ -587,12 +630,16 @@ def _iter_weights_attn_fp8(
                         # W8A16. Absent -> the layer stays on the W8A16 kernel.
                         act = (f.get_tensor(raw_base + ".input_scale")
                                if raw_base + ".input_scale" in keyset else None)
-                        emit = _pt_fp8_fuse(base, w, sc, act, fp8_buf)
+                        emit = _pt_fp8_fuse(base, w, sc, act, fp8_buf,
+                                             tp_info, qkv_local)
                         if emit is not None:
                             yield from emit
                             continue
-                        # standalone fp8 (self_attn.o_proj, linear_attn.out_proj)
-                        yield base + ".weight", w
+                        # standalone fp8 (self_attn.o_proj, linear_attn.out_proj):
+                        # row-parallel -- shard the input dim; the per-row scale and the
+                        # per-tensor input_scale cover the full (unsharded) output dim.
+                        yield base + ".weight", _shard_tp(
+                            w, rank=tp_info.rank, world_size=tp_info.size, dim=1)
                         yield base + ".weight_scale", _per_row_scale(sc, w.shape[0]).contiguous()
                         if act is not None:
                             yield base + ".input_scale", act.reshape(()).to(torch.float32)
@@ -609,7 +656,14 @@ def _iter_weights_attn_fp8(
                     tensor = _load_maybe_quantized(f, raw_name, keyset)
                     emit = _ct_bf16_fuse(base, tensor, bf16_buf, _PT_BF16_FUSE)
                     if emit is not None:
-                        yield from emit
+                        for ename, etensor in emit:
+                            # in_proj_ba: column-parallel -- shard b|a per part (heads).
+                            if ename.endswith(".in_proj_ba.weight") and gdn is not None:
+                                n_v = gdn.num_value_heads
+                                etensor = _shard_tp_parts(
+                                    etensor, (n_v, n_v),
+                                    rank=tp_info.rank, world_size=tp_info.size)
+                            yield ename, etensor
                         continue
                 else:
                     tensor = f.get_tensor(raw_name)
@@ -627,6 +681,21 @@ def _iter_weights_attn_fp8(
 
                 if _is_gemma_norm(name):
                     tensor = tensor + 1.0  # (1 + weight) baked into the stored norm weight
+
+                if tp_info.size > 1:
+                    # TP sharding of the non-fused dense weights. NVFP4 dense
+                    # (shared_expert, lm_head), norms, router and shared_expert_gate stay
+                    # full: the model holds them replicated at every rank.
+                    if name.endswith("embed_tokens.weight") \
+                            or name.endswith(("A_log", "dt_bias")):
+                        tensor = _shard_tp(tensor, rank=tp_info.rank,
+                                           world_size=tp_info.size, dim=0)
+                    elif name.endswith("conv1d.weight") and gdn is not None:
+                        key_dim = gdn.num_key_heads * gdn.key_head_dim
+                        value_dim = gdn.num_value_heads * gdn.value_head_dim
+                        tensor = _shard_tp_parts(
+                            tensor, (key_dim, key_dim, value_dim),
+                            rank=tp_info.rank, world_size=tp_info.size)
 
                 yield name, tensor
 
@@ -779,8 +848,8 @@ def iter_weights_parallel(
     )
     from freetoken.models.weight import iter_expert_tensors_parallel
 
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen3_5_moe weight loading currently supports TP=1 only")
+    # TP>1: every rank builds its FULL expert bank (the offload cache is not TP-aware,
+    # upstream #62) -- the parallel reader yields the complete experts to each rank.
 
     def _is_expert(raw_name: str) -> bool:
         name = _rename(raw_name)
@@ -837,10 +906,16 @@ def _split_kind(name: str) -> tuple[str, str]:
     return name, ""
 
 
-def _fp8_fuse(base: str, suf: str, tensor: torch.Tensor, buf: dict) -> tuple[str, torch.Tensor] | tuple[()] | None:
+def _fp8_fuse(base: str, suf: str, tensor: torch.Tensor, buf: dict,
+              tp_info=None, qkv_local: tuple | None = None, gdn=None):
     """Buffer a fusion part keyed by (fused_full_name, kind); return the concatenated
     ``(name, tensor)`` once all parts for that kind arrive, ``()`` while incomplete,
-    ``None`` if ``base`` is not a fusion part."""
+    ``None`` if ``base`` is not a fusion part.
+
+    Under TP>1 the qkv / in_proj_qkvz / in_proj_ba groups are sharded per part before
+    concatenation (GQA KV-head replication for qkv k/v; the GDN qkv part expands into
+    (key_dim, key_dim, value_dim) sub-parts); the gate_up groups stay full -- the model
+    holds the shared/dense experts replicated at every rank."""
     for fused_suffix, parts in _FP8_FUSIONS.items():
         for idx, part in enumerate(parts):
             if base.endswith(part):
@@ -850,9 +925,48 @@ def _fp8_fuse(base: str, suf: str, tensor: torch.Tensor, buf: dict) -> tuple[str
                 slots[idx] = tensor
                 if len(slots) == len(parts):
                     del buf[key]
-                    return fused_base + suf, torch.cat([slots[i] for i in range(len(parts))], dim=0)
+                    sharded = [
+                        _fp8_shard_part(fused_suffix, i, slots[i], suf,
+                                        tp_info, qkv_local, gdn)
+                        for i in range(len(parts))
+                    ]
+                    return fused_base + suf, torch.cat(sharded, dim=0)
                 return ()
     return None
+
+
+def _fp8_shard_part(fused_suffix: str, idx: int, tensor: torch.Tensor, suf: str,
+                    tp_info, qkv_local: tuple | None, gdn) -> torch.Tensor:
+    """TP-local rows for one block-fp8 fusion part. ``suf`` distinguishes the fp8 weight
+    (rows = output rows) from the bf16 scale (rows = output rows // 128)."""
+    if tp_info is None or tp_info.size == 1:
+        return tensor
+    world, rank = tp_info.size, tp_info.rank
+    s = 128 if suf == ".weight_scale_inv" else 1
+    full = tensor.shape[0] * s  # full output rows for this part
+    if fused_suffix == ".self_attn.qkv_proj":
+        local = div_even(full, world) if idx == 0 else qkv_local[idx]
+        return _shard_tp_parts(tensor, (tensor.shape[0],), rank=rank, world_size=world,
+                               local_part_sizes=(local // s,))
+    if fused_suffix == ".linear_attn.in_proj_qkvz":
+        if idx == 0:  # expand qkv -> (key_dim, key_dim, value_dim)
+            value_dim = gdn.num_value_heads * gdn.value_head_dim
+            key_dim = (full - value_dim) // 2
+            subs = (tensor[:key_dim // s], tensor[key_dim // s:2 * key_dim // s],
+                    tensor[2 * key_dim // s:])
+            locals_ = (div_even(key_dim, world) // s, div_even(key_dim, world) // s,
+                       div_even(value_dim, world) // s)
+            return torch.cat([
+                _shard_tp_parts(t, (t.shape[0],), rank=rank, world_size=world,
+                                local_part_sizes=(loc,))
+                for t, loc in zip(subs, locals_)
+            ], dim=0)
+        return _shard_tp_parts(tensor, (tensor.shape[0],), rank=rank, world_size=world,
+                               local_part_sizes=(div_even(full, world) // s,))
+    if fused_suffix == ".linear_attn.in_proj_ba":
+        return _shard_tp_parts(tensor, (tensor.shape[0],), rank=rank, world_size=world,
+                               local_part_sizes=(div_even(full, world) // s,))
+    return tensor  # gate_up groups: replicated
 
 
 def _iter_weights_fp8(
@@ -868,12 +982,18 @@ def _iter_weights_fp8(
     Routed experts: skipped under offload (loaded by setup_offload_expert_banks). Under the
     resident (non-offload) path ``include_moe_experts`` is True -> per-layer stacked fp8
     experts for the Fp8ResidentMoE buffers are yielded too."""
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen3_5_moe fp8 weight loading supports TP=1 only")
     if include_non_moe:
+        tp_info = get_tp_info()
+        config = parse_config(cached_load_hf_config(model_path))
+        gdn = config.linear_attention_group()
+        qkv_local = None
+        if tp_info.size > 1:
+            local_kv = div_even(config.num_kv_heads, tp_info.size, allow_replicate=True) \
+                * config.head_dim
+            qkv_local = (None, local_kv, local_kv)
         fuse_buf: dict = {}
         for file in tqdm(iter_weight_files(model_path), desc="Loading fp8 weights",
-                         disable=not get_tp_info().is_primary()):
+                         disable=not tp_info.is_primary()):
             with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
                 for raw_name in f.keys():
                     name = _rename(raw_name)
@@ -881,13 +1001,34 @@ def _iter_weights_fp8(
                         continue  # routed experts handled below / by the offload cache
                     tensor = f.get_tensor(raw_name)
                     base, suf = _split_kind(name)
-                    fused = _fp8_fuse(base, suf, tensor, fuse_buf)
+                    fused = _fp8_fuse(base, suf, tensor, fuse_buf,
+                                      tp_info, qkv_local, gdn)
                     if fused is not None:
                         if fused != ():
                             yield fused
                         continue
                     if _is_gemma_norm(name):
                         tensor = tensor + 1.0  # (1 + weight) baked into the stored norm weight
+                    if tp_info.size > 1:
+                        # Row-parallel o_proj / out_proj: shard the input dim (weight rows
+                        # and scale blocks keep the full, unsharded output dim).
+                        if name.endswith((".o_proj.weight", ".out_proj.weight")):
+                            tensor = _shard_tp(tensor, rank=tp_info.rank,
+                                               world_size=tp_info.size, dim=1)
+                        elif name.endswith((".o_proj.weight_scale_inv",
+                                            ".out_proj.weight_scale_inv")):
+                            tensor = _shard_tp(tensor, rank=tp_info.rank,
+                                               world_size=tp_info.size, dim=1)
+                        elif name.endswith("embed_tokens.weight") \
+                                or name.endswith(("A_log", "dt_bias")):
+                            tensor = _shard_tp(tensor, rank=tp_info.rank,
+                                               world_size=tp_info.size, dim=0)
+                        elif name.endswith("conv1d.weight") and gdn is not None:
+                            key_dim = gdn.num_key_heads * gdn.key_head_dim
+                            value_dim = gdn.num_value_heads * gdn.value_head_dim
+                            tensor = _shard_tp_parts(
+                                tensor, (key_dim, key_dim, value_dim),
+                                rank=tp_info.rank, world_size=tp_info.size)
                     yield name, tensor
         assert not fuse_buf, f"Incomplete fp8 fusions: {sorted(k for k, _ in fuse_buf)}"
 
@@ -962,8 +1103,8 @@ def setup_offload_expert_banks(
         return _PROVIDERS[eq](model_path, model_config, device, dtype, dummy,
                               parallel=parallel, workers=workers, chunk=chunk,
                               decode_target=decode_target, layer_sink=layer_sink)
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
+    # TP>1: every rank builds its FULL bank (the offload cache is not TP-aware, upstream
+    # #62) -- note this doubles the host-RAM footprint at TP=2.
     from freetoken.moe.expert_banks import ExpertBanks
 
     mode = os.environ.get("FREETOKEN_FP8_EXPERTS", "fp8").strip().lower()
