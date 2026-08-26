@@ -340,8 +340,9 @@ def iter_weights(
                         shared_buf=nvfp4_shared_buf,
                     )
                     if emit is not _NOT_DENSE_NVFP4:
-                        for ename, etensor in emit:
-                            yield ename, _maybe_shard(ename, etensor)
+                        # NVFP4-native layers (shared_expert / dense MLP / lm_head) are held
+                        # replicated at every rank -- never shard them (or their scales).
+                        yield from emit
                         continue
 
                 tensor = _load_maybe_quantized(f, raw_name, keyset)
@@ -685,8 +686,10 @@ def _iter_weights_attn_fp8(
                 if tp_info.size > 1:
                     # TP sharding of the non-fused dense weights. NVFP4 dense
                     # (shared_expert, lm_head), norms, router and shared_expert_gate stay
-                    # full: the model holds them replicated at every rank.
-                    if name.endswith("embed_tokens.weight") \
+                    # full: the model holds them replicated at every rank. (An NVFP4
+                    # lm_head never reaches here -- it is emitted native above; a bf16
+                    # lm_head is vocab-parallel like embed_tokens.)
+                    if name.endswith(("embed_tokens.weight", "lm_head.weight")) \
                             or name.endswith(("A_log", "dt_bias")):
                         tensor = _shard_tp(tensor, rank=tp_info.rank,
                                            world_size=tp_info.size, dim=0)
