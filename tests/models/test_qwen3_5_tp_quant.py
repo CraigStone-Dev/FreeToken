@@ -270,6 +270,51 @@ def test_fp8_shard_standalone_vocab_row_conv_tp2():
         _fp8_shard_standalone("lm_head.weight", w, DistributedInfo(0, 1), None), w)
 
 
+def test_fp8_iter_weights_tp2_sharding():
+    """Full ``_iter_weights_fp8`` run at TP=2 over a tiny synthetic block-FP8 checkpoint.
+
+    Regression: lm_head was yielded full-width (vocab, hidden) against the vocab-sharded
+    ParallelLMHead -> load_state_dict shape assert at TP=2 (reported on PR #104)."""
+    import tempfile
+
+    from safetensors import safe_open
+
+    from tests.models.tiny_fp8_ckpt import make_tiny_fp8_ckpt
+    from freetoken.models.qwen3_5_moe.weight import _iter_weights_fp8
+
+    V = 2048
+    with tempfile.TemporaryDirectory() as d:
+        ckpt = make_tiny_fp8_ckpt(d, vocab=V, experts=8)
+        got = {}
+        for rank in (0, 1):
+            _set_tp(rank, 2)
+            got[rank] = dict(_iter_weights_fp8(
+                ckpt, torch.device("cpu"), include_non_moe=True, include_moe_experts=False))
+        with safe_open(f"{ckpt}/model.safetensors", framework="pt") as f:
+            full_lm_head = f.get_tensor("lm_head.weight")
+    for rank, half in ((0, 0), (1, 1)):
+        w = got[rank]
+        # Vocab-parallel: lm_head / embed_tokens shard rows (the regression).
+        assert w["lm_head.weight"].shape == (V // 2, 2048)
+        assert w["model.embed_tokens.weight"].shape == (V // 2, 2048)
+        torch.testing.assert_close(
+            w["lm_head.weight"], full_lm_head[half * (V // 2):(half + 1) * (V // 2)])
+        # Row-parallel o_proj / out_proj: input dim sharded (weight + scale).
+        assert w["model.layers.3.self_attn.o_proj.weight"].shape == (2048, 2048)
+        assert w["model.layers.3.self_attn.o_proj.weight_scale_inv"].shape == (16, 16)
+        assert w["model.layers.0.linear_attn.out_proj.weight"].shape == (2048, 2048)
+        # Column-merged qkv / in_proj_qkvz: per-part local rows (GQA KV-head halving).
+        assert w["model.layers.3.self_attn.qkv_proj.weight"].shape == (4096 + 256 + 256, 2048)
+        assert w["model.layers.0.linear_attn.in_proj_qkvz.weight"].shape == (4096 + 2048, 2048)
+        # GDN per-head scalars / conv1d (k, k, v) sub-parts.
+        assert w["model.layers.0.linear_attn.A_log"].shape == (16,)
+        assert w["model.layers.0.linear_attn.conv1d.weight"].shape == (1024 + 1024 + 2048, 1, 4)
+        # Replicated: router, shared expert.
+        assert w["model.layers.0.mlp.gate.weight"].shape == (8, 2048)
+        assert w["model.layers.0.mlp.shared_expert.gate_up_proj.weight"].shape == (1024, 2048)
+    _set_tp(0, 1)
+
+
 # ======================================================================================
 # Row-parallel / column-merged quantized linears (pure-torch reference path)
 # ======================================================================================
