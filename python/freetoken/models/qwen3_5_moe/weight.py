@@ -969,6 +969,29 @@ def _fp8_shard_part(fused_suffix: str, idx: int, tensor: torch.Tensor, suf: str,
     return tensor  # gate_up groups: replicated
 
 
+def _fp8_shard_standalone(name: str, tensor: torch.Tensor, tp_info, gdn) -> torch.Tensor:
+    """TP-local view of a non-fused block-fp8 weight (or its scale).
+
+    Row-parallel o_proj / out_proj shard the input dim (weight rows and scale blocks keep
+    the full, unsharded output dim); embed_tokens / lm_head are vocab-parallel (dim 0);
+    A_log / dt_bias are per-head scalars (dim 0); conv1d shards its (k, k, v) sub-parts.
+    Everything else (norms, router, shared_expert_gate) stays replicated."""
+    if tp_info is None or tp_info.size == 1:
+        return tensor
+    rank, world = tp_info.rank, tp_info.size
+    if name.endswith((".o_proj.weight", ".out_proj.weight",
+                      ".o_proj.weight_scale_inv", ".out_proj.weight_scale_inv")):
+        return _shard_tp(tensor, rank=rank, world_size=world, dim=1)
+    if name.endswith(("embed_tokens.weight", "lm_head.weight", "A_log", "dt_bias")):
+        return _shard_tp(tensor, rank=rank, world_size=world, dim=0)
+    if name.endswith("conv1d.weight") and gdn is not None:
+        key_dim = gdn.num_key_heads * gdn.key_head_dim
+        value_dim = gdn.num_value_heads * gdn.value_head_dim
+        return _shard_tp_parts(tensor, (key_dim, key_dim, value_dim),
+                               rank=rank, world_size=world)
+    return tensor
+
+
 def _iter_weights_fp8(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool = False
 ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -1009,26 +1032,7 @@ def _iter_weights_fp8(
                         continue
                     if _is_gemma_norm(name):
                         tensor = tensor + 1.0  # (1 + weight) baked into the stored norm weight
-                    if tp_info.size > 1:
-                        # Row-parallel o_proj / out_proj: shard the input dim (weight rows
-                        # and scale blocks keep the full, unsharded output dim).
-                        if name.endswith((".o_proj.weight", ".out_proj.weight")):
-                            tensor = _shard_tp(tensor, rank=tp_info.rank,
-                                               world_size=tp_info.size, dim=1)
-                        elif name.endswith((".o_proj.weight_scale_inv",
-                                            ".out_proj.weight_scale_inv")):
-                            tensor = _shard_tp(tensor, rank=tp_info.rank,
-                                               world_size=tp_info.size, dim=1)
-                        elif name.endswith("embed_tokens.weight") \
-                                or name.endswith(("A_log", "dt_bias")):
-                            tensor = _shard_tp(tensor, rank=tp_info.rank,
-                                               world_size=tp_info.size, dim=0)
-                        elif name.endswith("conv1d.weight") and gdn is not None:
-                            key_dim = gdn.num_key_heads * gdn.key_head_dim
-                            value_dim = gdn.num_value_heads * gdn.value_head_dim
-                            tensor = _shard_tp_parts(
-                                tensor, (key_dim, key_dim, value_dim),
-                                rank=tp_info.rank, world_size=tp_info.size)
+                    tensor = _fp8_shard_standalone(name, tensor, tp_info, gdn)
                     yield name, tensor
         assert not fuse_buf, f"Incomplete fp8 fusions: {sorted(k for k, _ in fuse_buf)}"
 

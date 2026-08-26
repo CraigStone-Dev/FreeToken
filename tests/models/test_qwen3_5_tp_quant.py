@@ -225,6 +225,51 @@ def test_fp8_shard_part_qkvz_expands():
         gu)
 
 
+def test_fp8_shard_standalone_vocab_row_conv_tp2():
+    from freetoken.models.qwen3_5_moe.weight import _fp8_shard_standalone
+
+    class Gdn:
+        num_key_heads, key_head_dim = 16, 128
+        num_value_heads, value_head_dim = 32, 128
+
+    # Vocab-parallel: lm_head / embed_tokens shard rows (lm_head was previously yielded
+    # full-width against the vocab-sharded ParallelLMHead -> load-time shape assert).
+    w = torch.arange(8 * 4, dtype=torch.bfloat16).reshape(8, 4)
+    for name in ("lm_head.weight", "model.embed_tokens.weight"):
+        torch.testing.assert_close(
+            _fp8_shard_standalone(name, w, DistributedInfo(0, 2), None), w[:4])
+        torch.testing.assert_close(
+            _fp8_shard_standalone(name, w, DistributedInfo(1, 2), None), w[4:])
+    # Row-parallel: o_proj / out_proj shard the input (column) dim, weight and scale.
+    o = torch.randn(16, 256)
+    torch.testing.assert_close(
+        _fp8_shard_standalone("model.layers.0.self_attn.o_proj.weight", o,
+                              DistributedInfo(1, 2), None), o[:, 128:])
+    s = torch.randn(16, 2)
+    torch.testing.assert_close(
+        _fp8_shard_standalone("model.layers.0.self_attn.o_proj.weight_scale_inv", s,
+                              DistributedInfo(1, 2), None), s[:, 1:])
+    # Per-head GDN scalars shard dim 0; conv1d shards its (k, k, v) sub-parts.
+    a = torch.randn(16)
+    torch.testing.assert_close(
+        _fp8_shard_standalone("model.layers.0.linear_attn.A_log", a,
+                              DistributedInfo(1, 2), None), a[8:])
+    conv = torch.randn(2 * 2048 + 4096, 1)
+    got = _fp8_shard_standalone("model.layers.0.linear_attn.conv1d.weight", conv,
+                                DistributedInfo(0, 2), Gdn())
+    assert got.shape == (1024 + 1024 + 2048, 1)
+    torch.testing.assert_close(got[:1024], conv[:1024])
+    torch.testing.assert_close(got[1024:2048], conv[2048:3072])
+    torch.testing.assert_close(got[2048:], conv[4096:6144])
+    # Replicated names and TP=1 pass through unchanged.
+    norm = torch.randn(4)
+    torch.testing.assert_close(
+        _fp8_shard_standalone("model.layers.0.self_attn.o_norm.weight", norm,
+                              DistributedInfo(0, 2), None), norm)
+    torch.testing.assert_close(
+        _fp8_shard_standalone("lm_head.weight", w, DistributedInfo(0, 1), None), w)
+
+
 # ======================================================================================
 # Row-parallel / column-merged quantized linears (pure-torch reference path)
 # ======================================================================================
