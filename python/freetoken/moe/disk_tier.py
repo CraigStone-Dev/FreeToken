@@ -123,7 +123,7 @@ class Nvfp4DiskIndex:
         shard_idx = {s: i for i, s in enumerate(shards)}
 
         E = config.num_experts
-        seg_size = struct.calcsize("<iiq")  # (shard_idx, offset, nbytes)
+        seg_size = struct.calcsize("<iqq")  # (shard_idx, offset, nbytes)
         self.entries: list[list[bytes]] = []  # [bank][layer] -> packed segments per expert
         for bank_idx in range(len(_NVP4_BANK_SEGS)):
             per_layer = []
@@ -140,7 +140,7 @@ class Nvfp4DiskIndex:
                             )
                         name, shard = entry
                         start, end = offsets[shard][name]
-                        rows += struct.pack("<iiq", shard_idx[shard], start, end - start)
+                        rows += struct.pack("<iqq", shard_idx[shard], start, end - start)
                 per_layer.append(bytes(rows))
             self.entries.append(per_layer)
         self._seg_size = seg_size
@@ -150,7 +150,7 @@ class Nvfp4DiskIndex:
         base = expert * self._seg_size * len(_NVP4_BANK_SEGS[bank_idx])
         raw = self.entries[bank_idx][layer][base:base + self._seg_size * len(_NVP4_BANK_SEGS[bank_idx])]
         return [
-            struct.unpack_from("<iiq", raw, i * self._seg_size)
+            struct.unpack_from("<iqq", raw, i * self._seg_size)
             for i in range(len(_NVP4_BANK_SEGS[bank_idx]))
         ]
 
