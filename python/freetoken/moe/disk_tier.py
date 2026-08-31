@@ -226,7 +226,24 @@ class DiskTier:
                 else:
                     a0, slen = off, nbytes
                 mv = (ctypes.c_char * slen).from_address(staging.addr)
-                os.preadv(fd, [mv], a0)
+                try:
+                    os.preadv(fd, [mv], a0)
+                except OSError:
+                    vma = "?"
+                    try:
+                        for line in open("/proc/self/maps"):
+                            lo, hi = line.split()[0].split("-")
+                            if int(lo, 16) <= staging.addr < int(hi, 16):
+                                vma = line.strip()[:120]
+                                break
+                    except OSError:
+                        pass
+                    raise OSError(
+                        f"disk-tier preadv failed: shard={shard_idx} off={off} a0={a0} "
+                        f"slen={slen} direct={direct} buf={hex(staging.addr)} "
+                        f"staging_size={self._staging_size} thread={threading.current_thread().name} "
+                        f"vma={vma}"
+                    ) from None
                 row_off = off - a0
                 src = staging.tensor[row_off:row_off + nbytes]
                 dst = row[d0:d1]
