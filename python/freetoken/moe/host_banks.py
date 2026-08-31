@@ -170,6 +170,10 @@ class HostBank:
         import ctypes
 
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # argtypes are mandatory: without them ctypes truncates the 64-bit
+        # address to a C int and madvise fails (ENOMEM/EINVAL on bogus addrs).
+        libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        libc.madvise.restype = ctypes.c_int
         MADV_DONTNEED = 4
         rc = libc.madvise(self.addr + offset, nbytes, MADV_DONTNEED)
         if rc != 0:
