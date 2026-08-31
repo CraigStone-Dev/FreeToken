@@ -11,6 +11,7 @@ staging pin is stubbed.
 import json
 import re
 import struct
+import threading
 import types
 
 import pytest
@@ -160,9 +161,18 @@ def _fake_cache():
 def _tier(checkpoint, cache, ram_experts=2):
     index = _index(checkpoint)
     tier = DiskTier(index, cache, ram_experts=ram_experts, workers=2)
-    # Stub the pinned staging (HostBank.pin needs CUDA); the mmap buffer itself is fine.
-    staging = HostBank((tier._staging_size,), torch.uint8)
-    tier._staging_buf = lambda: staging
+    # Stub the pinned staging (HostBank.pin needs CUDA) with the same per-thread
+    # buffer semantics as production (threading.local).
+    local = threading.local()
+
+    def _staging_buf():
+        buf = getattr(local, "buf", None)
+        if buf is None:
+            buf = HostBank((tier._staging_size,), torch.uint8)
+            local.buf = buf
+        return buf
+
+    tier._staging_buf = _staging_buf
     return tier
 
 
