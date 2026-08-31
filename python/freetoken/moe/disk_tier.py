@@ -224,7 +224,7 @@ class DiskTier:
                 row_off = off - a0
                 src = staging.tensor[row_off:row_off + nbytes]
                 dst = row[d0:d1]
-                dst.copy_(src.view(dst.shape), non_blocking=True)
+                dst.copy_(src.view(dst.dtype).view(dst.shape), non_blocking=True)
         self._fetches += 1
         self._fetch_bytes += sum(self._row_bytes)
 
