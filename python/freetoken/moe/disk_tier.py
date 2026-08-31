@@ -174,7 +174,7 @@ class DiskTier:
             else:
                 self._dst_slices.append([(0, row.shape[0])])
         max_row = max(self._row_bytes)
-        self._staging_size = ((max_row + 2 * _ALIGN) // _ALIGN) * _ALIGN
+        self._staging_size = ((max_row + _ALIGN - 1) // _ALIGN + 2) * _ALIGN
         self._staging = threading.local()
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="disk-tier")
         self._fd_lock = threading.Lock()
