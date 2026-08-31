@@ -518,6 +518,22 @@ class Engine:
             decode_target = "cpu"
         else:
             decode_target = "gpu"
+        disk_tier = None
+        if config.moe_disk_tier == "on":
+            from freetoken.moe.disk_tier import DiskTierSpec
+
+            E = config.model_config.num_experts
+            if not 0 < config.expert_ram_experts < E:
+                raise ValueError(
+                    f"--expert-ram-experts must be in (0, {E}) with --moe-disk-tier on")
+            if decode_target != "gpu":
+                raise ValueError(
+                    "--moe-disk-tier v0 requires the gpu decode path (--moe-backend offload)")
+            if config.moe_prefill_overlap:
+                raise ValueError("--moe-disk-tier v0 requires --disable-moe-prefill-overlap")
+            if config.cuda_graph_max_bs is not None:
+                raise ValueError("--moe-disk-tier v0 requires cuda graphs disabled")
+            disk_tier = DiskTierSpec(ram_experts=config.expert_ram_experts)
         if cache_factory is None:
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
@@ -533,6 +549,7 @@ class Engine:
                 dummy=config.use_dummy_weight,
                 parallel=expert_parallel,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
+                disk_tier=disk_tier,
             )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -567,6 +584,14 @@ class Engine:
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
             )
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+            if banks.disk_index is not None:
+                cache.attach_disk_tier(
+                    banks.disk_index, banks.disk_ram_experts,
+                    workers=config.disk_fetch_workers)
+                logger.info_rank0(
+                    f"disk tier: {banks.disk_ram_experts}/{config.model_config.num_experts} "
+                    f"experts/layer pinned in RAM; the rest fetched from "
+                    f"{config.model_path} on slot-cache miss")
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
             cache = cache_factory(config, self.device)

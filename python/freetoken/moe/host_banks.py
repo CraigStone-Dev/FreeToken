@@ -93,6 +93,39 @@ class HostBank:
             ) from exc
         self._pinned = True
 
+    def pin_prefix(self, nrows: int) -> None:
+        """Pin only the first ``nrows`` rows (disk tier: the rest stays disk-resident).
+
+        The unpinned tail keeps its filled pages until :meth:`release_range` drops
+        them; nothing may DMA from the tail (the disk tier's miss filter guarantees
+        the GPU never copies those rows)."""
+        if self._pinned:
+            return
+        from freetoken.kernel.pinned import host_register
+
+        row_bytes = self.nbytes // self.tensor.shape[0]
+        nbytes = nrows * row_bytes
+        try:
+            host_register(self.addr, nbytes)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"cudaHostRegister failed for {nbytes / 2**30:.1f} GiB prefix"
+            ) from exc
+        self._pinned = True
+
+    def release_range(self, offset: int, nbytes: int) -> None:
+        """MADV_DONTNEED a byte range of the backing mmap (frees the resident pages).
+
+        For the disk tier's unpinned bank tails: the address space stays valid but
+        the pages are gone, so any read of the range silently refaults as zeros --
+        callers must guarantee nothing reads it (see :meth:`pin_prefix`)."""
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        MADV_DONTNEED = 4
+        rc = libc.madvise(self.addr + offset, nbytes, MADV_DONTNEED)
+        if rc != 0:
+            raise OSError(ctypes.get_errno(), "madvise(MADV_DONTNEED) failed")
     def release(self) -> None:
         """Drop the buffer's resident pages (address space stays valid; contents
         become undefined). Only for buffers that are done being read -- the
@@ -147,7 +180,8 @@ class PinPipeline:
     still joins the thread but lets the original exception propagate.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, prefix_rows: int | None = None) -> None:
+        self._prefix_rows = prefix_rows
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._exc: BaseException | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -161,7 +195,10 @@ class PinPipeline:
             if self._exc is not None:
                 continue  # drain without pinning after a failure
             try:
-                bank.pin()
+                if self._prefix_rows is not None:
+                    bank.pin_prefix(self._prefix_rows)
+                else:
+                    bank.pin()
             except BaseException as exc:  # surfaced by wait()/__exit__
                 self._exc = exc
 

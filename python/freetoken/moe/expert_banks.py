@@ -47,6 +47,11 @@ class ExpertBanks:
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
     streamed: bool = False
+    # Disk tier (None when off): a moe.disk_tier.Nvfp4DiskIndex over the original
+    # checkpoint plus how many experts per layer are RAM-resident (the rest are
+    # disk-resident and fetched on slot-cache miss).
+    disk_index: object | None = field(default=None)
+    disk_ram_experts: int = 0
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
@@ -158,7 +163,7 @@ class _Nvfp4RepackSink:
         return sources, gate_up_alpha, down_alpha
 
 
-def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, disk_tier=None) -> ExpertBanks:
     from freetoken.models.weight import load_nvfp4_moe_expert_sources
     from freetoken.moe.nvfp4_backends import (
         b12x_repack_layer,
@@ -181,6 +186,10 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
                                        getattr(model_config, "nvfp4_backend", "auto"),
                                        activation=getattr(model_config, "hidden_act", "silu"))
         native = backend == "triton"
+    if disk_tier is not None and (not native or dummy):
+        raise NotImplementedError(
+            "disk tier requires the native NVFP4 layout (triton backend, decode_target=gpu, "
+            "not dummy)")
 
     repack_sink = None
     if not native and not dummy and layer_sink is not None:
@@ -195,7 +204,7 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     # parallel only parallelizes the source read; the backend repack below is reused unchanged.
     sources = load_nvfp4_moe_expert_sources(
         model_path, model_config, dummy=dummy, parallel=parallel, workers=workers, chunk=chunk,
-        layer_sink=sink,
+        layer_sink=sink, disk_tier=disk_tier,
     )
     # CPU-compute decode (cpu/hybrid) reads the native ModelOpt rows directly (its
     # dequant-in-GEMV kernel), so keep the native "nvfp4" layout and skip the GPU-tiled
@@ -302,13 +311,14 @@ _PROVIDERS = {
 }
 
 
-def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None, disk_tier=None) -> ExpertBanks:
     """Dispatch to the model's setup-override or the per-quant provider. ``parallel=True``
     is the parallel read; a provider that hasn't implemented it raises NotImplementedError (the
     caller falls back to serial). ``decode_target`` lets the cpu backend force CPU-readable
     (native, non-GPU-tiled) bank layouts. ``layer_sink`` (converter only) is forwarded to
     setups/providers that declare the parameter; the rest ignore it and stay on the
-    materialize-and-write path (``ExpertBanks.streamed`` reports which happened)."""
+    materialize-and-write path (``ExpertBanks.streamed`` reports which happened).
+    ``disk_tier`` (a ``moe.disk_tier.DiskTierSpec``) is forwarded the same way."""
     setup = _model_setup_override(model_config)
     if setup is not None:
         import inspect
@@ -328,6 +338,8 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
             kw["decode_target"] = decode_target
         if "layer_sink" in params and layer_sink is not None:
             kw["layer_sink"] = layer_sink
+        if "disk_tier" in params and disk_tier is not None:
+            kw["disk_tier"] = disk_tier
         return setup(model_path, model_config, **kw)
 
     expert_quant = model_config.expert_quant
@@ -339,7 +351,7 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
     return _PROVIDERS[expert_quant](
         model_path, model_config, device, dtype, dummy,
         parallel=parallel, workers=workers, chunk=chunk, decode_target=decode_target,
-        layer_sink=layer_sink,
+        layer_sink=layer_sink, disk_tier=disk_tier,
     )
 
 
@@ -383,6 +395,7 @@ def load_expert_banks(
     chunk: int = _PARALLEL_CHUNK,
     decode_target: str = "gpu",
     layer_sink=None,
+    disk_tier=None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -404,6 +417,10 @@ def load_expert_banks(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
+        if disk_tier is not None:
+            raise NotImplementedError(
+                "disk tier v0 reads the original safetensors checkpoint; FTW checkpoints "
+                "are not supported yet (serve from the source path)")
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk
         )
@@ -434,10 +451,10 @@ def load_expert_banks(
     # allocation) falls back to serial.
     try:
         return _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
-                                   decode_target, layer_sink)
+                                   decode_target, layer_sink, disk_tier)
     except NotImplementedError as exc:
         if not parallel:
             raise
         logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
         return _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
-                                   decode_target, layer_sink)
+                                   decode_target, layer_sink, disk_tier)
