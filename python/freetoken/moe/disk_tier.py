@@ -73,11 +73,17 @@ _NVP4_BANK_SEGS = (
 
 
 def _read_safetensors_offsets(path: str) -> dict[str, tuple[int, int]]:
-    """{tensor_name: (start, end)} from a shard's safetensors header."""
+    """{tensor_name: (start, end)} from a shard's safetensors header, as ABSOLUTE
+    file offsets (data_offsets are relative to the data section, i.e. after the
+    8-byte length + header JSON)."""
     with open(path, "rb") as f:
         (hlen,) = struct.unpack("<Q", f.read(8))
         meta = json.loads(f.read(hlen))
-    return {k: tuple(v["data_offsets"]) for k, v in meta.items() if k != "__metadata__"}
+    base = 8 + hlen
+    return {
+        k: (v["data_offsets"][0] + base, v["data_offsets"][1] + base)
+        for k, v in meta.items() if k != "__metadata__"
+    }
 
 
 class Nvfp4DiskIndex:

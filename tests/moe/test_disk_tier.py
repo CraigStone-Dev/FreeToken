@@ -130,7 +130,8 @@ def test_index_segments_match_file_bytes(checkpoint):
                         (hlen,) = struct.unpack("<Q", f.read(8))
                         meta = json.loads(f.read(hlen))
                         tstart, tend = meta[_name(layer, expert, proj, kind)]["data_offsets"]
-                        assert (off, off + nbytes) == (tstart, tend), (
+                        base = 8 + hlen  # data_offsets are data-section-relative
+                        assert (off, off + nbytes) == (tstart + base, tend + base), (
                             bank_idx, layer, expert, proj, kind)
                     with safetensors.safe_open(shard_path, framework="pt", device="cpu") as sf:
                         tensor = sf.get_tensor(_name(layer, expert, proj, kind))
