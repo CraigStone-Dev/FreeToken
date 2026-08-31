@@ -867,10 +867,13 @@ def setup_offload_expert_banks(
             if eq != "nvfp4":
                 raise NotImplementedError(
                     f"disk tier: only nvfp4 experts are supported (got expert_quant={eq!r})")
+            import dataclasses
+
             from freetoken.moe.disk_tier import Nvfp4DiskIndex
 
-            banks.disk_index = Nvfp4DiskIndex(model_path, model_config, _NVFP4_SOURCE_SPEC)
-            banks.disk_ram_experts = disk_tier.ram_experts
+            index = Nvfp4DiskIndex(model_path, model_config, _NVFP4_SOURCE_SPEC)
+            banks = dataclasses.replace(
+                banks, disk_index=index, disk_ram_experts=disk_tier.ram_experts)
         return banks
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
