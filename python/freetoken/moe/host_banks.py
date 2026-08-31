@@ -141,6 +141,39 @@ class HostBank:
             ) from exc
         self._pinned = True
 
+    def pin_prefix(self, nrows: int) -> None:
+        """Pin only the first ``nrows`` rows (disk tier: the rest stays disk-resident).
+
+        The unpinned tail keeps its filled pages until :meth:`release_range` drops
+        them; nothing may DMA from the tail (the disk tier's miss filter guarantees
+        the GPU never copies those rows)."""
+        if self._pinned:
+            return
+        from freetoken.kernel.pinned import host_register
+
+        row_bytes = self.nbytes // self.tensor.shape[0]
+        nbytes = nrows * row_bytes
+        try:
+            host_register(self.addr, nbytes)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"cudaHostRegister failed for {nbytes / 2**30:.1f} GiB prefix"
+            ) from exc
+        self._pinned = True
+
+    def release_range(self, offset: int, nbytes: int) -> None:
+        """MADV_DONTNEED a byte range of the backing mmap (frees the resident pages).
+
+        For the disk tier's unpinned bank tails: the address space stays valid but
+        the pages are gone, so any read of the range silently refaults as zeros --
+        callers must guarantee nothing reads it (see :meth:`pin_prefix`)."""
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        MADV_DONTNEED = 4
+        rc = libc.madvise(self.addr + offset, nbytes, MADV_DONTNEED)
+        if rc != 0:
+            raise OSError(ctypes.get_errno(), "madvise(MADV_DONTNEED) failed")
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
 
@@ -289,7 +322,8 @@ class PinPipeline:
     A clean context-manager exit drains the queue and re-raises the first settle failure.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, prefix_rows: int | None = None) -> None:
+        self._prefix_rows = prefix_rows
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._exc: BaseException | None = None
         # the current device is thread-local: a fresh thread sits on device 0 and cudaHostRegister would build its context there -- carry the creator's (bound) device into the worker
@@ -308,9 +342,16 @@ class PinPipeline:
                 continue  # drain without settling after a failure
             bank, residency, plan, layer_id = item
             try:
-                _settle(bank, residency)
-                if plan is not None and residency == HostResidency.LOCKED.value:
-                    plan.record(layer_id, bank.residency.value)
+                if self._prefix_rows is not None:
+                    # Disk tier: pin only the RAM-resident expert prefix; the
+                    # disk-resident tail is released by the caller. Takes
+                    # precedence over the residency label (H2D needs the
+                    # prefix page-locked regardless).
+                    bank.pin_prefix(self._prefix_rows)
+                else:
+                    _settle(bank, residency)
+                    if plan is not None and residency == HostResidency.LOCKED.value:
+                        plan.record(layer_id, bank.residency.value)
             except BaseException as exc:  # surfaced by wait()/__exit__
                 self._exc = exc
 

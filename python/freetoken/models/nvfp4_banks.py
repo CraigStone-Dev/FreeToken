@@ -86,6 +86,7 @@ def load_nvfp4_expert_source_banks(
     drop_page_cache: DropPageCache,
     primary: bool,
     layer_sink=None,
+    disk_tier=None,
 ) -> dict[str, list[torch.Tensor]]:
     """Build the 6 native NVFP4 source banks by streaming checkpoint shards (serial per-shard read).
 
@@ -150,6 +151,9 @@ def load_nvfp4_expert_source_banks(
         drop_page_cache(path)
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
+    K = disk_tier.ram_experts if disk_tier is not None else None
+    if disk_tier is not None and layer_sink is not None:
+        raise NotImplementedError("disk tier: the converter (layer_sink) path is not supported yet")
     gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
     gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
     gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
@@ -202,8 +206,12 @@ def load_nvfp4_expert_source_banks(
     if layer_sink is not None:
         placed = _load(layer_sink)
     else:
-        with PinPipeline() as pins:
+        with PinPipeline(prefix_rows=K) as pins:
             placed = _load(pins)
+        if K is not None:
+            from freetoken.moe.disk_tier import release_bank_tails
+
+            release_bank_tails(_hb, E, K)
 
     expected = num_layers * E * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
@@ -227,6 +235,7 @@ def load_nvfp4_expert_source_banks_parallel(
     workers: int = 8,
     chunk: int = 8 << 20,
     layer_sink=None,
+    disk_tier=None,
 ) -> dict[str, list[torch.Tensor]]:
     """parallel counterpart of :func:`load_nvfp4_expert_source_banks`, byte-for-byte same
     placement. bulk weight/weight_scale read via chunked multi-threaded O_DIRECT reader
@@ -274,6 +283,9 @@ def load_nvfp4_expert_source_banks_parallel(
         drop_page_cache(path)
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
+    K = disk_tier.ram_experts if disk_tier is not None else None
+    if disk_tier is not None and layer_sink is not None:
+        raise NotImplementedError("disk tier: the converter (layer_sink) path is not supported yet")
     gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
     gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
     gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
@@ -321,8 +333,12 @@ def load_nvfp4_expert_source_banks_parallel(
     if layer_sink is not None:
         placed = _load(layer_sink)
     else:
-        with PinPipeline() as pins:
+        with PinPipeline(prefix_rows=K) as pins:
             placed = _load(pins)
+        if K is not None:
+            from freetoken.moe.disk_tier import release_bank_tails
+
+            release_bank_tails(_hb, E, K)
 
     expected = num_layers * E * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"

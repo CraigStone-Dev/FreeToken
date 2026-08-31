@@ -834,7 +834,7 @@ class _ShardReader:
 def setup_offload_expert_banks(
     model_path: str, model_config, *, device: torch.device, dtype: torch.dtype,
     dummy: bool = False, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20,
-    decode_target: str = "gpu", layer_sink=None,
+    decode_target: str = "gpu", layer_sink=None, disk_tier=None,
 ):
     """Build the routed-expert offload banks. The qwen3_5_moe module always exports this hook,
     so it intercepts *every* qwen3_5_moe offload load -- defer non-block-fp8 checkpoints (plain
@@ -849,14 +849,29 @@ def setup_offload_expert_banks(
     providers for non-block-fp8 checkpoints.
 
     ``decode_target`` is forwarded so the cpu backend gets CPU-readable (native, non-
-    GPU-tiled) bank layouts -- e.g. native ``nvfp4`` rows rather than marlin/b12x."""
+    GPU-tiled) bank layouts -- e.g. native ``nvfp4`` rows rather than marlin/b12x.
+
+    ``disk_tier`` (a ``moe.disk_tier.DiskTierSpec``): pin only the first
+    ``ram_experts`` experts per layer, release the rest, and attach a
+    :class:`~freetoken.moe.disk_tier.Nvfp4DiskIndex` so the offload cache can
+    fetch the disk-resident experts on miss."""
     eq = getattr(model_config, "expert_quant", "none")
     if eq != "fp8_block":
         from freetoken.moe.expert_banks import _PROVIDERS  # nvfp4 -> _nvfp4_banks, none -> _bf16_banks
 
-        return _PROVIDERS[eq](model_path, model_config, device, dtype, dummy,
-                              parallel=parallel, workers=workers, chunk=chunk,
-                              decode_target=decode_target, layer_sink=layer_sink)
+        banks = _PROVIDERS[eq](model_path, model_config, device, dtype, dummy,
+                               parallel=parallel, workers=workers, chunk=chunk,
+                               decode_target=decode_target, layer_sink=layer_sink,
+                               disk_tier=disk_tier)
+        if disk_tier is not None:
+            if eq != "nvfp4":
+                raise NotImplementedError(
+                    f"disk tier: only nvfp4 experts are supported (got expert_quant={eq!r})")
+            from freetoken.moe.disk_tier import Nvfp4DiskIndex
+
+            banks.disk_index = Nvfp4DiskIndex(model_path, model_config, _NVFP4_SOURCE_SPEC)
+            banks.disk_ram_experts = disk_tier.ram_experts
+        return banks
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
     from freetoken.moe.expert_banks import ExpertBanks
@@ -1061,7 +1076,7 @@ def _setup_bf16_dequant_banks(model_path, model_config, device, dummy: bool, *, 
 
 
 def load_nvfp4_expert_sources(
-    model_path: str, config, *, layer_sink=None
+    model_path: str, config, *, layer_sink=None, disk_tier=None
 ) -> dict[str, torch.Tensor]:
     """Build the CPU NVFP4 expert source banks for the offload cache (gate/up fused on the
     output-row axis, down separate; weight_scale_2 carried as the per-row global scale)."""
@@ -1072,11 +1087,13 @@ def load_nvfp4_expert_sources(
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         layer_sink=layer_sink,
+        disk_tier=disk_tier,
     )
 
 
 def load_nvfp4_expert_sources_parallel(
-    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
+    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None,
+    disk_tier=None,
 ):
     """parallel: same NVFP4 source banks via the common chunked multi-threaded reader."""
     from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
@@ -1090,6 +1107,7 @@ def load_nvfp4_expert_sources_parallel(
         workers=workers,
         chunk=chunk,
         layer_sink=layer_sink,
+        disk_tier=disk_tier,
     )
 
 
