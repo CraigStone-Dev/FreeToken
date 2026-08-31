@@ -1120,10 +1120,13 @@ def setup_offload_expert_banks(
             if eq != "nvfp4":
                 raise NotImplementedError(
                     f"disk tier: only nvfp4 experts are supported (got expert_quant={eq!r})")
+            import dataclasses
+
             from freetoken.moe.disk_tier import Nvfp4DiskIndex
 
-            banks.disk_index = Nvfp4DiskIndex(model_path, model_config, _NVFP4_SOURCE_SPEC)
-            banks.disk_ram_experts = disk_tier.ram_experts
+            index = Nvfp4DiskIndex(model_path, model_config, _NVFP4_SOURCE_SPEC)
+            banks = dataclasses.replace(
+                banks, disk_index=index, disk_ram_experts=disk_tier.ram_experts)
         return banks
     # TP>1: every rank builds its FULL bank (the offload cache is not TP-aware, upstream
     # #62) -- note this doubles the host-RAM footprint at TP=2.
