@@ -255,3 +255,28 @@ def test_fetch_pending_all_disk_clears_list(checkpoint):
     for bank_idx, (_host, gpu_cache) in enumerate(cache.banks):
         assert torch.equal(
             gpu_cache[4].contiguous().view(torch.uint8).reshape(-1), expected[bank_idx])
+
+
+def test_release_range_frees_pages():
+    """madvise(MADV_DONTNEED) must actually drop the resident pages (and not fail
+    on the 64-bit address -- the no-argtypes ctypes truncation bug)."""
+    import ctypes as ct
+
+    size = 4 * 1024 * 1024
+    bank = HostBank((size,), torch.uint8)
+    bank.tensor.fill_(7)  # fault every page in
+    libc = ct.CDLL("libc.so.6", use_errno=True)
+    libc.mincore.argtypes = [ct.c_void_p, ct.c_size_t, ct.POINTER(ct.c_ubyte)]
+    libc.mincore.restype = ct.c_int
+
+    def resident_pages(addr, nbytes):
+        vec = (ct.c_ubyte * ((nbytes + 4095) // 4096))()
+        assert libc.mincore(addr, nbytes, vec) == 0
+        return sum(1 for b in vec if b & 1)
+
+    pages = size // 4096
+    assert resident_pages(bank.addr, size) == pages
+    bank.release_range(0, size)
+    assert resident_pages(bank.addr, size) == 0
+    # The mapping stays valid: the refaulted pages read back as zeros.
+    assert bank.tensor[0] == 0
