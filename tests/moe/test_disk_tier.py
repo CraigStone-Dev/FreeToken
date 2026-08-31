@@ -161,6 +161,11 @@ def _fake_cache():
 def _tier(checkpoint, cache, ram_experts=2):
     index = _index(checkpoint)
     tier = DiskTier(index, cache, ram_experts=ram_experts, workers=2)
+    # Staging must hold the largest bank row's O_DIRECT super-block (a size
+    # regression here overflows the buffer -> EFAULT/segfault at fetch time).
+    max_row = max(
+        b[0][0][0].numel() * b[0][0][0].element_size() for b in cache.banks)
+    assert tier._staging_size >= max_row + 2 * 4096, (tier._staging_size, max_row)
     # Stub the pinned staging (HostBank.pin needs CUDA) with the same per-thread
     # buffer semantics as production (threading.local).
     local = threading.local()

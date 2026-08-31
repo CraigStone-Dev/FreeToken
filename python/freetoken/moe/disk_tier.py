@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import ctypes
 import json
-import math
 import os
 import struct
 import threading
@@ -163,8 +162,8 @@ class DiskTier:
         self._ram = ram_experts
         self._banks = list(cache.banks)  # [(per_layer_host, gpu_cache)] in schema order
         self._row_bytes = [
-            math.prod(b[0][0][0].shape[1:]) * b[0][0][0].element_size() for b in self._banks
-        ]
+            b[0][0][0].numel() * b[0][0][0].element_size() for b in self._banks
+        ]  # full expert-row bytes per bank (staging must hold the biggest one)
         # Per-bank destination row slices (gate|up split at the row midpoint).
         self._dst_slices: list[list[tuple[int, int]]] = []
         for bank_idx, (host_layer, _gpu) in enumerate(self._banks):
