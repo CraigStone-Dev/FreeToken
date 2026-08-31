@@ -258,8 +258,9 @@ def test_fetch_pending_all_disk_clears_list(checkpoint):
 
 
 def test_release_range_frees_pages():
-    """madvise(MADV_DONTNEED) must actually drop the resident pages (and not fail
-    on the 64-bit address -- the no-argtypes ctypes truncation bug)."""
+    """release_range must actually drop the resident pages (MAP_SHARED /dev/zero
+    mappings ignore MADV_DONTNEED, so the in-place private remap is verified
+    with mincore)."""
     import ctypes as ct
 
     size = 4 * 1024 * 1024

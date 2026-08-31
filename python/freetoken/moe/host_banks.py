@@ -114,22 +114,38 @@ class HostBank:
         self._pinned = True
 
     def release_range(self, offset: int, nbytes: int) -> None:
-        """MADV_DONTNEED a byte range of the backing mmap (frees the resident pages).
+        """Free a byte range of the backing mapping by replacing it IN PLACE with a
+        fresh MAP_PRIVATE anonymous mapping at the same virtual address.
 
-        For the disk tier's unpinned bank tails: the address space stays valid but
-        the pages are gone, so any read of the range silently refaults as zeros --
-        callers must guarantee nothing reads it (see :meth:`pin_prefix`)."""
+        HostBank's buffer is a MAP_SHARED /dev/zero mapping (CPython's
+        ``mmap(-1)``), and the kernel silently ignores MADV_DONTNEED on shared
+        mappings -- the pages would stay resident. Replacing the range with a
+        private zero mapping frees them while keeping every existing pointer
+        and torch view valid (same address). The range must be page-aligned
+        and must not overlap a pinned prefix (the disk tier's unpinned tails).
+        """
         import ctypes
 
+        _BLK = 4096
+        assert offset % _BLK == 0 and nbytes % _BLK == 0, (
+            "release_range: page-aligned range required")
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        # argtypes are mandatory: without them ctypes truncates the 64-bit
-        # address to a C int and madvise fails (ENOMEM/EINVAL on bogus addrs).
-        libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-        libc.madvise.restype = ctypes.c_int
-        MADV_DONTNEED = 4
-        rc = libc.madvise(self.addr + offset, nbytes, MADV_DONTNEED)
-        if rc != 0:
-            raise OSError(ctypes.get_errno(), "madvise(MADV_DONTNEED) failed")
+        libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        libc.munmap.restype = ctypes.c_int
+        libc.mmap.restype = ctypes.c_void_p
+        libc.mmap.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        addr = self.addr + offset
+        if libc.munmap(addr, nbytes) != 0:
+            raise OSError(ctypes.get_errno(), "munmap failed")
+        PROT_READ_WRITE = 3
+        MAP_PRIVATE_ANON = 0x22  # MAP_PRIVATE | MAP_ANONYMOUS
+        MAP_FIXED = 0x10
+        MAP_FAILED = (1 << 64) - 1
+        new_addr = libc.mmap(addr, nbytes, PROT_READ_WRITE, MAP_PRIVATE_ANON | MAP_FIXED, -1, 0)
+        if new_addr in (None, MAP_FAILED):
+            raise OSError(ctypes.get_errno(), "mmap(MAP_FIXED) failed")
+        assert new_addr == addr, "MAP_FIXED returned a different address"
     def release(self) -> None:
         """Drop the buffer's resident pages (address space stays valid; contents
         become undefined). Only for buffers that are done being read -- the
