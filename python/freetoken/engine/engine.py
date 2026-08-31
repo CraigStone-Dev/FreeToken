@@ -578,8 +578,9 @@ class Engine:
                     "--moe-disk-tier v0 requires the gpu decode path (--moe-backend offload)")
             if config.moe_prefill_overlap:
                 raise ValueError("--moe-disk-tier v0 requires --disable-moe-prefill-overlap")
-            if config.cuda_graph_max_bs is not None:
-                raise ValueError("--moe-disk-tier v0 requires cuda graphs disabled")
+            if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
+                raise ValueError(
+                    "--moe-disk-tier v0 requires --cuda-graph-max-bs 0 (cuda graphs disabled)")
             disk_tier = DiskTierSpec(ram_experts=config.expert_ram_experts)
         if cache_factory is None:
             # Fast path: an FTW checkpoint loads its repacked banks directly.
