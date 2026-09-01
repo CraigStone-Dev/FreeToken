@@ -1031,6 +1031,11 @@ class OffloadMoeCache:
             for per_layer, cache in self.banks:
                 cache[: self.num_experts].copy_(per_layer[layer_id])
             return
+        if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id == 0:
+            print(f"[copy-miss] layer={layer_id} fused={self._copy_fused_ok} "
+                  f"n={int(self.num_indices.item())} "
+                  f"evict={self.evict_slots[:4].cpu().tolist()} "
+                  f"src={self.src_indices[:4].cpu().tolist()}", flush=True)
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 

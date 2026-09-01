@@ -432,6 +432,9 @@ class DiskTier:
         src = cache.src_indices[:n].cpu()
         slots = cache.evict_slots[:n].cpu()
         disk = [i for i in range(n) if int(src[i]) >= self._ram]
+        if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id == 0:
+            print(f"[fetch-pend] layer=0 n={n} ndisk={len(disk)} "
+                  f"src_head={src[:4].tolist()}", flush=True)
         if not disk:
             return
         futures = [
