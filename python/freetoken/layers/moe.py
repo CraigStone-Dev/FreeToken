@@ -316,6 +316,9 @@ class OffloadMoELayer(MoELayer):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
+        if (cache.disk_tier_enabled and self.layer_id == 0
+                and os.environ.get("FT_DISK_TIER_VERIFY")):
+            cache._disk_tier.verify_decode_mapping(cache, self.layer_id, topk_ids)
         return self._expert_gemm(
             cache,
             hidden_states,
