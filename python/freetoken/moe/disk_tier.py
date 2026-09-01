@@ -270,6 +270,14 @@ class DiskTier:
         self._fetches += 1
         self._fetch_bytes += sum(self._row_bytes)
 
+    def _sync_fetches(self) -> None:
+        """Wait for the pool threads' async H2D copies to land.
+
+        The copies are enqueued on the pool threads' default stream; f.result() only
+        waits for them to be ENQUEUED. The GEMM's stream is not ordered with that
+        stream, so sync the default stream before the GEMM reads the slots."""
+        torch.cuda.default_stream().synchronize()
+
     def materialize_layer(self, cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Disk-tier prefill: materialize the RAM-resident prefix into identity slots
         (the normal kernel restricted to K experts; the following ``copy_missing``
@@ -290,6 +298,7 @@ class DiskTier:
         ]
         for f in futures:
             f.result()
+        self._sync_fetches()
         # Same bookkeeping the materialize kernel writes, per fetched expert.
         flat = layer_id * cache.num_experts + disk
         cache.slot_for_id[layer_id, disk] = disk
@@ -313,6 +322,7 @@ class DiskTier:
         ]
         for f in futures:
             f.result()
+        self._sync_fetches()
         disk_set = set(disk)
         ram = [i for i in range(n) if i not in disk_set]
         if ram:
