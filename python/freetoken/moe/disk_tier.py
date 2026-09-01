@@ -213,6 +213,12 @@ class DiskTier:
 
     # ---------------------------------------------------------------- fetch
     def _fetch_expert(self, layer: int, expert: int, slot: int) -> None:
+        # The server runs under inference_mode; the fetch pool threads do not,
+        # so the H2D writes into the (inference) slot cache need their own scope.
+        with torch.inference_mode():
+            self._fetch_expert_inner(layer, expert, slot)
+
+    def _fetch_expert_inner(self, layer: int, expert: int, slot: int) -> None:
         staging = self._staging_buf()
         for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
             row = gpu_cache[slot]
