@@ -323,6 +323,13 @@ class DiskTier:
             except Exception as exc:  # never crash the server in debug
                 print(f"[verify] bank={bank_idx} expert={expert} ERROR {exc!r}", flush=True)
 
+    def verify_ram(self, cache, layer: int) -> None:
+        """One-shot debug: after the PCIe copy, check a RAM-resident expert's slot rows
+        against the checkpoint reference. Gated on FT_DISK_TIER_VERIFY."""
+        expert = min(10, self._ram - 1)  # a RAM-resident expert
+        print(f"[verify-ram] layer={layer} expert={expert} (RAM prefix)", flush=True)
+        self._verify_slot(cache, layer, expert)
+
     def materialize_layer(self, cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Disk-tier prefill: materialize the RAM-resident prefix into identity slots
         (the normal kernel restricted to K experts; the following ``copy_missing``
