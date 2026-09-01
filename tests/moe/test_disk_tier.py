@@ -43,9 +43,11 @@ TENSOR_SPECS = (
     ("gate_proj", "weight_scale", (I, H // 16), torch.uint8),
     ("up_proj", "weight_scale", (I, H // 16), torch.uint8),
     ("down_proj", "weight_scale", (H, I // 16), torch.uint8),
-    ("gate_proj", "weight_scale_2", (I,), torch.float16),
-    ("up_proj", "weight_scale_2", (I,), torch.float16),
-    ("down_proj", "weight_scale_2", (H,), torch.float16),
+    # weight_scale_2 is a per-expert fp32 SCALAR in the real checkpoints; the
+    # bank row is its fp16 value broadcast across the row.
+    ("gate_proj", "weight_scale_2", (), torch.float32),
+    ("up_proj", "weight_scale_2", (), torch.float32),
+    ("down_proj", "weight_scale_2", (), torch.float32),
 )
 
 BANK_SHAPES = (
@@ -71,6 +73,8 @@ def _tensor_for(layer, expert, proj, kind):
     base = layer * 100000 + expert * 1000 + proj_i * 100 + kind_i * 10
     for p, k, shape, dtype in TENSOR_SPECS:
         if p == proj and k == kind:
+            if shape == ():  # per-expert fp32 scalar (kept in fp16 range)
+                return torch.tensor(float(base % 50000), dtype=torch.float32)
             n = int(torch.tensor(shape).prod())
             if dtype == torch.uint8:
                 return torch.arange(n, dtype=torch.uint8).add_(base % 251).view(shape)
@@ -185,13 +189,20 @@ def _expected_rows(layer, expert):
     """The 6 bank rows for one expert, as flat uint8, in schema order."""
     rows = []
     for bank_idx, (shape, dtype) in enumerate(zip(BANK_SHAPES, BANK_DTYPES)):
-        if bank_idx < 3:
-            gate = _tensor_for(layer, expert, "gate_proj", ("weight", "weight_scale", "weight_scale_2")[bank_idx])
-            up = _tensor_for(layer, expert, "up_proj", ("weight", "weight_scale", "weight_scale_2")[bank_idx])
+        if bank_idx == 2:
+            gate = _tensor_for(layer, expert, "gate_proj", "weight_scale_2").to(torch.float16)
+            up = _tensor_for(layer, expert, "up_proj", "weight_scale_2").to(torch.float16)
+            row = torch.cat([gate.expand(I), up.expand(I)]).view(shape)
+        elif bank_idx == 5:
+            row = (_tensor_for(layer, expert, "down_proj", "weight_scale_2")
+                   .to(torch.float16).expand(H).view(shape))
+        elif bank_idx < 3:
+            kind = ("weight", "weight_scale")[bank_idx]
+            gate = _tensor_for(layer, expert, "gate_proj", kind)
+            up = _tensor_for(layer, expert, "up_proj", kind)
             row = torch.cat([gate.reshape(-1), up.reshape(-1)]).view(shape)
         else:
-            kind = ("weight", "weight_scale", "weight_scale_2")[bank_idx - 3]
-            row = _tensor_for(layer, expert, "down_proj", kind)
+            row = _tensor_for(layer, expert, "down_proj", ("weight", "weight_scale")[bank_idx - 3])
         rows.append(row.contiguous().view(torch.uint8).reshape(-1))
     return rows
 
