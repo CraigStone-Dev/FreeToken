@@ -193,6 +193,19 @@ class DiskTier:
                 self._dst_slices.append([(0, mid), (mid, row.shape[0])])
             else:
                 self._dst_slices.append([(0, row.shape[0])])
+        if os.environ.get("FT_DISK_TIER_VERIFY"):
+            # TP=2 debug: prove per-rank whether the host bank rows are full or
+            # TP-sharded, and that the disk index's full-row segments match them.
+            from freetoken.distributed import try_get_tp_info
+            tp = try_get_tp_info()
+            host_shapes = [tuple(b[0][0][0].shape) for b in self._banks]
+            disk_bytes = [
+                sum(nb for _, _, nb in self._index.row_segments(bi, 0, 100))
+                for bi in range(len(self._banks))
+            ]
+            print(f"[disk-tier-init] tp_rank={getattr(tp, 'rank', '?')}/{getattr(tp, 'size', '?')} "
+                  f"ram={ram_experts} host_row_shapes={host_shapes} "
+                  f"host_row_bytes={self._row_bytes} disk_row_bytes={disk_bytes}", flush=True)
         max_row = max(self._row_bytes)
         self._staging_size = ((max_row + _ALIGN - 1) // _ALIGN + 2) * _ALIGN
         self._staging = threading.local()
