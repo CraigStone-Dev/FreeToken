@@ -280,6 +280,45 @@ class DiskTier:
             return  # CPU-only tests: the copies are synchronous CPU->CPU
         torch.cuda.default_stream().synchronize()
 
+    def _verify_slot(self, cache, layer: int, expert: int) -> None:
+        """One-shot debug: read back a fetched disk expert's slot rows and compare
+        against the checkpoint bytes (ground truth). Gated on FT_DISK_TIER_VERIFY."""
+        import torch
+        slot = expert  # identity mapping in prefill
+        for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
+            slot_row = gpu_cache[slot].contiguous()
+            flat = slot_row.view(torch.uint8).reshape(-1)
+            segs = self._index.row_segments(bank_idx, layer, expert)
+            dsl = self._dst_slices[bank_idx]
+            # Reconstruct the reference row bytes from the checkpoint.
+            row_bytes = flat.numel()
+            ref = torch.zeros(row_bytes, dtype=torch.uint8)
+            row_el = slot_row.element_size()
+            row_leading = slot_row.numel() // slot_row.shape[0] if slot_row.dim() > 1 else 1
+            for (d0, d1), (shard_idx, off, nbytes) in zip(dsl, segs):
+                fd, direct = self._fd(shard_idx)
+                a0 = off if not direct else (off & ~(_ALIGN - 1))
+                slen = nbytes if not direct else (off + nbytes - a0 + _ALIGN - 1) & ~(_ALIGN - 1)
+                buf = os.pread(fd, slen, a0)
+                row_off = off - a0
+                seg = buf[row_off:row_off + nbytes]
+                if bank_idx in (2, 5):
+                    val = int.from_bytes(seg, "little")
+                    import struct as _st
+                    f32 = _st.unpack("<f", seg[:4])[0]
+                    import numpy as _np
+                    f16 = _np.float16(f32).tobytes()
+                    for r in range(d0, d1):
+                        ref[r * row_el:(r + 1) * row_el] = torch.frombuffer(f16, dtype=torch.uint8)
+                else:
+                    dst_off = d0 * row_leading * row_el
+                    ref[dst_off:dst_off + len(seg)] = torch.frombuffer(seg, dtype=torch.uint8)
+            match = bool(torch.equal(flat, ref))
+            print(f"[verify] bank={bank_idx} expert={expert} match={match} "
+                  f"slot_norm={slot_row.float().norm().item():.4f} "
+                  f"ref_norm={ref.view(slot_row.dtype).view(slot_row.shape).float().norm().item():.4f} "
+                  f"slot_head={flat[:8].tolist()} ref_head={ref[:8].tolist()}", flush=True)
+
     def materialize_layer(self, cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Disk-tier prefill: materialize the RAM-resident prefix into identity slots
         (the normal kernel restricted to K experts; the following ``copy_missing``
@@ -291,6 +330,9 @@ class DiskTier:
         _materialize_layer_gpu(cache, layer_id, materialize_count=self._ram)
         routed = expert_ids.reshape(-1)
         disk = torch.unique(routed[routed >= self._ram])
+        if layer_id < 3:
+            print(f"[disk-tier dbg] layer={layer_id} routed={routed.numel()} "
+                  f"unique_disk={disk.numel()} disk={disk.tolist()[:12]}", flush=True)
         if disk.numel() == 0:
             return
         step = int(cache.step.item())  # already incremented by the kernel
@@ -301,6 +343,8 @@ class DiskTier:
         for f in futures:
             f.result()
         self._sync_fetches()
+        if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id == 0 and disk.numel() > 0:
+            self._verify_slot(cache, 0, int(disk[0].item()))
         # Same bookkeeping the materialize kernel writes, per fetched expert.
         flat = layer_id * cache.num_experts + disk
         cache.slot_for_id[layer_id, disk] = disk
