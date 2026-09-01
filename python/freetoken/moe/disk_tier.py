@@ -357,7 +357,8 @@ class DiskTier:
             f.result()
         self._sync_fetches()
         if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id in (0, 20) and disk.numel() > 0:
-            self._verify_slot(cache, layer_id, int(disk[0].item()))
+            for e in disk.tolist()[:6]:
+                self._verify_slot(cache, layer_id, int(e))
         # Same bookkeeping the materialize kernel writes, per fetched expert.
         flat = layer_id * cache.num_experts + disk
         cache.slot_for_id[layer_id, disk] = disk
