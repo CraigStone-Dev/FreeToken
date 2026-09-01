@@ -240,6 +240,10 @@ class OffloadMoeCache:
         # by copy_missing to pick the per-layer source (part of the same pending-copy
         # state as evict_slots/src_indices/num_indices).
         self._pending_src_layer: int | None = None
+        # True when the pending miss list was staged by materialize_layer (prefill
+        # identity mapping) rather than ensure_experts (decode LRU) -- the RAM-slot
+        # identity checks in the disk-tier verify path only hold for the former.
+        self._pending_is_materialize = False
         # Per-bank [2, num_experts, ...] double-buffer views over the slot cache's
         # first 2 * num_experts slots (set up when prefill_overlap is enabled).
         self.prefill_bank_buffers: list[torch.Tensor] = []
@@ -772,6 +776,7 @@ class OffloadMoeCache:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
+        self._pending_is_materialize = False
         ensure_experts(self, layer_id, expert_ids)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
@@ -790,6 +795,7 @@ class OffloadMoeCache:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
+        self._pending_is_materialize = False
         ensure_experts_hybrid(
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
@@ -804,11 +810,13 @@ class OffloadMoeCache:
             # disk-resident experts into their identity slots (needs the routing).
             assert expert_ids is not None, "disk-tier prefill needs the routed expert ids"
             self._pending_src_layer = layer_id
+            self._pending_is_materialize = True
             self._disk_tier.materialize_layer(self, layer_id, expert_ids)
             return
         from freetoken.moe.offload_kernels import materialize_layer
 
         self._pending_src_layer = layer_id
+        self._pending_is_materialize = True
         materialize_layer(self, layer_id)
 
     def reset(self) -> None:
@@ -989,6 +997,7 @@ class OffloadMoeCache:
                     self.num_indices,
                 )
         if (self._disk_tier is not None and layer_id == 0
+                and self._pending_is_materialize
                 and os.environ.get("FT_DISK_TIER_VERIFY")):
             self._disk_tier.verify_ram(self, layer_id)
 
