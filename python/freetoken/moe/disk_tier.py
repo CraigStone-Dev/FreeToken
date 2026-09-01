@@ -313,11 +313,15 @@ class DiskTier:
                 else:
                     dst_off = d0 * row_leading * row_el
                     ref[dst_off:dst_off + len(seg)] = torch.frombuffer(seg, dtype=torch.uint8)
-            match = bool(torch.equal(flat, ref))
-            print(f"[verify] bank={bank_idx} expert={expert} match={match} "
-                  f"slot_norm={slot_row.float().norm().item():.4f} "
-                  f"ref_norm={ref.view(slot_row.dtype).view(slot_row.shape).float().norm().item():.4f} "
-                  f"slot_head={flat[:8].tolist()} ref_head={ref[:8].tolist()}", flush=True)
+            try:
+                ref = ref.to(flat.device)
+                match = bool(torch.equal(flat, ref))
+                print(f"[verify] bank={bank_idx} expert={expert} match={match} "
+                      f"slot_norm={slot_row.float().norm().item():.4f} "
+                      f"ref_norm={ref.view(slot_row.dtype).view(slot_row.shape).float().norm().item():.4f} "
+                      f"slot_head={flat[:8].tolist()} ref_head={ref[:8].tolist()}", flush=True)
+            except Exception as exc:  # never crash the server in debug
+                print(f"[verify] bank={bank_idx} expert={expert} ERROR {exc!r}", flush=True)
 
     def materialize_layer(self, cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Disk-tier prefill: materialize the RAM-resident prefix into identity slots
