@@ -171,17 +171,18 @@ def _tier(checkpoint, cache, ram_experts=2):
         b[0][0][0].numel() * b[0][0][0].element_size() for b in cache.banks)
     assert tier._staging_size >= max_row + 2 * 4096, (tier._staging_size, max_row)
     # Stub the pinned staging (HostBank.pin needs CUDA) with the same per-thread
-    # buffer semantics as production (threading.local).
+    # ring semantics as production (threading.local, no CUDA events on CPU).
     local = threading.local()
 
-    def _staging_buf():
-        buf = getattr(local, "buf", None)
-        if buf is None:
-            buf = HostBank((tier._staging_size,), torch.uint8)
-            local.buf = buf
-        return buf
+    def _staging_ring():
+        ring = getattr(local, "ring", None)
+        if ring is None:
+            ring = [[HostBank((tier._staging_size,), torch.uint8), None]
+                    for _ in range(tier._STAGING_RING)]
+            local.ring = ring
+        return ring
 
-    tier._staging_buf = _staging_buf
+    tier._staging_ring = _staging_ring
     return tier
 
 
