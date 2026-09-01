@@ -865,6 +865,7 @@ class OffloadMoeCache:
             # disk-resident experts into their identity slots (needs the routing).
             assert expert_ids is not None, "disk-tier prefill needs the routed expert ids"
             self._pending_src_layer = layer_id
+            self._pending_whole_layer = True
             self._disk_tier.materialize_layer(self, layer_id, expert_ids)
             return
         from freetoken.moe.offload_kernels import materialize_layer
@@ -1063,6 +1064,7 @@ class OffloadMoeCache:
                     self.num_indices,
                 )
         if (self._disk_tier is not None and layer_id == 0
+                and self._pending_whole_layer
                 and os.environ.get("FT_DISK_TIER_VERIFY")):
             self._disk_tier.verify_ram(self, layer_id)
 
