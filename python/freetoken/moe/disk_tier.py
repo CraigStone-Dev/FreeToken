@@ -201,6 +201,7 @@ class DiskTier:
         self._fds: dict[int, tuple[int, bool]] = {}
         self._fetches = 0
         self._fetch_bytes = 0
+        self._decode_verify_done = False
 
     # ------------------------------------------------------------------ fds
     def _fd(self, shard_idx: int) -> tuple[int, bool]:
@@ -280,11 +281,12 @@ class DiskTier:
             return  # CPU-only tests: the copies are synchronous CPU->CPU
         torch.cuda.default_stream().synchronize()
 
-    def _verify_slot(self, cache, layer: int, expert: int) -> None:
-        """One-shot debug: read back a fetched disk expert's slot rows and compare
-        against the checkpoint bytes (ground truth). Gated on FT_DISK_TIER_VERIFY."""
+    def _verify_slot(self, cache, layer: int, expert: int, slot: int | None = None) -> None:
+        """One-shot debug: read back an expert's slot rows and compare against the
+        checkpoint bytes (ground truth). Gated on FT_DISK_TIER_VERIFY."""
         import torch
-        slot = expert  # identity mapping in prefill
+        if slot is None:
+            slot = expert  # identity mapping (prefill)
         for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
             slot_row = gpu_cache[slot].contiguous()
             flat = slot_row.view(torch.uint8).reshape(-1)
@@ -380,6 +382,12 @@ class DiskTier:
         for f in futures:
             f.result()
         self._sync_fetches()
+        if (os.environ.get("FT_DISK_TIER_VERIFY") and not self._decode_verify_done
+                and layer_id == 0):
+            i0 = disk[0]
+            self._decode_verify_done = True
+            print(f"[verify-decode] layer=0 expert={int(src[i0])} slot={int(slots[i0])}", flush=True)
+            self._verify_slot(cache, layer_id, int(src[i0]), int(slots[i0]))
         disk_set = set(disk)
         ram = [i for i in range(n) if i not in disk_set]
         if ram:
