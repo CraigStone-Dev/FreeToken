@@ -239,13 +239,26 @@ class DiskTier:
         return ent
 
     # --------------------------------------------------------------- staging
-    def _staging_buf(self) -> HostBank:
-        buf = getattr(self._staging, "buf", None)
-        if buf is None:
-            buf = HostBank((self._staging_size,), torch.uint8)
-            buf.pin()  # small; pin once per worker thread
-            self._staging.buf = buf
-        return buf
+    # Staging ring depth per worker thread. A buffer must not be overwritten by the
+    # next preadv until the async H2D copy that read it has finished (pinned-memory
+    # reuse race -- the copy is DMA, still reading host bytes after copy_ returns).
+    # The depth only needs to cover one copy's DMA time in host-side preadv time;
+    # the per-slot CUDA event below makes any shallower lap correct, just slower.
+    _STAGING_RING = 8
+
+    def _staging_ring(self) -> list:
+        ring = getattr(self._staging, "ring", None)
+        if ring is None:
+            ring = []
+            for _ in range(self._STAGING_RING):
+                buf = HostBank((self._staging_size,), torch.uint8)
+                buf.pin()  # pin once per worker thread
+                ev = torch.cuda.Event() if torch.cuda.is_available() else None
+                if ev is not None:
+                    ev.record()  # start "complete"; re-recorded after each copy
+                ring.append([buf, ev])
+            self._staging.ring = ring
+        return ring
 
     # ---------------------------------------------------------------- fetch
     def _fetch_expert(self, layer: int, expert: int, slot: int) -> None:
@@ -255,11 +268,18 @@ class DiskTier:
             self._fetch_expert_inner(layer, expert, slot)
 
     def _fetch_expert_inner(self, layer: int, expert: int, slot: int) -> None:
-        staging = self._staging_buf()
+        ring = self._staging_ring()
+        ri = getattr(self._staging, "ri", 0)
         for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
             row = gpu_cache[slot]
             segs = self._index.row_segments(bank_idx, layer, expert)
             for (d0, d1), (shard_idx, off, nbytes) in zip(self._dst_slices[bank_idx], segs):
+                staging, ev = ring[ri]
+                if ev is not None:
+                    # This buffer's last async H2D copy must be done before the
+                    # preadv below overwrites it (pinned-memory reuse race).
+                    ev.synchronize()
+                ri = (ri + 1) % len(ring)
                 fd, direct = self._fd(shard_idx)
                 if direct:
                     a0 = off & ~(_ALIGN - 1)
@@ -283,6 +303,10 @@ class DiskTier:
                 src = staging.tensor[row_off:row_off + nbytes]
                 dst = row[d0:d1]
                 dst.copy_(src.view(dst.dtype).view(dst.shape), non_blocking=True)
+                if ev is not None:
+                    # Arm: the next reuse of this buffer waits for this copy.
+                    ev.record()
+        self._staging.ri = ri
         self._fetches += 1
         self._fetch_bytes += sum(self._row_bytes)
 
@@ -296,7 +320,8 @@ class DiskTier:
             return  # CPU-only tests: the copies are synchronous CPU->CPU
         torch.cuda.default_stream().synchronize()
 
-    def _verify_slot(self, cache, layer: int, expert: int, slot: int | None = None) -> None:
+    def _verify_slot(self, cache, layer: int, expert: int, slot: int | None = None,
+                     phase: str = "prefill") -> None:
         """One-shot debug: read back an expert's slot rows and compare against the
         checkpoint bytes (ground truth). Gated on FT_DISK_TIER_VERIFY."""
         import torch
@@ -311,10 +336,19 @@ class DiskTier:
             try:
                 ref = ref.to(flat.device)
                 match = bool(torch.equal(flat, ref))
-                print(f"[verify] bank={bank_idx} expert={expert} match={match} "
+                if match:
+                    print(f"[verify] {phase} L{layer} bank={bank_idx} expert={expert} "
+                          f"slot={slot} match=True", flush=True)
+                    continue
+                diff = (flat != ref)
+                nz = torch.nonzero(diff).flatten()
+                print(f"[verify] {phase} L{layer} bank={bank_idx} expert={expert} "
+                      f"slot={slot} match=False n_diff={int(diff.sum())}/{flat.numel()} "
+                      f"first_off={int(nz[0])} last_off={int(nz[-1])} "
                       f"slot_norm={slot_row.float().norm().item():.4f} "
                       f"ref_norm={ref.view(slot_row.dtype).view(slot_row.shape).float().norm().item():.4f} "
                       f"slot_head={flat[:8].tolist()} ref_head={ref[:8].tolist()}", flush=True)
+                self._identify_overwriter(layer, bank_idx, expert, flat)
             except Exception as exc:  # never crash the server in debug
                 print(f"[verify] bank={bank_idx} expert={expert} ERROR {exc!r}", flush=True)
 
@@ -340,6 +374,37 @@ class DiskTier:
                 dst_off = d0 * row_leading * row_el
                 ref[dst_off:dst_off + len(seg)] = torch.frombuffer(seg, dtype=torch.uint8)
         return ref
+
+    def _identify_overwriter(self, layer: int, bank_idx: int, expert: int,
+                             flat: torch.Tensor) -> None:
+        """Debug: on a verify mismatch, find whose row the slot actually holds.
+
+        Compares the slot's first 64 bytes against (a) every other expert of the
+        same layer and (b) the same expert in every other layer, straight from the
+        checkpoint. A hit names the overwriter (e.g. a staging-buffer reuse race
+        landing a neighbour's preadv); no hit means a partial mix. Only runs on
+        mismatch, so the ~300 extra preads are free otherwise."""
+        head = flat[:64].cpu()
+        host_row = self._banks[bank_idx][0][0][layer]
+        row_el = host_row.element_size()
+        row_leading = host_row.numel() // host_row.shape[0] if host_row.dim() > 1 else 1
+        num_experts = host_row.shape[0]
+        num_layers = len(self._banks[bank_idx][0])
+        hits = []
+        for e in range(num_experts):
+            if e == expert:
+                continue
+            ref = self._ref_row(bank_idx, layer, e, flat.numel(), row_el, row_leading)
+            if bool(torch.equal(ref[:64], head)):
+                hits.append(f"L{layer}_e{e}")
+        for L in range(num_layers):
+            if L == layer:
+                continue
+            ref = self._ref_row(bank_idx, L, expert, flat.numel(), row_el, row_leading)
+            if bool(torch.equal(ref[:64], head)):
+                hits.append(f"L{L}_e{expert}")
+        print(f"[overwriter] L{layer} B{bank_idx} e{expert} head64 matches: "
+              f"{hits if hits else 'NONE (partial mix?)'}", flush=True)
 
     def verify_ram(self, cache, layer: int) -> None:
         """One-shot debug: after the PCIe copy, check a RAM-resident expert's slot rows
@@ -478,7 +543,7 @@ class DiskTier:
         if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id in (0, 20) and disk.numel() > 0:
             limit = disk.numel() if layer_id == 0 else 6  # layer 0: ALL experts (race hunt)
             for e in disk.tolist()[:limit]:
-                self._verify_slot(cache, layer_id, int(e))
+                self._verify_slot(cache, layer_id, int(e), phase="prefill")
         # Same bookkeeping the materialize kernel writes, per fetched expert.
         flat = layer_id * cache.num_experts + disk
         cache.slot_for_id[layer_id, disk] = disk
@@ -512,7 +577,8 @@ class DiskTier:
             for i in disk[:8]:
                 print(f"[verify-decode] step={self._decode_verify_steps} "
                       f"expert={int(src[i])} slot={int(slots[i])} ndisk={len(disk)}", flush=True)
-                self._verify_slot(cache, layer_id, int(src[i]), int(slots[i]))
+                self._verify_slot(cache, layer_id, int(src[i]), int(slots[i]),
+                                  phase="decode")
         disk_set = set(disk)
         ram = [i for i in range(n) if i not in disk_set]
         if ram:
