@@ -356,8 +356,8 @@ class DiskTier:
         for f in futures:
             f.result()
         self._sync_fetches()
-        if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id == 0 and disk.numel() > 0:
-            self._verify_slot(cache, 0, int(disk[0].item()))
+        if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id in (0, 20) and disk.numel() > 0:
+            self._verify_slot(cache, layer_id, int(disk[0].item()))
         # Same bookkeeping the materialize kernel writes, per fetched expert.
         flat = layer_id * cache.num_experts + disk
         cache.slot_for_id[layer_id, disk] = disk
@@ -382,11 +382,11 @@ class DiskTier:
         for f in futures:
             f.result()
         self._sync_fetches()
-        if (os.environ.get("FT_DISK_TIER_VERIFY") and not self._decode_verify_done
-                and layer_id == 0):
+        if os.environ.get("FT_DISK_TIER_VERIFY") and not self._decode_verify_done:
             i0 = disk[0]
             self._decode_verify_done = True
-            print(f"[verify-decode] layer=0 expert={int(src[i0])} slot={int(slots[i0])}", flush=True)
+            print(f"[verify-decode] layer={layer_id} expert={int(src[i0])} slot={int(slots[i0])} "
+                  f"ndisk={len(disk)}", flush=True)
             self._verify_slot(cache, layer_id, int(src[i0]), int(slots[i0]))
         disk_set = set(disk)
         ram = [i for i in range(n) if i not in disk_set]
