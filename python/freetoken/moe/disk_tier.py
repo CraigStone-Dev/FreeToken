@@ -332,17 +332,62 @@ class DiskTier:
         expert = min(10, self._ram - 1)  # a RAM-resident expert
         print(f"[verify-ram] layer={layer} expert={expert} (RAM prefix)", flush=True)
         self._verify_slot(cache, layer, expert)
-        # Also check the HOST row (CPU) -- separates host-side corruption from the
-        # GPU PCIe copy.
-        for bank_idx, (host_layer, _gpu) in enumerate(self._banks):
-            host_row = host_layer[layer][expert].contiguous()
-            flat = host_row.view(torch.uint8).reshape(-1)
-            ref = self._ref_row(bank_idx, layer, expert, flat.numel(),
-                                host_row.element_size(),
-                                host_row.numel() // host_row.shape[0] if host_row.dim() > 1 else 1)
-            match = bool(torch.equal(flat, ref))
-            print(f"[verify-host] bank={bank_idx} expert={expert} match={match} "
-                  f"host_head={flat[:8].tolist()} ref_head={ref[:8].tolist()}", flush=True)
+        # Check ALL RAM experts: slot vs host row (host correctness established
+        # separately). Count mismatches; identify the source of the first one.
+        n_bad = 0
+        identified = False
+        for e in range(self._ram):
+            for bank_idx, (host_layer, gpu_cache) in enumerate(self._banks):
+                slot_row = gpu_cache[e].contiguous()
+                flat = slot_row.view(torch.uint8).reshape(-1)
+                hflat = host_layer[layer][e].contiguous().view(torch.uint8).reshape(-1)
+                if flat.numel() != hflat.numel() or not bool(torch.equal(flat.cpu(), hflat)):
+                    n_bad += 1
+                    if n_bad <= 12:
+                        print(f"[verify-ram] MISMATCH e={e} bank={bank_idx} "
+                              f"slot_head={flat[:8].tolist()} host_head={hflat[:8].tolist()}",
+                              flush=True)
+                    if not identified:
+                        identified = True
+                        self._identify_source(layer, bank_idx, flat)
+        print(f"[verify-ram] layer={layer} mismatches={n_bad}/{self._ram * len(self._banks)}",
+              flush=True)
+
+    def _identify_source(self, layer: int, bank_idx: int, flat: torch.Tensor) -> None:
+        """Debug: find where a corrupted slot's bytes came from (GPU slot, host row,
+        or checkpoint row)."""
+        flat_cpu = flat.cpu()
+        head = flat_cpu[:16]
+        found = []
+        _host_layer, gpu_cache = self._banks[bank_idx]
+        gpu_flat = gpu_cache.view(torch.uint8).reshape(gpu_cache.shape[0], -1)
+        if gpu_flat.shape[1] == flat_cpu.numel():
+            cand = torch.nonzero(
+                (gpu_flat[:, :16].cpu() == head.unsqueeze(0)).all(dim=1)).flatten().tolist()
+            for s in cand[:16]:
+                if bool(torch.equal(gpu_flat[s].cpu(), flat_cpu)):
+                    found.append(f"gpu_slot={s}(L{layer},B{bank_idx})")
+        for e in range(self._ram):
+            hflat = _host_layer[layer][e].contiguous().view(torch.uint8).reshape(-1)
+            if hflat.numel() == flat_cpu.numel() and bool(torch.equal(hflat, flat_cpu)):
+                found.append(f"host_row_e{e}(L{layer},B{bank_idx})")
+        import itertools
+        num_layers = len(self._banks[bank_idx][0])
+        targets = sorted(set(itertools.product([layer], range(256)))
+                         | set(itertools.product(range(num_layers), [10])))
+        for (L, e) in targets:
+            row_el, row_leading = None, None
+            hrow = _host_layer[layer][0]
+            row_el = hrow.element_size()
+            row_leading = hrow.numel() // hrow.shape[0] if hrow.dim() > 1 else 1
+            try:
+                ref = self._ref_row(bank_idx, L, e, flat_cpu.numel(), row_el, row_leading)
+            except Exception:
+                continue
+            if bool(torch.equal(ref, flat_cpu)):
+                found.append(f"checkpoint_L{L}_e{e}")
+        print(f"[identify] L{layer} B{bank_idx} n={flat_cpu.numel()} "
+              f"source={found if found else 'UNKNOWN'}", flush=True)
 
     def materialize_layer(self, cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Disk-tier prefill: materialize the RAM-resident prefix into identity slots
