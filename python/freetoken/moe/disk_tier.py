@@ -434,6 +434,18 @@ class DiskTier:
         preserved, so the prefill GEMM is unchanged."""
         from freetoken.moe.offload_kernels import _materialize_layer_gpu
 
+        # Prefill identity mapping owns ALL of slots [0, E) for this layer, but
+        # the kernel only scans slots < materialize_count, so the disk slots
+        # [ram, E) that still hold a previous layer's experts (previous prefill
+        # layer or decode LRU) would keep their slot_for_id entries -- phantom
+        # decode hits that read another layer's weights. Clear them first
+        # (device-side, no sync).
+        seg = cache.id_of_slot[self._ram:cache.num_experts]
+        valid = seg >= 0
+        cache.slot_for_id.view(-1)[seg[valid].long()] = -1
+        seg[valid] = -1
+        cache.usage[self._ram:cache.num_experts][valid] = 0
+
         _materialize_layer_gpu(cache, layer_id, materialize_count=self._ram)
         routed = expert_ids.reshape(-1)
         disk = torch.unique(routed[routed >= self._ram])
