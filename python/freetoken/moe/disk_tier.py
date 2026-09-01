@@ -202,6 +202,8 @@ class DiskTier:
         self._fetches = 0
         self._fetch_bytes = 0
         self._decode_verify_steps = 0
+        self._map_verify_steps = 0
+        self._cache = cache
 
     # ------------------------------------------------------------------ fds
     def _fd(self, shard_idx: int) -> tuple[int, bool]:
@@ -389,6 +391,41 @@ class DiskTier:
         print(f"[identify] L{layer} B{bank_idx} n={flat_cpu.numel()} "
               f"source={found if found else 'UNKNOWN'}", flush=True)
 
+    def verify_decode_mapping(self, cache, layer_id: int, topk_ids: torch.Tensor) -> None:
+        """Debug: after the LRU rewrite + fetch/copy, check that every slot the GEMM
+        will read actually holds the expert the bookkeeping says it holds. Gated on
+        FT_DISK_TIER_VERIFY; first 4 decode steps only."""
+        if self._map_verify_steps >= 4:
+            return
+        self._map_verify_steps += 1
+        slots = torch.unique(topk_ids.reshape(-1))
+        nbad = 0
+        for s in slots.tolist():
+            s = int(s)
+            flat_id = int(cache.id_of_slot[s].item())
+            if flat_id < 0:
+                print(f"[verify-map] step={self._map_verify_steps} slot={s} id_of_slot=-1",
+                      flush=True)
+                nbad += 1
+                continue
+            expert = flat_id % cache.num_experts
+            for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
+                slot_row = gpu_cache[s].contiguous()
+                flat = slot_row.view(torch.uint8).reshape(-1)
+                ref = self._ref_row(bank_idx, layer_id, expert, flat.numel(),
+                                    slot_row.element_size(),
+                                    slot_row.numel() // slot_row.shape[0]
+                                    if slot_row.dim() > 1 else 1)
+                if not bool(torch.equal(flat.cpu(), ref)):
+                    nbad += 1
+                    if nbad <= 8:
+                        print(f"[verify-map] step={self._map_verify_steps} slot={s} "
+                              f"expert={expert} bank={bank_idx} MISMATCH "
+                              f"slot_head={flat[:8].tolist()} ref_head={ref[:8].tolist()}",
+                              flush=True)
+        print(f"[verify-map] step={self._map_verify_steps} slots={slots.numel()} bad={nbad}",
+              flush=True)
+
     def materialize_layer(self, cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Disk-tier prefill: materialize the RAM-resident prefix into identity slots
         (the normal kernel restricted to K experts; the following ``copy_missing``
@@ -462,6 +499,7 @@ class DiskTier:
     def refresh(self, cache) -> None:
         """Rebind the slot-cache references after a runtime cache rebuild."""
         self._banks = list(cache.banks)
+        self._cache = cache
 
     def stats(self) -> dict:
         return {"experts_fetched": self._fetches, "bytes_fetched": self._fetch_bytes}
