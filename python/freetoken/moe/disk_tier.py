@@ -276,6 +276,8 @@ class DiskTier:
         The copies are enqueued on the pool threads' default stream; f.result() only
         waits for them to be ENQUEUED. The GEMM's stream is not ordered with that
         stream, so sync the default stream before the GEMM reads the slots."""
+        if not torch.cuda.is_available():
+            return  # CPU-only tests: the copies are synchronous CPU->CPU
         torch.cuda.default_stream().synchronize()
 
     def materialize_layer(self, cache, layer_id: int, expert_ids: torch.Tensor) -> None:
