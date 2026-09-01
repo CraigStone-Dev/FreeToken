@@ -201,7 +201,7 @@ class DiskTier:
         self._fds: dict[int, tuple[int, bool]] = {}
         self._fetches = 0
         self._fetch_bytes = 0
-        self._decode_verify_done = False
+        self._decode_verify_steps = 0
 
     # ------------------------------------------------------------------ fds
     def _fd(self, shard_idx: int) -> tuple[int, bool]:
@@ -357,7 +357,8 @@ class DiskTier:
             f.result()
         self._sync_fetches()
         if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id in (0, 20) and disk.numel() > 0:
-            for e in disk.tolist()[:6]:
+            limit = disk.numel() if layer_id == 0 else 6  # layer 0: ALL experts (race hunt)
+            for e in disk.tolist()[:limit]:
                 self._verify_slot(cache, layer_id, int(e))
         # Same bookkeeping the materialize kernel writes, per fetched expert.
         flat = layer_id * cache.num_experts + disk
@@ -383,12 +384,13 @@ class DiskTier:
         for f in futures:
             f.result()
         self._sync_fetches()
-        if os.environ.get("FT_DISK_TIER_VERIFY") and not self._decode_verify_done:
-            i0 = disk[0]
-            self._decode_verify_done = True
-            print(f"[verify-decode] layer={layer_id} expert={int(src[i0])} slot={int(slots[i0])} "
-                  f"ndisk={len(disk)}", flush=True)
-            self._verify_slot(cache, layer_id, int(src[i0]), int(slots[i0]))
+        if (os.environ.get("FT_DISK_TIER_VERIFY") and layer_id == 0
+                and self._decode_verify_steps < 3):
+            self._decode_verify_steps += 1
+            for i in disk[:8]:
+                print(f"[verify-decode] step={self._decode_verify_steps} "
+                      f"expert={int(src[i])} slot={int(slots[i])} ndisk={len(disk)}", flush=True)
+                self._verify_slot(cache, layer_id, int(src[i]), int(slots[i]))
         disk_set = set(disk)
         ram = [i for i in range(n) if i not in disk_set]
         if ram:
