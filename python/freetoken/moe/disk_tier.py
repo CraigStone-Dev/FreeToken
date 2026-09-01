@@ -290,31 +290,9 @@ class DiskTier:
         for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
             slot_row = gpu_cache[slot].contiguous()
             flat = slot_row.view(torch.uint8).reshape(-1)
-            segs = self._index.row_segments(bank_idx, layer, expert)
-            dsl = self._dst_slices[bank_idx]
-            # Reconstruct the reference row bytes from the checkpoint.
-            row_bytes = flat.numel()
-            ref = torch.zeros(row_bytes, dtype=torch.uint8)
-            row_el = slot_row.element_size()
-            row_leading = slot_row.numel() // slot_row.shape[0] if slot_row.dim() > 1 else 1
-            for (d0, d1), (shard_idx, off, nbytes) in zip(dsl, segs):
-                fd, direct = self._fd(shard_idx)
-                a0 = off if not direct else (off & ~(_ALIGN - 1))
-                slen = nbytes if not direct else (off + nbytes - a0 + _ALIGN - 1) & ~(_ALIGN - 1)
-                buf = os.pread(fd, slen, a0)
-                row_off = off - a0
-                seg = buf[row_off:row_off + nbytes]
-                if bank_idx in (2, 5):
-                    val = int.from_bytes(seg, "little")
-                    import struct as _st
-                    f32 = _st.unpack("<f", seg[:4])[0]
-                    import numpy as _np
-                    f16 = _np.float16(f32).tobytes()
-                    for r in range(d0, d1):
-                        ref[r * row_el:(r + 1) * row_el] = torch.frombuffer(f16, dtype=torch.uint8)
-                else:
-                    dst_off = d0 * row_leading * row_el
-                    ref[dst_off:dst_off + len(seg)] = torch.frombuffer(seg, dtype=torch.uint8)
+            ref = self._ref_row(bank_idx, layer, expert, flat.numel(),
+                                slot_row.element_size(),
+                                slot_row.numel() // slot_row.shape[0] if slot_row.dim() > 1 else 1)
             try:
                 ref = ref.to(flat.device)
                 match = bool(torch.equal(flat, ref))
@@ -325,12 +303,46 @@ class DiskTier:
             except Exception as exc:  # never crash the server in debug
                 print(f"[verify] bank={bank_idx} expert={expert} ERROR {exc!r}", flush=True)
 
+    def _ref_row(self, bank_idx: int, layer: int, expert: int, row_bytes: int,
+                 row_el: int, row_leading: int) -> torch.Tensor:
+        """Reference row bytes for (bank, layer, expert) straight from the checkpoint."""
+        ref = torch.zeros(row_bytes, dtype=torch.uint8)
+        segs = self._index.row_segments(bank_idx, layer, expert)
+        for (d0, d1), (shard_idx, off, nbytes) in zip(self._dst_slices[bank_idx], segs):
+            fd, direct = self._fd(shard_idx)
+            a0 = off if not direct else (off & ~(_ALIGN - 1))
+            slen = nbytes if not direct else (off + nbytes - a0 + _ALIGN - 1) & ~(_ALIGN - 1)
+            buf = os.pread(fd, slen, a0)
+            row_off = off - a0
+            seg = buf[row_off:row_off + nbytes]
+            if bank_idx in (2, 5):
+                import struct as _st
+                import numpy as _np
+                f16 = _np.float16(_st.unpack("<f", seg[:4])[0]).tobytes()
+                for r in range(d0, d1):
+                    ref[r * row_el:(r + 1) * row_el] = torch.frombuffer(f16, dtype=torch.uint8)
+            else:
+                dst_off = d0 * row_leading * row_el
+                ref[dst_off:dst_off + len(seg)] = torch.frombuffer(seg, dtype=torch.uint8)
+        return ref
+
     def verify_ram(self, cache, layer: int) -> None:
         """One-shot debug: after the PCIe copy, check a RAM-resident expert's slot rows
         against the checkpoint reference. Gated on FT_DISK_TIER_VERIFY."""
         expert = min(10, self._ram - 1)  # a RAM-resident expert
         print(f"[verify-ram] layer={layer} expert={expert} (RAM prefix)", flush=True)
         self._verify_slot(cache, layer, expert)
+        # Also check the HOST row (CPU) -- separates host-side corruption from the
+        # GPU PCIe copy.
+        for bank_idx, (host_layer, _gpu) in enumerate(self._banks):
+            host_row = host_layer[layer][expert].contiguous()
+            flat = host_row.view(torch.uint8).reshape(-1)
+            ref = self._ref_row(bank_idx, layer, expert, flat.numel(),
+                                host_row.element_size(),
+                                host_row.numel() // host_row.shape[0] if host_row.dim() > 1 else 1)
+            match = bool(torch.equal(flat, ref))
+            print(f"[verify-host] bank={bank_idx} expert={expert} match={match} "
+                  f"host_head={flat[:8].tolist()} ref_head={ref[:8].tolist()}", flush=True)
 
     def materialize_layer(self, cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Disk-tier prefill: materialize the RAM-resident prefix into identity slots
