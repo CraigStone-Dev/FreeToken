@@ -972,18 +972,20 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
-            return
+        else:
+            from freetoken.kernel import fast_index_copy_jit
 
-        from freetoken.kernel import fast_index_copy_jit
-
-        for per_layer, cache in self.banks:
-            fast_index_copy_jit(
-                cache,
-                self.evict_slots,
-                per_layer[layer_id],
-                self.src_indices,
-                self.num_indices,
-            )
+            for per_layer, cache in self.banks:
+                fast_index_copy_jit(
+                    cache,
+                    self.evict_slots,
+                    per_layer[layer_id],
+                    self.src_indices,
+                    self.num_indices,
+                )
+        if (self._disk_tier is not None and layer_id == 0
+                and os.environ.get("FT_DISK_TIER_VERIFY")):
+            self._disk_tier.verify_ram(self, layer_id)
 
 
 def iter_offload_moe_layers(model) -> Iterator:
