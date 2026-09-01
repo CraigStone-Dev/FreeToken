@@ -71,6 +71,26 @@ _NVP4_BANK_SEGS = (
 )
 
 
+
+def _preadv_error(tier, staging, shard_idx: int, off: int, a0: int, slen: int,
+                  direct: bool) -> OSError:
+    vma = "?"
+    try:
+        for line in open("/proc/self/maps"):
+            lo, hi = line.split()[0].split("-")
+            if int(lo, 16) <= staging.addr < int(hi, 16):
+                vma = line.strip()[:120]
+                break
+    except OSError:
+        pass
+    return OSError(
+        f"disk-tier preadv failed: shard={shard_idx} off={off} a0={a0} "
+        f"slen={slen} direct={direct} buf={hex(staging.addr)} "
+        f"staging_size={tier._staging_size} thread={threading.current_thread().name} "
+        f"vma={vma}"
+    )
+
+
 def _read_safetensors_offsets(path: str) -> dict[str, tuple[int, int]]:
     """{tensor_name: (start, end)} from a shard's safetensors header, as ABSOLUTE
     file offsets (data_offsets are relative to the data section, i.e. after the
@@ -234,22 +254,16 @@ class DiskTier:
                 try:
                     os.preadv(fd, [mv], a0)
                 except OSError:
-                    vma = "?"
-                    try:
-                        for line in open("/proc/self/maps"):
-                            lo, hi = line.split()[0].split("-")
-                            if int(lo, 16) <= staging.addr < int(hi, 16):
-                                vma = line.strip()[:120]
-                                break
-                    except OSError:
-                        pass
-                    raise OSError(
-                        f"disk-tier preadv failed: shard={shard_idx} off={off} a0={a0} "
-                        f"slen={slen} direct={direct} buf={hex(staging.addr)} "
-                        f"staging_size={self._staging_size} thread={threading.current_thread().name} "
-                        f"vma={vma}"
-                    ) from None
+                    raise _preadv_error(self, staging, shard_idx, off, a0, slen, direct)
                 row_off = off - a0
+                if bank_idx in (2, 5):
+                    # Global-scale banks: the checkpoint stores a per-expert fp32
+                    # SCALAR (weight_scale_2); the bank row is that value as fp16
+                    # broadcast across the row -- convert + fill, no byte copy.
+                    val = staging.tensor[row_off:row_off + 4].view(torch.float32)[0].to(
+                        torch.float16)
+                    row[d0:d1].fill_(val)
+                    continue
                 src = staging.tensor[row_off:row_off + nbytes]
                 dst = row[d0:d1]
                 dst.copy_(src.view(dst.dtype).view(dst.shape), non_blocking=True)
