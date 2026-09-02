@@ -368,6 +368,85 @@ def test_mixed_iter_weights_tp2_sharding():
     _set_tp(0, 1)
 
 
+def test_resident_nvfp4_expert_banks_tp_sharding():
+    """Full ``_iter_weights_attn_fp8`` run with ``include_moe_experts=True`` over a tiny mixed
+    checkpoint that carries the routed NVFP4 experts. Verifies the resident (fused) TP-sharded
+    bank shapes and that each rank's slice is the correct slice of the checkpoint tensors:
+    gate_up is column-parallel (shard the 2*I output rows), down is row-parallel (shard the I
+    input cols, a packed dim)."""
+    import tempfile
+
+    from safetensors import safe_open
+
+    from tests.models.tiny_fp8_ckpt import make_tiny_mixed_ckpt
+    from freetoken.models.qwen3_5_moe.weight import _iter_weights_attn_fp8
+
+    V = 2048
+    M, H = 512, 2048  # moe_intermediate_size, hidden (tiny_fp8_ckpt dims)
+    with tempfile.TemporaryDirectory() as d:
+        ckpt = make_tiny_mixed_ckpt(d, vocab=V, experts=8, routed_experts=True)
+        got = {}
+        for rank in (0, 1):
+            _set_tp(rank, 2)
+            got[rank] = dict(_iter_weights_attn_fp8(
+                ckpt, torch.device("cpu"), include_non_moe=True, include_moe_experts=True,
+                dense_nvfp4=True, lmhead_nvfp4=False))
+        with safe_open(f"{ckpt}/model.safetensors", framework="pt") as f:
+            # Layer-0 expert-0 checkpoint tensors (ground truth for the sharding).
+            gate = f.get_tensor("model.language_model.layers.0.mlp.experts.0.gate_proj.weight")
+            up = f.get_tensor("model.language_model.layers.0.mlp.experts.0.up_proj.weight")
+            down = f.get_tensor("model.language_model.layers.0.mlp.experts.0.down_proj.weight")
+
+    i = M // 2  # per-rank intermediate at TP=2
+    for rank in (0, 1):
+        w = got[rank]
+        pre = "model.layers.0.mlp.experts"
+        gu = w[f"{pre}.gate_up_packed"]
+        assert gu.shape == (8, 2 * i, H // 2), gu.shape
+        assert w[f"{pre}.gate_up_scale"].shape == (8, 2 * i, H // 16)
+        assert w[f"{pre}.gate_up_global"].shape == (8, 2 * i)
+        assert w[f"{pre}.down_packed"].shape == (8, H, i // 2)
+        assert w[f"{pre}.down_scale"].shape == (8, H, i // 16)
+        assert w[f"{pre}.down_global"].shape == (8, H)
+        # gate_up column-parallel: rank's gate rows [rank*i:(rank+1)*i], up rows likewise.
+        torch.testing.assert_close(gu[0, :i], gate[rank * i:(rank + 1) * i])
+        torch.testing.assert_close(gu[0, i:], up[rank * i:(rank + 1) * i])
+        # down row-parallel: rank's packed cols [rank*(i//2):(rank+1)*(i//2)].
+        torch.testing.assert_close(
+            w[f"{pre}.down_packed"][0], down[:, rank * (i // 2):(rank + 1) * (i // 2)])
+    _set_tp(0, 1)
+
+
+def test_resident_nvfp4_expert_banks_tp1_full():
+    """TP=1 resident NVFP4 banks are the full (unsharded) checkpoint tensors."""
+    import tempfile
+
+    from safetensors import safe_open
+
+    from tests.models.tiny_fp8_ckpt import make_tiny_mixed_ckpt
+    from freetoken.models.qwen3_5_moe.weight import _iter_weights_attn_fp8
+
+    V, M, H = 2048, 512, 2048
+    with tempfile.TemporaryDirectory() as d:
+        ckpt = make_tiny_mixed_ckpt(d, vocab=V, experts=8, routed_experts=True)
+        _set_tp(0, 1)
+        w = dict(_iter_weights_attn_fp8(
+            ckpt, torch.device("cpu"), include_non_moe=True, include_moe_experts=True,
+            dense_nvfp4=True, lmhead_nvfp4=False))
+        with safe_open(f"{ckpt}/model.safetensors", framework="pt") as f:
+            gate = f.get_tensor("model.language_model.layers.0.mlp.experts.0.gate_proj.weight")
+            up = f.get_tensor("model.language_model.layers.0.mlp.experts.0.up_proj.weight")
+            down = f.get_tensor("model.language_model.layers.0.mlp.experts.0.down_proj.weight")
+    pre = "model.layers.0.mlp.experts"
+    assert w[f"{pre}.gate_up_packed"].shape == (8, 2 * M, H // 2)
+    assert w[f"{pre}.down_packed"].shape == (8, H, M // 2)
+    # Full bank: gate rows [0:M], up rows [M:2M]; down unsharded.
+    torch.testing.assert_close(w[f"{pre}.gate_up_packed"][0, :M], gate)
+    torch.testing.assert_close(w[f"{pre}.gate_up_packed"][0, M:], up)
+    torch.testing.assert_close(w[f"{pre}.down_packed"][0], down)
+    _set_tp(0, 1)
+
+
 # ======================================================================================
 # Row-parallel / column-merged quantized linears (pure-torch reference path)
 # ======================================================================================

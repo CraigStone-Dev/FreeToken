@@ -21,6 +21,7 @@ from freetoken.models.loader import (
 )
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
+    load_nvfp4_expert_resident_banks,
     load_nvfp4_expert_source_banks,
 )
 from freetoken.utils import cached_load_hf_config, download_hf_weight
@@ -397,6 +398,11 @@ def iter_weights(
     assert not nvfp4_shared_buf, f"Incomplete NVFP4 shared-expert merges: {list(nvfp4_shared_buf.keys())}"
     assert not fuse_buf, f"Incomplete projection fusions: {list(fuse_buf.keys())}"
 
+    if include_moe_experts:
+        # Resident (fused) NVFP4 experts: TP-sharded native banks (the offload path loads
+        # these via load_nvfp4_expert_sources instead; include_moe_experts is False there).
+        yield from _iter_resident_nvfp4_experts(model_path, config)
+
 
 # ======================================================================================
 # Mixed-precision modelopt checkpoint (per-tensor FP8 attn/GDN + NVFP4 experts/shared/lm_head)
@@ -706,6 +712,12 @@ def _iter_weights_attn_fp8(
     assert not bf16_buf, f"Incomplete bf16 fusions: {list(bf16_buf.keys())}"
     assert not shared_buf, f"Incomplete shared-expert merges: {list(shared_buf.keys())}"
     assert not nvfp4_shared_buf, f"Incomplete NVFP4 shared-expert merges: {list(nvfp4_shared_buf.keys())}"
+
+    if include_moe_experts:
+        # Resident (fused) NVFP4 experts: TP-sharded native banks. The offload path never
+        # reaches here (include_moe_experts is False; it loads the experts via
+        # load_nvfp4_expert_sources into the offload cache instead).
+        yield from _iter_resident_nvfp4_experts(model_path, config)
 
 
 # ======================================================================================
@@ -1304,6 +1316,37 @@ def _setup_bf16_dequant_banks(model_path, model_config, device, dummy: bool, *, 
     else:
         _load(None)  # CUDA-less: mmap banks stay pageable, never pinned
     return ExpertBanks("bf16", banks, streamed=layer_sink is not None)
+
+
+def _iter_resident_nvfp4_experts(model_path: str, config) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield the resident (fused) TP-sharded NVFP4 expert banks as per-layer state-dict views.
+
+    Called by the dense passes when ``include_moe_experts`` is True (the fused backend). The
+    offload path never calls this -- it loads the routed experts via
+    :func:`load_nvfp4_expert_sources` into the offload cache instead. The keys match the
+    MoELayer's resident NVFP4 tensor attributes (``gate_up_packed``/``gate_up_scale``/
+    ``gate_up_global``/``down_packed``/``down_scale``/``down_global``) under the
+    ``...mlp.experts`` prefix; the engine's ``_materialize`` moves each to GPU.
+    """
+    tp_info = get_tp_info()
+    banks = load_nvfp4_expert_resident_banks(
+        model_path,
+        config,
+        _NVFP4_SOURCE_SPEC,
+        drop_page_cache=drop_page_cache,
+        primary=tp_info.is_primary(),
+        rank=tp_info.rank,
+        world_size=tp_info.size,
+    )
+    L, E, H, I, dense = _moe_dims(config)
+    for li in range(L):
+        pre = f"model.layers.{dense + li}.mlp.experts"
+        yield f"{pre}.gate_up_packed", banks["gate_up_packed"][li]
+        yield f"{pre}.gate_up_scale", banks["gate_up_scale"][li]
+        yield f"{pre}.gate_up_global", banks["gate_up_global"][li]
+        yield f"{pre}.down_packed", banks["down_packed"][li]
+        yield f"{pre}.down_scale", banks["down_scale"][li]
+        yield f"{pre}.down_global", banks["down_global"][li]
 
 
 def load_nvfp4_expert_sources(

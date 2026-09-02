@@ -164,6 +164,7 @@ def make_tiny_mixed_ckpt(
     layers: int = 4,
     experts: int = 32,
     seed: int = 0,
+    routed_experts: bool = False,
 ) -> str:
     """Write a minimal modelopt MIXED_PRECISION checkpoint (random weights).
 
@@ -206,6 +207,12 @@ def make_tiny_mixed_ckpt(
         for p, shape in (("gate", (M, H)), ("up", (M, H)), ("down", (H, M))):
             t.update({f"{pre}.mlp.shared_expert.{p}_proj{k}": v
                       for k, v in nvfp4(shape).items()})
+        if routed_experts:
+            for e in range(experts):
+                ep = f"{pre}.mlp.experts.{e}"
+                for p, shape in (("gate", (M, H)), ("up", (M, H)), ("down", (H, M))):
+                    t.update({f"{ep}.{p}_proj{k}": v
+                              for k, v in nvfp4(shape).items()})
         if li % 4 != 3:  # GDN (linear attention)
             g = f"{pre}.linear_attn"
             t[f"{g}.A_log"] = bf16((NV,))
