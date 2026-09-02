@@ -249,6 +249,15 @@ class DiskTier:
     def _staging_ring(self) -> list:
         ring = getattr(self._staging, "ring", None)
         if ring is None:
+            # Fresh worker threads default to CUDA device 0, but the rank may
+            # live on another device (TP>1). The H2D copies land on the
+            # destination tensor's device stream, while ev.record() below uses
+            # the thread's CURRENT stream -- without this, the ring's reuse
+            # guard waits on an idle stream and a preadv can overwrite the
+            # buffer mid-DMA (corrupted slot rows on TP=2 rank 1).
+            dev = self._banks[0][1].device
+            if dev.type == "cuda":
+                torch.cuda.set_device(dev)
             ring = []
             for _ in range(self._STAGING_RING):
                 buf = HostBank((self._staging_size,), torch.uint8)
@@ -318,7 +327,7 @@ class DiskTier:
         stream, so sync the default stream before the GEMM reads the slots."""
         if not torch.cuda.is_available():
             return  # CPU-only tests: the copies are synchronous CPU->CPU
-        torch.cuda.default_stream().synchronize()
+        torch.cuda.default_stream(self._banks[0][1].device).synchronize()
 
     def _verify_slot(self, cache, layer: int, expert: int, slot: int | None = None,
                      phase: str = "prefill") -> None:
@@ -385,10 +394,10 @@ class DiskTier:
         landing a neighbour's preadv); no hit means a partial mix. Only runs on
         mismatch, so the ~300 extra preads are free otherwise."""
         head = flat[:64].cpu()
-        host_row = self._banks[bank_idx][0][0][layer]
+        host_row = self._banks[bank_idx][0][0][0]  # expert-0 row (all rows share its shape)
         row_el = host_row.element_size()
         row_leading = host_row.numel() // host_row.shape[0] if host_row.dim() > 1 else 1
-        num_experts = host_row.shape[0]
+        num_experts = self._cache.num_experts
         num_layers = len(self._banks[bank_idx][0])
         hits = []
         for e in range(num_experts):
