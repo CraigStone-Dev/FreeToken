@@ -298,3 +298,20 @@ def test_release_range_frees_pages():
     assert resident_pages(bank.addr, size) == 0
     # The mapping stays valid: the refaulted pages read back as zeros.
     assert bank.tensor[0] == 0
+
+
+def test_tail_unbacked_after_release():
+    """Lazy-tail invariant (the disk-tier RAM math): after release_range, the
+    tail rows [K, E) back NO pages -- until something writes them. mincore over
+    the tail is the cheap startup check check_tail_unbacked() runs for real."""
+    from freetoken.moe.disk_tier import release_bank_tails, tail_resident_bytes
+
+    E, K = 8, 4
+    bank = HostBank((E, 4096), torch.uint8)  # page-sized rows
+    bank.tensor[:K].fill_(1)  # touch only the prefix
+    release_bank_tails({"b": [bank]}, E, K)
+    assert tail_resident_bytes(bank, E, K) == 0
+    # The mapping still works: one tail write backs exactly one page (the
+    # invariant is "nothing touches the tail", not "the tail refuses to back").
+    bank.tensor[K].fill_(2)
+    assert tail_resident_bytes(bank, E, K) == 4096

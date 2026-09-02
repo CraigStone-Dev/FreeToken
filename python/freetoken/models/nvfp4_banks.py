@@ -218,9 +218,10 @@ def load_nvfp4_expert_source_banks(
         with PinPipeline(prefix_rows=K) as pins:
             placed = _load(pins)
         if K is not None:
-            from freetoken.moe.disk_tier import release_bank_tails
+            from freetoken.moe.disk_tier import check_tail_unbacked, release_bank_tails
 
             release_bank_tails(_hb, E, K)
+            check_tail_unbacked(_hb, E, K)
 
     expected = num_layers * rows_per_layer * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
@@ -357,9 +358,10 @@ def load_nvfp4_expert_source_banks_parallel(
         with PinPipeline(prefix_rows=K) as pins:
             placed = _load(pins)
         if K is not None:
-            from freetoken.moe.disk_tier import release_bank_tails
+            from freetoken.moe.disk_tier import check_tail_unbacked, release_bank_tails
 
             release_bank_tails(_hb, E, K)
+            check_tail_unbacked(_hb, E, K)
 
     expected = num_layers * rows_per_layer * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"

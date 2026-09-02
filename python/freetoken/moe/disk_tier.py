@@ -57,6 +57,67 @@ def release_bank_tails(banks_by_name: dict[str, list[HostBank]], num_experts: in
             row_bytes = bank.nbytes // num_experts
             bank.release_range(ram_experts * row_bytes, bank.nbytes - ram_experts * row_bytes)
 
+
+def tail_resident_bytes(bank: HostBank, num_experts: int, ram_experts: int) -> int:
+    """Bytes the kernel currently backs in the released tail rows ``[ram_experts, E)``.
+
+    mincore(2) over the tail's byte range: one syscall, per-page residency.
+    Conservative -- mincore also reports private-anon pages mapped from the
+    shared zero page (a plain READ of a tail row), so this overcounts what
+    actually costs RAM (cgroup memory.stat shmem is the real number).
+    Returns -1 if mincore itself fails."""
+    row_bytes = bank.nbytes // num_experts
+    off = ram_experts * row_bytes
+    size = bank.nbytes - off
+    if size <= 0:
+        return 0
+    _PAGE = 4096
+    vec = (ctypes.c_ubyte * (size // _PAGE))()
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_ubyte)]
+    if libc.mincore(ctypes.c_void_p(bank.addr + off), size, vec) != 0:
+        return -1
+    return sum(vec) * _PAGE
+
+
+def check_tail_unbacked(banks_by_name: dict[str, list[HostBank]], num_experts: int,
+                        ram_experts: int) -> None:
+    """Startup sanity check for the lazy-tail invariant, right after
+    ``release_bank_tails``: nothing reads or writes the tail rows, so the kernel
+    should be backing ~none of them. The expected worst case is one 2 MiB THP
+    huge page per bank layer (shmem_enabled=always|force can back the
+    prefix/tail boundary as a huge page); more than that means something touched
+    the tail and the disk-tier RAM math no longer holds. Always logs, warns
+    above the bound."""
+    _HUGE = 2 << 20
+    resident = tail = n_banks = 0
+    for layer_banks in banks_by_name.values():
+        for bank in layer_banks:
+            row_bytes = bank.nbytes // num_experts
+            t = bank.nbytes - ram_experts * row_bytes
+            if t <= 0:
+                continue
+            r = tail_resident_bytes(bank, num_experts, ram_experts)
+            if r < 0:
+                continue  # mincore failed: skip rather than warn on our own probe
+            resident += r
+            tail += t
+            n_banks += 1
+    if n_banks == 0:
+        return
+    from freetoken.distributed import try_get_tp_info
+    tp = try_get_tp_info()
+    rank = getattr(tp, "rank", "?")
+    size_ = getattr(tp, "size", "?")
+    bound = n_banks * _HUGE
+    print(f"[disk-tier] tail check rank={rank}/{size_}: resident {resident >> 20} MiB "
+          f"of {tail >> 20} MiB (warn bound {bound >> 20} MiB = 1x2MiB per bank layer)",
+          flush=True)
+    if resident > bound:
+        print(f"[disk-tier] WARNING: tail rows more resident than the THP bound -- "
+              f"something is reading the released rows; the disk-tier RAM math no longer holds",
+              flush=True)
+
 # Native NVFP4 bank order (== _BANK_SCHEMAS["nvfp4"]) and, per bank, the
 # checkpoint segments that make up one expert row: (proj, kind, dst_row_start,
 # dst_row_end). The gate|up-fused banks splice gate rows then up rows on the
