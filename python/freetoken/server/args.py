@@ -554,8 +554,10 @@ def parse_args(
         help=(
             "NVMe tier for MoE experts (see moe/disk_tier.py): experts beyond "
             "--expert-ram-experts per layer stay on disk in the original checkpoint "
-            "and are fetched on slot-cache miss. Requires native NVFP4 banks, "
-            "--moe-backend offload, --disable-moe-prefill-overlap and no cuda graphs."
+            "and are fetched on slot-cache miss. Requires native NVFP4 banks. "
+            "v0 preconditions (all enforced at once at boot): --moe-backend offload "
+            "(gpu decode), --disable-moe-prefill-overlap, --cuda-graph-max-bs 0, "
+            "and 0 < --expert-ram-experts < num_experts."
         ),
     )
     parser.add_argument(

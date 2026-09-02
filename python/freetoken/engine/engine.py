@@ -570,17 +570,23 @@ class Engine:
             from freetoken.moe.disk_tier import DiskTierSpec
 
             E = config.model_config.num_experts
+            # Collect ALL unmet preconditions and raise once: each used to surface as a
+            # separate boot-time ValueError, costing a full boot per missing flag.
+            problems = []
             if not 0 < config.expert_ram_experts < E:
-                raise ValueError(
+                problems.append(
                     f"--expert-ram-experts must be in (0, {E}) with --moe-disk-tier on")
             if decode_target != "gpu":
-                raise ValueError(
+                problems.append(
                     "--moe-disk-tier v0 requires the gpu decode path (--moe-backend offload)")
             if config.moe_prefill_overlap:
-                raise ValueError("--moe-disk-tier v0 requires --disable-moe-prefill-overlap")
+                problems.append("--moe-disk-tier v0 requires --disable-moe-prefill-overlap")
             if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
-                raise ValueError(
+                problems.append(
                     "--moe-disk-tier v0 requires --cuda-graph-max-bs 0 (cuda graphs disabled)")
+            if problems:
+                raise ValueError(
+                    "--moe-disk-tier on: unmet preconditions:\n  - " + "\n  - ".join(problems))
             disk_tier = DiskTierSpec(ram_experts=config.expert_ram_experts)
         if cache_factory is None:
             # Fast path: an FTW checkpoint loads its repacked banks directly.

@@ -540,12 +540,14 @@ class DiskTier:
         _materialize_layer_gpu(cache, layer_id, materialize_count=self._ram)
         routed = expert_ids.reshape(-1)
         disk = torch.unique(routed[routed >= self._ram])
-        if layer_id < 3:
+        if os.environ.get("FT_DISK_TIER_DEBUG") and layer_id < 3:
             print(f"[disk-tier dbg] layer={layer_id} routed={routed.numel()} "
                   f"unique_disk={disk.numel()} disk={disk.tolist()[:12]}", flush=True)
         if disk.numel() == 0:
             return
-        step = int(cache.step.item())  # already incremented by the kernel
+        # cache.step was already incremented by the kernel; assign the 0-d tensor
+        # device-side (same dtype/device as usage) instead of .item()-ing it, which
+        # would sync the stream once per layer on the prefill/decode path.
         futures = [
             self._pool.submit(self._fetch_expert, layer_id, int(e), int(e))
             for e in disk.tolist()
@@ -561,7 +563,7 @@ class DiskTier:
         flat = layer_id * cache.num_experts + disk
         cache.slot_for_id[layer_id, disk] = disk
         cache.id_of_slot[disk] = flat
-        cache.usage[disk] = step
+        cache.usage[disk] = cache.step
 
     def fetch_pending(self, cache, layer_id: int) -> None:
         """Fetch this layer's disk-resident misses into their slots; shrink the miss
