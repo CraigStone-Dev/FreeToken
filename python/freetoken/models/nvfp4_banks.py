@@ -152,6 +152,13 @@ def load_nvfp4_expert_source_banks(
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
     K = disk_tier.ram_experts if disk_tier is not None else None
+    # Rows this loader actually materializes per layer. The banks are still allocated
+    # at the full [E, ...] shape -- rows K..E-1 are the disk tier's fetch destination and
+    # must exist as address space -- but they are never read or written here, so they
+    # stay unbacked. Filling them and releasing afterwards (the previous order) made the
+    # load-time peak the FULL expert set, which is exactly the case the tier exists for:
+    # GLM-5.3-Flash (166 GiB of experts) swapped a 61 GB box to a halt at shard 73/118.
+    rows_per_layer = E if K is None else min(K, E)
     if disk_tier is not None and layer_sink is not None:
         raise NotImplementedError("disk tier: the converter (layer_sink) path is not supported yet")
     gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
@@ -164,7 +171,7 @@ def load_nvfp4_expert_source_banks(
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
 
     def _load(sink) -> int:
-        tracker = LayerCompletionTracker(E * 6, _hb, sink)
+        tracker = LayerCompletionTracker(rows_per_layer * 6, _hb, sink)
         placed = 0
         for shard in tqdm(sorted(weight_shards), desc=f"Loading {spec.desc}", disable=not primary):
             path = os.path.join(folder, shard)
@@ -172,6 +179,8 @@ def load_nvfp4_expert_source_banks(
                 for name, match, bank_layer_id in weight_shards[shard]:
                     layer = int(match.group("layer"))
                     expert = int(match.group("expert"))
+                    if expert >= rows_per_layer:
+                        continue  # disk-resident row: fetched on demand, never loaded here
                     proj = match.group("proj")
                     role = spec.proj_to_role[proj]
                     kind = _canon_kind(spec, match.group("kind"))
@@ -213,7 +222,7 @@ def load_nvfp4_expert_source_banks(
 
             release_bank_tails(_hb, E, K)
 
-    expected = num_layers * E * 6
+    expected = num_layers * rows_per_layer * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
     return {
         "gate_up_packed": gate_up_packed,
@@ -284,6 +293,13 @@ def load_nvfp4_expert_source_banks_parallel(
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
     K = disk_tier.ram_experts if disk_tier is not None else None
+    # Rows this loader actually materializes per layer. The banks are still allocated
+    # at the full [E, ...] shape -- rows K..E-1 are the disk tier's fetch destination and
+    # must exist as address space -- but they are never read or written here, so they
+    # stay unbacked. Filling them and releasing afterwards (the previous order) made the
+    # load-time peak the FULL expert set, which is exactly the case the tier exists for:
+    # GLM-5.3-Flash (166 GiB of experts) swapped a 61 GB box to a halt at shard 73/118.
+    rows_per_layer = E if K is None else min(K, E)
     if disk_tier is not None and layer_sink is not None:
         raise NotImplementedError("disk tier: the converter (layer_sink) path is not supported yet")
     gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
@@ -297,10 +313,15 @@ def load_nvfp4_expert_source_banks_parallel(
 
     # Pass 2: bulk weight/weight_scale via the common parallel reader; place by name.
     def _load(sink) -> int:
-        tracker = LayerCompletionTracker(E * 6, _hb, sink)
+        tracker = LayerCompletionTracker(rows_per_layer * 6, _hb, sink)
         placed = 0
+        def _wanted(n: str) -> bool:
+            info = weight_info.get(n)
+            # Filter at the reader so disk-resident rows cost no I/O at all, not just no write.
+            return info is not None and int(info[0].group("expert")) < rows_per_layer
+
         for name, tensor in iter_expert_tensors_parallel(
-            folder, lambda n: n in weight_info, workers=workers, chunk=chunk
+            folder, _wanted, workers=workers, chunk=chunk
         ):
             match, bank_layer_id = weight_info[name]
             layer = int(match.group("layer"))
@@ -340,7 +361,7 @@ def load_nvfp4_expert_source_banks_parallel(
 
             release_bank_tails(_hb, E, K)
 
-    expected = num_layers * E * 6
+    expected = num_layers * rows_per_layer * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
     return {
         "gate_up_packed": gate_up_packed,

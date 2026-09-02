@@ -325,9 +325,13 @@ class DiskTier:
         The copies are enqueued on the pool threads' default stream; f.result() only
         waits for them to be ENQUEUED. The GEMM's stream is not ordered with that
         stream, so sync the default stream before the GEMM reads the slots."""
-        if not torch.cuda.is_available():
-            return  # CPU-only tests: the copies are synchronous CPU->CPU
-        torch.cuda.default_stream(self._banks[0][1].device).synchronize()
+        # Key this on where the BANKS live, not on whether the machine has a GPU: the
+        # disk-tier unit tests build CPU banks on a CUDA box, and default_stream() rejects
+        # a CPU device outright. There is nothing to order for a CPU->CPU copy anyway.
+        device = self._banks[0][1].device
+        if device.type != "cuda":
+            return  # CPU banks: the copies are synchronous CPU->CPU
+        torch.cuda.default_stream(device).synchronize()
 
     def _verify_slot(self, cache, layer: int, expert: int, slot: int | None = None,
                      phase: str = "prefill") -> None:
