@@ -192,6 +192,23 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
         raise NotImplementedError(
             "disk tier requires the native NVFP4 layout (triton backend, decode_target=gpu, "
             "not dummy)")
+    # Build the index HERE, not in a per-family setup: the loader below releases expert rows
+    # [K, E) for every family, so a family that reaches the release without an index would
+    # serve zeroed experts. Resolving the spec through the family hook keeps the index and
+    # the loader reading the same rows.
+    disk_kw = {}
+    if disk_tier is not None:
+        from freetoken.models.weight import nvfp4_moe_expert_source_spec
+        from freetoken.moe.disk_tier import Nvfp4DiskIndex
+
+        source_spec = nvfp4_moe_expert_source_spec(model_path, model_config)
+        if source_spec is None:
+            raise NotImplementedError(
+                f"--moe-disk-tier on: {type(model_config).__name__} exposes no "
+                "nvfp4_expert_source_spec, so the tier cannot locate expert rows in the "
+                "checkpoint (the loader would release them and never refetch)")
+        disk_kw = {"disk_index": Nvfp4DiskIndex(model_path, model_config, source_spec),
+                   "disk_ram_experts": disk_tier.ram_experts}
 
     repack_sink = None
     if not native and not dummy and layer_sink is not None:
@@ -213,7 +230,7 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     # marlin/b12x repacks (which only the GPU W4A16 kernels can read).
     if decode_target == "cpu":
         return ExpertBanks("nvfp4", {name: sources[name] for name in _BANK_SCHEMAS["nvfp4"]},
-                           streamed=sink is not None)
+                           streamed=sink is not None, **disk_kw)
     # Pick the expert-GEMM backend by compute capability (and MoE width: auto keeps
     # small-I MoE on the Triton M=1 GEMV, which beats b12x's tensor cores at single-stream
     # decode) and repack the banks (in place; the tiled blocks are byte-identical per
@@ -221,7 +238,7 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     logger.info(f"NVFP4 expert backend: {backend}")
     if backend == "triton":
         return ExpertBanks("nvfp4", {name: sources[name] for name in _BANK_SCHEMAS["nvfp4"]},
-                           streamed=sink is not None)
+                           streamed=sink is not None, **disk_kw)
     quant_format = f"nvfp4_{backend}"
     if repack_sink is not None:
         # Streamed conversion: each layer was already repacked + written by the wrapper.

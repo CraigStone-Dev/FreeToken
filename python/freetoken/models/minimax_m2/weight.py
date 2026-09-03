@@ -88,6 +88,15 @@ def iter_weights(
     yield from iter_merged_tensors(raw(), _MERGE_RULES, model_name="minimax_m2")
 
 
+
+def nvfp4_expert_source_spec(model_path: str, config):
+    """The source spec the disk tier must index this checkpoint with.
+
+    Same object the loader passes to ``load_nvfp4_expert_source_banks``, exposed so the
+    shared provider can build the disk index without knowing the family: the index has to
+    read the rows the loader placed, so one spec has to serve both."""
+    return _NVFP4_SOURCE_SPEC
+
 def load_nvfp4_expert_sources(
     model_path: str,
     config,

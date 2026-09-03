@@ -856,6 +856,11 @@ def setup_offload_expert_banks(
     :class:`~freetoken.moe.disk_tier.Nvfp4DiskIndex` so the offload cache can
     fetch the disk-resident experts on miss."""
     eq = getattr(model_config, "expert_quant", "none")
+    # Checked before the branch below, not inside it: the fp8_block path never passes
+    # disk_tier on, so a guard inside the nvfp4 branch silently accepted the flag there.
+    if disk_tier is not None and eq != "nvfp4":
+        raise NotImplementedError(
+            f"disk tier: only nvfp4 experts are supported (got expert_quant={eq!r})")
     if eq != "fp8_block":
         from freetoken.moe.expert_banks import _PROVIDERS  # nvfp4 -> _nvfp4_banks, none -> _bf16_banks
 
@@ -863,17 +868,8 @@ def setup_offload_expert_banks(
                                parallel=parallel, workers=workers, chunk=chunk,
                                decode_target=decode_target, layer_sink=layer_sink,
                                disk_tier=disk_tier)
-        if disk_tier is not None:
-            if eq != "nvfp4":
-                raise NotImplementedError(
-                    f"disk tier: only nvfp4 experts are supported (got expert_quant={eq!r})")
-            import dataclasses
-
-            from freetoken.moe.disk_tier import Nvfp4DiskIndex
-
-            index = Nvfp4DiskIndex(model_path, model_config, _NVFP4_SOURCE_SPEC)
-            banks = dataclasses.replace(
-                banks, disk_index=index, disk_ram_experts=disk_tier.ram_experts)
+        # The disk index rides back on the banks: _nvfp4_banks builds it for every family
+        # through nvfp4_expert_source_spec, so there is nothing family-specific left here.
         return banks
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
@@ -1082,6 +1078,15 @@ def _setup_bf16_dequant_banks(model_path, model_config, device, dummy: bool, *, 
         _load(None)  # CUDA-less: mmap banks stay pageable, never pinned
     return ExpertBanks("bf16", banks, streamed=layer_sink is not None)
 
+
+
+def nvfp4_expert_source_spec(model_path: str, config):
+    """The source spec the disk tier must index this checkpoint with.
+
+    Same object the loader passes to ``load_nvfp4_expert_source_banks``, exposed so the
+    shared provider can build the disk index without knowing the family: the index has to
+    read the rows the loader placed, so one spec has to serve both."""
+    return _NVFP4_SOURCE_SPEC
 
 def load_nvfp4_expert_sources(
     model_path: str, config, *, layer_sink=None, disk_tier=None

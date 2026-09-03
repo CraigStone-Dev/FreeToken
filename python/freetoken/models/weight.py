@@ -293,6 +293,20 @@ def load_moe_expert_sources(
     )
 
 
+def nvfp4_moe_expert_source_spec(model_path: str, model_config):
+    """The family's ``Nvfp4ExpertSourceSpec`` for this checkpoint, or None if it has none.
+
+    The disk tier indexes the same rows the loader placed, so it needs the very spec the
+    family loader used -- which only the family knows (glm5_next picks between a
+    compressed-tensors and a modelopt naming per checkpoint). None means the family has no
+    NVFP4 expert source spec at all, which the caller must treat as "no disk tier here"
+    rather than silently continue.
+    """
+    _config, spec = _spec_for_model_path(model_path)
+    getter = _model_override(spec, "nvfp4_expert_source_spec")
+    return None if getter is None else getter(model_path, model_config)
+
+
 def load_nvfp4_moe_expert_sources(
     model_path: str,
     model_config,
