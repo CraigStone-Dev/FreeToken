@@ -14,7 +14,7 @@ immediate combine::
 """
 
 from __future__ import annotations
-
+import os
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -114,8 +114,15 @@ class Qwen4ExpModel(BaseOP):
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
-        for layer in self.layers.op_list:
+        _dbg = os.environ.get("FREETOKEN_DEBUG_R")
+        _dbg_this = bool(_dbg and getattr(batch, "is_prefill", False)
+                         and not getattr(self, "_dbg_done", False))
+        if _dbg_this:
+            self._dbg_done = True
+        for i, layer in enumerate(self.layers.op_list):
             hidden = layer.forward(hidden, batch)
+            if _dbg_this:
+                torch.save(hidden.float().cpu(), f"{_dbg}.layer{i:02d}.full.pt")
         if meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window

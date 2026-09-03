@@ -34,21 +34,36 @@ SEED = 1234
 
 def _tiny_hf_config():
     """TP=2-divisible geometry; GDN head dims 32 (the fla kernels reject 8).
-    Q4TP_LAYERS=full,full,full,full overrides the layer types (QSA isolation)."""
+    Q4TP_REAL=1 switches to the real Qwen3.8 head geometry (24q/2kv @ head_dim 256,
+    GDN 16key/48value @ 128, indexer 4q/1kv @ 128) to expose dimension-dependent TP bugs.
+    Q4TP_LAYERS overrides the layer types; Q4TP_PLE=0 disables PLE."""
     lt = os.environ.get("Q4TP_LAYERS")
     layer_types = lt.split(",") if lt else [
         "linear_attention", "full_attention",
         "linear_attention", "full_attention",
     ]
     ple_ids = [] if os.environ.get("Q4TP_PLE") == "0" else [1]
+    if os.environ.get("Q4TP_REAL") == "1":
+        geo = dict(
+            num_attention_heads=24, num_key_value_heads=2, head_dim=256,
+            linear_num_key_heads=16, linear_num_value_heads=48,
+            linear_key_head_dim=128, linear_value_head_dim=128,
+            indexer_n_heads=4, indexer_kv_heads=1, indexer_head_dim=128,
+            partial_rotary_factor=0.25,
+        )
+    else:
+        geo = dict(
+            num_attention_heads=4, num_key_value_heads=2, head_dim=64,
+            linear_num_key_heads=2, linear_num_value_heads=4,
+            linear_key_head_dim=32, linear_value_head_dim=32,
+            indexer_n_heads=2, indexer_kv_heads=1, indexer_head_dim=64,
+            partial_rotary_factor=0.5,
+        )
     return SimpleNamespace(
         model_type="qwen4_exp",
         architectures=["Qwen4ExpForConditionalGeneration"],
         text_config=SimpleNamespace(
             hidden_size=HIDDEN,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=64,
             num_hidden_layers=NUM_LAYERS,
             layer_types=layer_types,
             vocab_size=VOCAB,
@@ -62,11 +77,6 @@ def _tiny_hf_config():
             tie_word_embeddings=False,
             max_position_embeddings=128,
             rope_theta=10000.0,
-            partial_rotary_factor=0.5,
-            linear_num_key_heads=2,
-            linear_num_value_heads=4,
-            linear_key_head_dim=32,
-            linear_value_head_dim=32,
             linear_conv_kernel_dim=4,
             output_gate_type="sigmoid",
             hc_count=2,
@@ -81,11 +91,9 @@ def _tiny_hf_config():
             make_ngram_vocab_size_divisible_by=8,
             split_ngram_parts=2,
             eos_token_id=0,
-            indexer_n_heads=2,
-            indexer_kv_heads=1,
-            indexer_head_dim=64,
             indexer_budget=8,
             indexer_compress_ratio=2,
+            **geo,
         ),
     )
 
@@ -137,7 +145,7 @@ def _make_ckpt(folder: str) -> None:
             t[lp + "self_attn.q_proj.weight"] = torch.randn(2 * qo, H)
             t[lp + "self_attn.k_proj.weight"] = torch.randn(kv, H)
             t[lp + "self_attn.v_proj.weight"] = torch.randn(kv, H)
-            t[lp + "self_attn.o_proj.weight"] = torch.randn(qo, H)
+            t[lp + "self_attn.o_proj.weight"] = torch.randn(H, qo)
             t[lp + "self_attn.q_norm.weight"] = torch.randn(cfg.head_dim)
             t[lp + "self_attn.k_norm.weight"] = torch.randn(cfg.head_dim)
             t[lp + "self_attn.indexer.index_qk_proj.weight"] = torch.randn(
@@ -259,6 +267,9 @@ def run(tp: int, out: str | None) -> None:
             full[name] = torch.zeros(meta.shape, device=device, dtype=meta.dtype)
     extra = set(state) - set(want)
     assert not extra, f"unexpected loader keys: {sorted(extra)}"
+    for name in want:
+        if name in state and tuple(state[name].shape) != tuple(want[name].shape):
+            print(f"SHAPE MISMATCH {name}: loader {tuple(state[name].shape)} vs model {tuple(want[name].shape)}", flush=True)
     model.load_state_dict(full)
 
     # ---- PLE table: read the shards straight (skip load_ple_table's O_DIRECT: overlayfs) ----
