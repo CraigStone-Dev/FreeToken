@@ -566,7 +566,11 @@ def parse_args(
         default=ServerArgs.expert_ram_experts,
         help=(
             "With --moe-disk-tier on: experts per layer kept pinned in RAM "
-            "(0 < N < num_experts; the rest are disk-resident)."
+            "(0 < N < num_experts; the rest are disk-resident). Keep "
+            "N * (smallest bank row bytes) page-aligned (a multiple of 4096) or "
+            "the small scale banks' tail rows stay resident instead of released "
+            "(warns, does not abort). The rule is per-model: e.g. Qwen3.8-Flash-Next "
+            "needs a multiple of 8, Ornith-1.5-35B a multiple of 2."
         ),
     )
     parser.add_argument(
