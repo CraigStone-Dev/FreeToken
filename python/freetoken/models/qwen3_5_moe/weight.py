@@ -877,6 +877,11 @@ def setup_offload_expert_banks(
         return banks
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
+    if disk_tier is not None:
+        # the fp8_block path builds no disk index; without this the flag would be
+        # accepted and silently dropped (nothing released, nothing fetched)
+        raise NotImplementedError(
+            f"disk tier: only nvfp4 experts are supported (got expert_quant={eq!r})")
     from freetoken.moe.expert_banks import ExpertBanks
 
     mode = os.environ.get("FREETOKEN_FP8_EXPERTS", "fp8").strip().lower()

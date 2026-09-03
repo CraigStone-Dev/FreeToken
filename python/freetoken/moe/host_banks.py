@@ -79,7 +79,7 @@ class HostBank:
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_pinned_bytes", "_locked")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None):
@@ -104,11 +104,19 @@ class HostBank:
             self.addr = raw.data_ptr() + off
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
+            self._pinned_bytes = asize
         else:
-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+            # MAP_PRIVATE, not CPython's default MAP_SHARED: on a shared anonymous mapping a
+            # *read* fault allocates a page (no zero-page sharing) and MADV_DONTNEED is ignored,
+            # so an untouched region is only free by convention and a freed one never comes back.
+            # Private anonymous gives both for real: reads map the shared zero page, and
+            # release_range() actually returns memory. Nothing needs the mapping to be shared --
+            # the loaders are thread pools and ranks are mp-spawned, each with its own banks.
+            self._buf = mmap.mmap(-1, asize, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
+            self._pinned_bytes = 0
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
         self._locked = False
 
@@ -140,6 +148,7 @@ class HostBank:
                 f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
             ) from exc
         self._pinned = True
+        self._pinned_bytes = len(self._buf)
 
     def pin_prefix(self, nrows: int) -> None:
         """Pin only the first ``nrows`` rows (disk tier: the rest stays disk-resident).
@@ -160,44 +169,31 @@ class HostBank:
                 f"cudaHostRegister failed for {nbytes / 2**30:.1f} GiB prefix"
             ) from exc
         self._pinned = True
+        self._pinned_bytes = nbytes
 
     def release_range(self, offset: int, nbytes: int) -> None:
-        """Free a byte range of the backing mapping by replacing it IN PLACE with a
-        fresh MAP_PRIVATE anonymous mapping at the same virtual address.
+        """Free a byte range of the backing mapping with MADV_DONTNEED.
 
-        HostBank's buffer is a MAP_SHARED /dev/zero mapping (CPython's
-        ``mmap(-1)``), and the kernel silently ignores MADV_DONTNEED on shared
-        mappings -- the pages would stay resident. Replacing the range with a
-        private zero mapping frees them while keeping every existing pointer
-        and torch view valid (same address). The range must be page-aligned
-        and must not overlap a pinned prefix (the disk tier's unpinned tails).
+        The bank is a MAP_PRIVATE anonymous mapping, so dropping a range frees the
+        pages outright and a later read faults the shared zero page again; every
+        existing pointer and torch view stays valid (the mapping is never replaced).
+
+        The range must be page-aligned and must not overlap the pinned prefix:
+        dropping pages under a cudaHostRegister'd range corrupts silently, so it is
+        asserted here rather than left to the caller (the disk tier's unpinned tails).
         """
-        import ctypes
-
-        _BLK = 4096
         assert offset % _BLK == 0 and nbytes % _BLK == 0, (
             "release_range: page-aligned range required")
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-        libc.munmap.restype = ctypes.c_int
-        libc.mmap.restype = ctypes.c_void_p
-        libc.mmap.argtypes = [
-            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
-        addr = self.addr + offset
-        if libc.munmap(addr, nbytes) != 0:
-            raise OSError(ctypes.get_errno(), "munmap failed")
-        PROT_READ_WRITE = 3
-        MAP_PRIVATE_ANON = 0x22  # MAP_PRIVATE | MAP_ANONYMOUS
-        MAP_FIXED = 0x10
-        MAP_FAILED = (1 << 64) - 1
-        new_addr = libc.mmap(addr, nbytes, PROT_READ_WRITE, MAP_PRIVATE_ANON | MAP_FIXED, -1, 0)
-        if new_addr in (None, MAP_FAILED):
-            raise OSError(ctypes.get_errno(), "mmap(MAP_FIXED) failed")
-        assert new_addr == addr, "MAP_FIXED returned a different address"
+        assert offset >= self._pinned_bytes, (
+            f"release_range: [{offset}, {offset + nbytes}) overlaps the pinned prefix "
+            f"[0, {self._pinned_bytes})")
+        if nbytes:
+            self._buf.madvise(mmap.MADV_DONTNEED, offset, nbytes)
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
 
-        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
+        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped.
+        (This frees memory only because the mapping is MAP_PRIVATE; the kernel ignores MADV_DONTNEED on shared ones.)"""
         if self._pinned:
             return
         self._buf.madvise(mmap.MADV_DONTNEED)

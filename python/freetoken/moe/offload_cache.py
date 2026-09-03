@@ -1032,7 +1032,9 @@ class OffloadMoeCache:
             for per_layer, cache in self.banks:
                 cache[: self.num_experts].copy_(per_layer[layer_id])
             return
-        if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id == 0:
+        if (self._disk_tier is not None and layer_id == 0
+                and os.environ.get("FT_DISK_TIER_VERIFY")
+                and not torch.cuda.is_current_stream_capturing()):
             print(f"[copy-miss] layer={layer_id} fused={self._copy_fused_ok} "
                   f"n={int(self.num_indices.item())} "
                   f"evict={self.evict_slots[:4].cpu().tolist()} "

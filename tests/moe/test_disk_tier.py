@@ -275,9 +275,9 @@ def test_fetch_pending_all_disk_clears_list(checkpoint):
 
 
 def test_release_range_frees_pages():
-    """release_range must actually drop the resident pages (MAP_SHARED /dev/zero
-    mappings ignore MADV_DONTNEED, so the in-place private remap is verified
-    with mincore)."""
+    """release_range must actually drop the resident pages. The bank is a
+    MAP_PRIVATE anonymous mapping, so MADV_DONTNEED frees for real; mincore
+    verifies the pages are gone (a MAP_SHARED mapping would keep them)."""
     import ctypes as ct
 
     size = 4 * 1024 * 1024
@@ -315,3 +315,38 @@ def test_tail_unbacked_after_release():
     # invariant is "nothing touches the tail", not "the tail refuses to back").
     bank.tensor[K].fill_(2)
     assert tail_resident_bytes(bank, E, K) == 4096
+
+
+def test_release_bank_tails_unaligned_row_boundary():
+    """A row boundary that is not page-aligned (the small scale banks) must not
+    fail the boot: release_bank_tails warns and skips that bank instead of
+    asserting in release_range. The tail rows were never written, so skipping
+    loses nothing. Aligned boundaries still release."""
+    import ctypes as ct
+
+    from freetoken.moe.disk_tier import release_bank_tails
+
+    libc = ct.CDLL("libc.so.6", use_errno=True)
+    libc.mincore.argtypes = [ct.c_void_p, ct.c_size_t, ct.POINTER(ct.c_ubyte)]
+    libc.mincore.restype = ct.c_int
+
+    def resident_pages(addr, nbytes):
+        vec = (ct.c_ubyte * ((nbytes + 4095) // 4096))()
+        assert libc.mincore(addr, nbytes, vec) == 0
+        return sum(1 for b in vec if b & 1)
+
+    # A real Ornith gate_up_scale row size: 2048 bytes/row, NOT page-aligned.
+    E, K = 256, 127
+    bank = HostBank((E, 2048), torch.uint8)
+    bank.tensor.fill_(7)  # fault every page in
+    assert resident_pages(bank.addr, bank.nbytes) == bank.nbytes // 4096
+    # K=127: offset = 127*2048 = 259072, not % 4096 -> warn+skip, no AssertionError.
+    release_bank_tails({"gate_up_scale": [bank]}, E, K)
+    # Skipped: the (already resident) tail pages are untouched, not freed.
+    assert resident_pages(bank.addr, bank.nbytes) == bank.nbytes // 4096
+
+    # Aligned K on the same bank shape: offset = 128*2048 = 262144 (% 4096) -> releases.
+    bank2 = HostBank((E, 2048), torch.uint8)
+    bank2.tensor.fill_(7)
+    release_bank_tails({"gate_up_scale": [bank2]}, E, 128)
+    assert resident_pages(bank2.addr + 128 * 2048, bank2.nbytes - 128 * 2048) == 0

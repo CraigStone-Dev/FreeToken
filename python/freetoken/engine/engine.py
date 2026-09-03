@@ -658,6 +658,14 @@ class Engine:
                     f"disk tier: {banks.disk_ram_experts}/{config.model_config.num_experts} "
                     f"experts/layer pinned in RAM; the rest fetched from "
                     f"{config.model_path} on slot-cache miss")
+            elif disk_tier is not None:
+                # The loader released the tail rows but this family built no disk
+                # index (only qwen3_5_moe and re-exporters attach one): without a
+                # fetcher the released rows would serve as zeros -- wrong logits,
+                # no error. Fail loudly instead.
+                raise NotImplementedError(
+                    "--moe-disk-tier on: this model family builds no disk index; experts "
+                    "[K, E) are released at load and would never be refetched")
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
             cache = cache_factory(config, self.device)

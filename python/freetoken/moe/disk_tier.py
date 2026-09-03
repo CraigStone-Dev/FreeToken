@@ -51,11 +51,24 @@ class DiskTierSpec:
 
 def release_bank_tails(banks_by_name: dict[str, list[HostBank]], num_experts: int,
                        ram_experts: int) -> None:
-    """MADV_DONTNEED the unpinned tail rows of every bank layer (post-load)."""
+    """MADV_DONTNEED the unpinned tail rows of every bank layer (post-load).
+
+    The release is an optimization, not an invariant: the tail rows were never
+    written at load, so when a row boundary is not page-aligned (the small scale
+    banks) we warn and skip that bank instead of failing the boot."""
+    _PAGE = 4096
     for layer_banks in banks_by_name.values():
         for bank in layer_banks:
             row_bytes = bank.nbytes // num_experts
-            bank.release_range(ram_experts * row_bytes, bank.nbytes - ram_experts * row_bytes)
+            offset = ram_experts * row_bytes
+            size = bank.nbytes - offset
+            if offset % _PAGE or size % _PAGE:
+                print(f"[disk-tier] WARNING: bank row boundary not page-aligned "
+                      f"(ram_experts={ram_experts}, row_bytes={row_bytes}); skipping "
+                      f"the release for this bank -- the tail rows were never written, "
+                      f"so nothing is lost", flush=True)
+                continue
+            bank.release_range(offset, size)
 
 
 def tail_resident_bytes(bank: HostBank, num_experts: int, ram_experts: int) -> int:
@@ -261,7 +274,7 @@ class DiskTier:
             tp = try_get_tp_info()
             host_shapes = [tuple(b[0][0][0].shape) for b in self._banks]
             disk_bytes = [
-                sum(nb for _, _, nb in self._index.row_segments(bi, 0, 100))
+                sum(nb for _, _, nb in self._index.row_segments(bi, 0, 0))
                 for bi in range(len(self._banks))
             ]
             print(f"[disk-tier-init] tp_rank={getattr(tp, 'rank', '?')}/{getattr(tp, 'size', '?')} "
