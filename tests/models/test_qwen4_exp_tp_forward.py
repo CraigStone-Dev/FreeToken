@@ -33,7 +33,14 @@ SEED = 1234
 
 
 def _tiny_hf_config():
-    """TP=2-divisible geometry; GDN head dims 32 (the fla kernels reject 8)."""
+    """TP=2-divisible geometry; GDN head dims 32 (the fla kernels reject 8).
+    Q4TP_LAYERS=full,full,full,full overrides the layer types (QSA isolation)."""
+    lt = os.environ.get("Q4TP_LAYERS")
+    layer_types = lt.split(",") if lt else [
+        "linear_attention", "full_attention",
+        "linear_attention", "full_attention",
+    ]
+    ple_ids = [] if os.environ.get("Q4TP_PLE") == "0" else [1]
     return SimpleNamespace(
         model_type="qwen4_exp",
         architectures=["Qwen4ExpForConditionalGeneration"],
@@ -43,10 +50,7 @@ def _tiny_hf_config():
             num_key_value_heads=2,
             head_dim=64,
             num_hidden_layers=NUM_LAYERS,
-            layer_types=[
-                "linear_attention", "full_attention",
-                "linear_attention", "full_attention",
-            ],
+            layer_types=layer_types,
             vocab_size=VOCAB,
             num_experts=8,
             num_experts_per_tok=2,
@@ -68,7 +72,7 @@ def _tiny_hf_config():
             hc_count=2,
             hc_lowrank=16,
             # 1-indexed: layer 0 (a linear_attention layer) carries the PLE.
-            ple_layer_ids=[1],
+            ple_layer_ids=ple_ids,
             ple_embed_dim=64,
             ple_conv_kernel_size=4,
             ngram_size=3,
@@ -231,9 +235,26 @@ def run(tp: int, out: str | None) -> None:
     for name, meta in want.items():
         if name in state:
             full[name] = state[name].to(device=device, dtype=meta.dtype)
-        elif meta.dtype.is_floating_point:  # routed experts: deterministic per-rank-identical fill
+        elif meta.dtype.is_floating_point:
+            # Routed experts: the resident MoE is TP-sharded (col-parallel gate_up on the
+            # intermediate dim, row-parallel down_proj). Fill from a FULL-size deterministic
+            # tensor and slice per rank so TP=1 and TP=2 hold the same logical weights.
             gen = torch.Generator(device=device).manual_seed(_stable_seed(name))
-            full[name] = torch.randn(meta.shape, generator=gen, device=device, dtype=meta.dtype)
+            if name.endswith("experts.gate_up_proj"):
+                # per-expert layout is [gate | up]; each half is col-parallel independently
+                inter_local = meta.shape[1] // 2
+                fg = torch.randn((meta.shape[0], inter_local * size, meta.shape[2]),
+                                 generator=gen, device=device, dtype=meta.dtype)
+                fu = torch.randn((meta.shape[0], inter_local * size, meta.shape[2]),
+                                 generator=gen, device=device, dtype=meta.dtype)
+                sl = slice(rank * inter_local, (rank + 1) * inter_local)
+                full[name] = torch.cat([fg[:, sl, :], fu[:, sl, :]], dim=1)
+            elif name.endswith("experts.down_proj"):
+                f = torch.randn((meta.shape[0], meta.shape[1], meta.shape[2] * size),
+                                 generator=gen, device=device, dtype=meta.dtype)
+                full[name] = f[:, :, rank * meta.shape[2]:(rank + 1) * meta.shape[2]].contiguous()
+            else:
+                full[name] = torch.randn(meta.shape, generator=gen, device=device, dtype=meta.dtype)
         else:
             full[name] = torch.zeros(meta.shape, device=device, dtype=meta.dtype)
     extra = set(state) - set(want)
@@ -241,16 +262,17 @@ def run(tp: int, out: str | None) -> None:
     model.load_state_dict(full)
 
     # ---- PLE table: read the shards straight (skip load_ple_table's O_DIRECT: overlayfs) ----
-    from safetensors import safe_open
+    if model.model.ple_layers:
+        from safetensors import safe_open
 
-    with safe_open(os.path.join(ckpt, "model.safetensors"), framework="pt", device="cpu") as f:
-        keys = sorted(k for k in f.keys() if "ngram_embedding.shard_" in k)
-        table_tensor = torch.cat([f.get_tensor(k) for k in keys], dim=0).contiguous()
-        scale_key = next(k for k in f.keys() if k.endswith("ngram_embedding.weight_scale"))
-        table_scale = float(f.get_tensor(scale_key))
-    table_tensor = table_tensor.pin_memory()
-    for ple in model.model.ple_layers:
-        ple.ple_embedding.attach_table(PinnedUVATable(table_tensor, table_scale))
+        with safe_open(os.path.join(ckpt, "model.safetensors"), framework="pt", device="cpu") as f:
+            keys = sorted(k for k in f.keys() if "ngram_embedding.shard_" in k)
+            table_tensor = torch.cat([f.get_tensor(k) for k in keys], dim=0).contiguous()
+            scale_key = next(k for k in f.keys() if k.endswith("ngram_embedding.weight_scale"))
+            table_scale = float(f.get_tensor(scale_key))
+        table_tensor = table_tensor.pin_memory()
+        for ple in model.model.ple_layers:
+            ple.ple_embedding.attach_table(PinnedUVATable(table_tensor, table_scale))
 
     # ---- pools + context ----
     num_req_slots = 2  # 1 request + 1 dummy
@@ -311,6 +333,9 @@ def run(tp: int, out: str | None) -> None:
         _capture(layer.linear_attn if layer._is_linear else layer.self_attn, f"layer{i}.attn")
         _capture(layer.attn_hyper_connection, f"layer{i}.attn_comb", "combine")
         _capture(layer.mlp_hyper_connection, f"layer{i}.mlp_mix", "mix")
+        _capture(layer.mlp.gate, f"layer{i}.router")
+        _capture(layer.mlp.shared_expert, f"layer{i}.shared")
+        _capture(layer.mlp.experts, f"layer{i}.routed")
         _capture(layer.mlp, f"layer{i}.mlp")
         _capture(layer, f"layer{i}")
     with torch.no_grad(), ctx.forward_batch(batch):
@@ -318,10 +343,24 @@ def run(tp: int, out: str | None) -> None:
     for op, method, orig in wrapped:
         setattr(op, method, orig)
 
+    # layer0's routed-expert weights, FULL (unsharded), for the fp64 CPU MoE cross-check
+    gu = model.state_dict()["model.layers.0.mlp.experts.gate_up_proj"]
+    dp = model.state_dict()["model.layers.0.mlp.experts.down_proj"]
+    if size > 1:
+        inter_local = gu.shape[1] // 2
+        gu_parts = [torch.empty_like(gu) for _ in range(size)]
+        dist.all_gather(gu_parts, gu.contiguous())
+        gu = torch.cat([p[:, :inter_local] for p in gu_parts] +
+                       [p[:, inter_local:] for p in gu_parts], dim=1)
+        dp_parts = [torch.empty_like(dp) for _ in range(size)]
+        dist.all_gather(dp_parts, dp.contiguous())
+        dp = torch.cat(dp_parts, dim=2)
     result = {
         "logits_last": logits[-1].float().cpu(),
         "logits_all": logits.float().cpu(),
         "layers": layer_outs,
+        "experts_gate_up": gu.cpu(),
+        "experts_down": dp.cpu(),
     }
     if rank == 0 and out:
         torch.save(result, out)
@@ -337,18 +376,29 @@ def compare(a_path: str, b_path: str) -> None:
     ok = True
     for key in ("logits_last", "logits_all"):
         d = (a[key] - b[key]).abs()
-        rel = d / a[key].abs().clamp_min(1e-3)
-        print(f"{key}: max_abs={d.max().item():.4g} max_rel={rel.max().item():.4g}")
-        if d.max().item() > 0.05:
+        scale = a[key].abs().max().item()
+        print(f"{key}: max_abs={d.max().item():.4g} scale={scale:.4g} "
+              f"rel={d.max().item() / max(scale, 1e-6):.4g}")
+        if d.max().item() > 0.05 * max(scale, 1.0):
             ok = False
     for name in sorted(a["layers"]):
         da, db = a["layers"][name], b["layers"][name]
         # per-layer hidden is [T, hc*hidden]; compare the final position
         d = (da[-1] - db[-1]).abs()
-        rel = d / da[-1].abs().clamp_min(1e-3)
-        print(f"{name}: max_abs={d.max().item():.4g} max_rel={rel.max().item():.4g}")
-        if d.max().item() > 0.05:
+        scale = da[-1].abs().max().item()
+        print(f"{name}: max_abs={d.max().item():.4g} scale={scale:.4g} "
+              f"rel={d.max().item() / max(scale, 1e-6):.4g}")
+        if d.max().item() > 0.05 * max(scale, 1.0):
             ok = False
+    # MoE router top-k flips: with random weights the top-2 logit gap is often within
+    # bf16 noise, so a flip changes the selected experts and the MoE output discontinuously.
+    for name in sorted(k for k in a["layers"] if k.endswith(".router")):
+        ra, rb = a["layers"][name], b["layers"][name]
+        ia = ra.topk(2, dim=-1).indices.sort(-1).values
+        ib = rb.topk(2, dim=-1).indices.sort(-1).values
+        flips = (ia != ib).any(-1).sum().item()
+        gap = (ra.topk(2, dim=-1).values[:, -2] - ra.topk(2, dim=-1).values[:, -1]).abs()
+        print(f"{name}: top2 flips={flips}/{ra.shape[0]} min_gap={gap.min().item():.4g}")
     print("EQUIVALENT" if ok else "DIVERGED")
     sys.exit(0 if ok else 1)
 

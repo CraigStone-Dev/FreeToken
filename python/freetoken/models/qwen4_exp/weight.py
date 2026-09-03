@@ -270,9 +270,13 @@ def iter_weights(
                                 if g is not None:
                                     key_dim = g.num_key_heads * g.key_head_dim
                                     value_dim = g.num_value_heads * g.value_head_dim
+                                    # The conv part is itself [q | k | v] (q/k each key_dim);
+                                    # shard each sub-part so the model's [local_key | local_key |
+                                    # local_value] split lines up (mirrors the fp8 loader's
+                                    # (key_dim, key_dim, value_dim) expansion).
                                     fused_tensor = _shard_tp_parts(
                                         fused_tensor,
-                                        (2 * key_dim + value_dim, value_dim,
+                                        (key_dim, key_dim, value_dim, value_dim,
                                          g.num_value_heads, g.num_value_heads),
                                         rank=tp.rank, world_size=tp.size)
                             elif fused_name.endswith(".mlp.shared_expert.gate_up_proj.weight"):

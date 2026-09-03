@@ -225,6 +225,33 @@ def test_shard_tp_parts_replicate():
     torch.testing.assert_close(s0[2:], s2[2:])   # replicated part identical
 
 
+def test_in_proj_conv_part_sharded_per_subpart():
+    """The in_proj conv part is itself [q | k | v] (q/k each key_dim); each sub-part must be
+    sharded individually so the model's [local_key | local_key | local_value] split lines up.
+    Regression: chunking the whole conv part as one part misaligns k/v at TP>1 (garbage GDN)."""
+    from freetoken.models.qwen4_exp.weight import _shard_tp_parts
+
+    cfg = _tiny_config()
+    g = cfg.linear_attention_group()
+    key_dim = g.num_key_heads * g.key_head_dim
+    value_dim = g.num_value_heads * g.value_head_dim
+    v = g.num_value_heads
+    q, k, vv, z, b, a = [torch.randn(n, 8) for n in
+                         (key_dim, key_dim, value_dim, value_dim, v, v)]
+    fused = torch.cat([q, k, vv, z, b, a], dim=0)
+    # the part sizes iter_weights actually passes
+    s0 = _shard_tp_parts(fused, (key_dim, key_dim, value_dim, value_dim, v, v),
+                         rank=0, world_size=2)
+    s1 = _shard_tp_parts(fused, (key_dim, key_dim, value_dim, value_dim, v, v),
+                         rank=1, world_size=2)
+    exp0 = torch.cat([q[:key_dim // 2], k[:key_dim // 2], vv[:value_dim // 2],
+                      z[:value_dim // 2], b[:v // 2], a[:v // 2]], dim=0)
+    exp1 = torch.cat([q[key_dim // 2:], k[key_dim // 2:], vv[value_dim // 2:],
+                      z[value_dim // 2:], b[v // 2:], a[v // 2:]], dim=0)
+    torch.testing.assert_close(s0, exp0)
+    torch.testing.assert_close(s1, exp1)
+
+
 def test_maybe_shard_q4_rules():
     from freetoken.models.qwen4_exp.weight import _maybe_shard_q4
 
