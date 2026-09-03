@@ -19,9 +19,11 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from freetoken.core import get_global_ctx
+from freetoken.distributed import get_tp_info
 from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.rotary import get_rope
-from freetoken.utils import nvtx_annotate
+from freetoken.models.quant_linear import make_row_parallel
+from freetoken.utils import div_even, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -115,16 +117,27 @@ class Qwen4ExpAttention(BaseOP):
 
     def __init__(self, config: ModelConfig, layer_id: int) -> None:
         self.layer_id = layer_id
+        tp = get_tp_info()
         self.num_q = config.num_qo_heads
         self.num_kv = config.num_kv_heads
         self.head_dim = config.head_dim
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
-        self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
+        # TP-local head counts: q splits evenly, k/v replicate under GQA when num_kv < tp.
+        # _qkv_split is TP-local (torch.split in forward); LinearColParallelMerged gets the
+        # full sizes plus the local per-part output sizes (KV parts may be replicated).
+        self._local_num_q = div_even(self.num_q, tp.size)
+        self._local_num_kv = div_even(self.num_kv, tp.size, allow_replicate=True)
+        self._local_qo_attn_dim = self._local_num_q * self.head_dim
+        self._local_kv_attn_dim = self._local_num_kv * self.head_dim
+        self._qkv_split = [self._local_qo_attn_dim * 2, self._local_kv_attn_dim, self._local_kv_attn_dim]
         self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False
+            config.hidden_size,
+            [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim],
+            has_bias=False,
+            local_output_sizes=self._qkv_split,
         )
-        self.o_proj = LinearReplicated(self.qo_attn_dim, config.hidden_size, has_bias=False)
+        self.o_proj = make_row_parallel(config, self.qo_attn_dim, config.hidden_size, has_bias=False)
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rotary = config.rotary_config
@@ -140,21 +153,21 @@ class Qwen4ExpAttention(BaseOP):
     @nvtx_annotate("QSA")
     def forward(self, x: torch.Tensor, batch: Batch) -> torch.Tensor:
         qg, k, v = self.qkv_proj.forward(x).split(self._qkv_split, dim=-1)
-        qg = qg.view(-1, self.num_q, self.head_dim * 2)
+        qg = qg.view(-1, self._local_num_q, self.head_dim * 2)
         q = qg[..., : self.head_dim].contiguous()
-        gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
-        k = k.contiguous().view(-1, self.num_kv, self.head_dim)
+        gate = qg[..., self.head_dim :].reshape(-1, self._local_qo_attn_dim)
+        k = k.contiguous().view(-1, self._local_num_kv, self.head_dim)
         v = v.contiguous()
         self.q_norm.forward_inplace(q)
         self.k_norm.forward_inplace(k)
         q, k = self.rotary.forward(
-            batch.positions, q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
+            batch.positions, q.view(-1, self._local_qo_attn_dim), k.view(-1, self._local_kv_attn_dim)
         )
         index = self.indexer.forward(x)
         o = get_global_ctx().attn_backend.qsa_forward(
-            q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch
+            q.view(-1, self._local_num_q, self.head_dim), k, v, index, self.layer_id, batch
         )
-        gated = o.reshape(-1, self.qo_attn_dim) * torch.sigmoid(gate)
+        gated = o.reshape(-1, self._local_qo_attn_dim) * torch.sigmoid(gate)
         return self.o_proj.forward(gated)
 
 

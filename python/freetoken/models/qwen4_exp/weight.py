@@ -27,9 +27,11 @@ from freetoken.models.nvfp4_banks import (
     load_nvfp4_expert_source_banks,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import download_hf_weight
+from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
+
+from .config import parse_config
 
 # Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
 # weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
@@ -137,6 +139,67 @@ def _try_fuse(
     return None
 
 
+def _shard_tp(tensor: torch.Tensor, *, rank: int, world_size: int, dim: int) -> torch.Tensor:
+    """Simple chunk sharding along ``dim``."""
+    if world_size == 1:
+        return tensor
+    return tensor.chunk(world_size, dim=dim)[rank].clone()
+
+
+def _shard_tp_parts(
+    tensor: torch.Tensor,
+    part_sizes: tuple[int, ...],
+    *,
+    rank: int,
+    world_size: int,
+    local_part_sizes: tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    """Per-part column-parallel sharding (dim=0), matching ``LinearColParallelMerged``.
+    ``local_part_sizes`` overrides per part (GQA KV replication when ``num_kv < tp``)."""
+    if world_size == 1:
+        return tensor
+    shards: list[torch.Tensor] = []
+    offset = 0
+    for i, full_size in enumerate(part_sizes):
+        chunk = tensor[offset:offset + full_size]
+        local_size = full_size // world_size if local_part_sizes is None else local_part_sizes[i]
+        if local_size >= full_size:
+            shards.append(chunk.clone())
+        elif local_size * world_size == full_size:
+            shards.append(chunk.chunk(world_size, dim=0)[rank].clone())
+        else:
+            num_heads = full_size // local_size
+            head_idx = rank * num_heads // world_size
+            shards.append(chunk[head_idx * local_size:(head_idx + 1) * local_size].clone())
+        offset += full_size
+    return torch.cat(shards, dim=0)
+
+
+def _maybe_shard_q4(name: str, tensor: torch.Tensor, config, tp) -> torch.Tensor:
+    """TP sharding for a non-fused qwen4_exp weight by state-dict key suffix.
+
+    Fused projections (qkv_proj, in_proj, gate_up_proj) are sharded by the caller right after
+    fusion. Row-parallel outputs (o_proj, shared-expert down_proj) shard the INPUT dim;
+    embed_tokens / lm_head are vocab-parallel (dim 0); GDN A_log / dt_bias are per-v-head
+    (dim 0); GDN conv1d is per-part (key|key|value). Everything else -- norms, HC mixers,
+    PLE (norms + int64 hash constants), the QSA indexer (kept replicated so every rank makes
+    the SAME sparse-block selection) -- stays replicated."""
+    if tp.size == 1:
+        return tensor
+    if name.endswith((".o_proj.weight", ".out_proj.weight", ".down_proj.weight")):
+        return _shard_tp(tensor, rank=tp.rank, world_size=tp.size, dim=1)
+    if name.endswith(("embed_tokens.weight", "lm_head.weight", "A_log", "dt_bias")):
+        return _shard_tp(tensor, rank=tp.rank, world_size=tp.size, dim=0)
+    if name.endswith(".linear_attn.conv1d.weight"):  # PLE's conv1d (.ple.conv1d) stays replicated
+        g = config.linear_attention_group()
+        if g is not None:
+            key_dim = g.num_key_heads * g.key_head_dim
+            value_dim = g.num_value_heads * g.value_head_dim
+            return _shard_tp_parts(tensor, (key_dim, key_dim, value_dim),
+                                    rank=tp.rank, world_size=tp.size)
+    return tensor
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -156,17 +219,32 @@ def iter_weights(
 
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the
     routed experts are NVFP4 and always come from :func:`load_nvfp4_expert_sources`.
+
+    TP>1: fused qkv/in_proj/gate_up are column-sharded per part (k/v GQA-aware), o_proj /
+    out_proj / shared-expert down_proj are input-sharded (row-parallel), embed_tokens /
+    lm_head are vocab-sharded, GDN A_log / dt_bias / conv1d are head-sharded. Norms, HC
+    mixers, PLE and the QSA indexer stay replicated (the indexer must make the same
+    sparse-block selection on every rank).
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
+    tp = get_tp_info()
     if not include_non_moe:
         return
+
+    config = parse_config(cached_load_hf_config(model_path))
+    # TP-local qkv sizes: q (carrying the output gate) splits evenly, k/v replicate under GQA
+    # when num_kv < tp -- the same rule LinearColParallelMerged applies.
+    head_dim = config.head_dim
+    qkv_local = (
+        div_even(config.num_qo_heads, tp.size) * head_dim * 2,
+        div_even(config.num_kv_heads, tp.size, allow_replicate=True) * head_dim,
+        div_even(config.num_kv_heads, tp.size, allow_replicate=True) * head_dim,
+    )
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
-        disable=not get_tp_info().is_primary(),
+        disable=not tp.is_primary(),
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
@@ -177,9 +255,35 @@ def iter_weights(
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
-                        yield fused
+                        fused_name, fused_tensor = fused
+                        if tp.size > 1:
+                            if fused_name.endswith(".self_attn.qkv_proj.weight"):
+                                part_sizes = (config.num_qo_heads * head_dim * 2,
+                                              config.num_kv_heads * head_dim,
+                                              config.num_kv_heads * head_dim)
+                                fused_tensor = _shard_tp_parts(
+                                    fused_tensor, part_sizes,
+                                    rank=tp.rank, world_size=tp.size,
+                                    local_part_sizes=qkv_local)
+                            elif fused_name.endswith(".linear_attn.in_proj.weight"):
+                                g = config.linear_attention_group()
+                                if g is not None:
+                                    key_dim = g.num_key_heads * g.key_head_dim
+                                    value_dim = g.num_value_heads * g.value_head_dim
+                                    fused_tensor = _shard_tp_parts(
+                                        fused_tensor,
+                                        (2 * key_dim + value_dim, value_dim,
+                                         g.num_value_heads, g.num_value_heads),
+                                        rank=tp.rank, world_size=tp.size)
+                            elif fused_name.endswith(".mlp.shared_expert.gate_up_proj.weight"):
+                                inter = config.shared_expert_intermediate_size
+                                fused_tensor = _shard_tp_parts(
+                                    fused_tensor, (inter, inter),
+                                    rank=tp.rank, world_size=tp.size)
+                            # HC input_mix fusions stay replicated (full-residual GEMM).
+                        yield fused_name, fused_tensor
                     continue
-                yield name, tensor
+                yield name, _maybe_shard_q4(name, tensor, config, tp)
 
     assert not fuse_buf, f"Incomplete projection fusions: {sorted(fuse_buf)}"
 
