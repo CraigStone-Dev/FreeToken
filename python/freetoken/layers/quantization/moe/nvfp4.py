@@ -41,14 +41,17 @@ class TritonNvfp4MoEKernel(MoEKernel):
     cpu_format = "nvfp4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        reason = self._common_reject(cfg, resident_ok=True, tp_ok=True, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)
         return f"triton nvfp4 MoE kernel: {reason}" if reason else None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        # TP-sharded on the intermediate dim: gate_up is column-parallel (2*I output
+        # rows -> 2*i), down is row-parallel (I input cols -> i); the down global keeps
+        # the full H output rows (row-parallel output is replicated, then all-reduced).
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), FP8),
@@ -59,11 +62,24 @@ class TritonNvfp4MoEKernel(MoEKernel):
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
-        out["gate_up"].copy_(fused_piece(pieces, "gate_up"))
-        out["gate_up_scale"].copy_(fused_piece(pieces, "gate_up_scale"))
-        out["gate_up_global"].copy_(fused_global(pieces, cfg.intermediate))
-        out["down"].copy_(pieces["down"])
-        out["down_scale"].copy_(pieces["down_scale"])
+        # The pieces are the full per-expert tensors; place only this rank's slice of the
+        # intermediate dim. gate_up is column-parallel (gate rows [g0:g1) -> local [0:i),
+        # up rows [I+g0:I+g1) -> local [i:2i)); down is row-parallel (input cols, packed:
+        # //2 for the FP4 bytes, //16 for the per-16 block scale); the down global keeps
+        # the full H output rows.
+        i, I = cfg.local_intermediate, cfg.intermediate
+        g0, g1 = cfg.tp_rank * i, (cfg.tp_rank + 1) * i
+        gu = fused_piece(pieces, "gate_up")
+        out["gate_up"][:, :i].copy_(gu[:, g0:g1])
+        out["gate_up"][:, i:].copy_(gu[:, I + g0:I + g1])
+        gus = fused_piece(pieces, "gate_up_scale")
+        out["gate_up_scale"][:, :i].copy_(gus[:, g0:g1])
+        out["gate_up_scale"][:, i:].copy_(gus[:, I + g0:I + g1])
+        gug = fused_global(pieces, I)
+        out["gate_up_global"][:, :i].copy_(gug[:, g0:g1])
+        out["gate_up_global"][:, i:].copy_(gug[:, I + g0:I + g1])
+        out["down"].copy_(pieces["down"][:, :, g0 // 2:g1 // 2])
+        out["down_scale"].copy_(pieces["down_scale"][:, :, g0 // GROUP:g1 // GROUP])
         out["down_global"].copy_(global_rows(pieces["down_global"], cfg.hidden))
         return {}
 
@@ -569,7 +585,27 @@ class Nvfp4MoEMethod(MoEMethod):
     candidates = (TritonNvfp4MoEKernel, MarlinNvfp4MoEKernel, B12xNvfp4MoEKernel)
 
     def create_weights(self, layer) -> None:
-        raise NotImplementedError("NVFP4 experts are served from the offload cache, not resident")
+        # Resident (in-GPU) NVFP4 experts, TP-sharded on the intermediate dim: the
+        # native ModelOpt rows (packed e2m1 + fp8 per-16 block scale + fp16 per-output-row
+        # global), each rank holding only its slice. gate_up is column-parallel (2*I ->
+        # 2*i output rows), down is row-parallel (I -> i input cols); the down global keeps
+        # the full H output rows. The plain *_nvfp4 Triton kernels read these directly
+        # (inline dequant in the K-loop); the MoELayer all-reduces the partial output.
+        g = self.cfg
+        e, h = g.num_experts, g.hidden
+        i = g.local_intermediate
+        fp8 = torch.float8_e4m3fn
+        layer.gate_up_packed = torch.empty(e, 2 * i, h // 2, dtype=torch.uint8)
+        layer.gate_up_scale = torch.empty(e, 2 * i, h // GROUP, dtype=fp8)
+        layer.gate_up_global = torch.empty(e, 2 * i, dtype=torch.float16)
+        layer.down_packed = torch.empty(e, h, i // 2, dtype=torch.uint8)
+        layer.down_scale = torch.empty(e, h, i // GROUP, dtype=fp8)
+        layer.down_global = torch.empty(e, h, dtype=torch.float16)
 
     def resident_view(self, layer) -> ExpertView:
-        raise NotImplementedError("NVFP4 experts are not resident")
+        return ExpertView({
+            "gate_up": layer.gate_up_packed, "gate_up_scale": layer.gate_up_scale,
+            "gate_up_global": layer.gate_up_global,
+            "down": layer.down_packed, "down_scale": layer.down_scale,
+            "down_global": layer.down_global,
+        })

@@ -241,3 +241,79 @@ def test_resident_fp8_experts_tp1_full():
     shapes = {n: tuple(t.shape) for n, t in _resident_fp8_experts(ckpt, cfg)}
     assert shapes["model.layers.0.mlp.experts.gate_up_proj"] == (8, 1024, 2048)
     assert shapes["model.layers.0.mlp.experts.down_proj"] == (8, 2048, 512)
+
+
+# ======================================================================================
+# resident NVFP4 expert banks (TP-sharded on the intermediate dim)
+# ======================================================================================
+def _resident_nvfp4_banks(ckpt, rank, size):
+    _set_tp(rank, size)
+    banks = {}
+    for name, t in iter_weights(ckpt, torch.device("cpu"), include_moe_experts=True, include_non_moe=True):
+        if name.startswith("model.layers.0.mlp.experts."):
+            banks[name.split(".")[-1]] = t
+    return banks
+
+
+def test_resident_nvfp4_experts_tp2_sharding():
+    d = tempfile.mkdtemp()
+    ckpt = make_tiny_mixed_ckpt(d, vocab=512, layers=4, experts=8, routed_experts=True)
+    from safetensors import safe_open
+    with safe_open(f"{ckpt}/model.safetensors", framework="pt") as f:
+        gate = f.get_tensor("model.language_model.layers.0.mlp.experts.0.gate_proj.weight")
+        up = f.get_tensor("model.language_model.layers.0.mlp.experts.0.up_proj.weight")
+        down = f.get_tensor("model.language_model.layers.0.mlp.experts.0.down_proj.weight")
+    b0 = _resident_nvfp4_banks(ckpt, 0, 2)
+    b1 = _resident_nvfp4_banks(ckpt, 1, 2)
+    # I=512, H=2048, E=8, i=256 (TP=2)
+    assert b0["gate_up_packed"].shape == (8, 512, 1024)
+    assert b0["down_packed"].shape == (8, 2048, 128)
+    # rank 0 holds gate rows [0:256) / up rows [0:256); rank 1 the halves
+    assert torch.equal(b0["gate_up_packed"][0, :256], gate[:256])
+    assert torch.equal(b1["gate_up_packed"][0, :256], gate[256:])
+    assert torch.equal(b0["gate_up_packed"][0, 256:], up[:256])
+    assert torch.equal(b1["gate_up_packed"][0, 256:], up[256:])
+    # down is row-parallel: input cols (packed //2)
+    assert torch.equal(b0["down_packed"][0], down[:, :128])
+    assert torch.equal(b1["down_packed"][0], down[:, 128:])
+    # down global keeps the full H output rows (replicated)
+    assert b0["down_global"].shape == (8, 2048)
+
+
+def test_resident_nvfp4_experts_tp1_full():
+    d = tempfile.mkdtemp()
+    ckpt = make_tiny_mixed_ckpt(d, vocab=512, layers=4, experts=8, routed_experts=True)
+    b = _resident_nvfp4_banks(ckpt, 0, 1)
+    # TP=1: full banks (I=512, H=2048)
+    assert b["gate_up_packed"].shape == (8, 1024, 1024)
+    assert b["down_packed"].shape == (8, 2048, 256)
+
+
+def test_nvfp4_kernel_layout_pack_tp2():
+    from freetoken.layers.quantization.moe.base import MoEConfig
+    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
+
+    cfg = MoEConfig(num_experts=8, hidden=2048, intermediate=512, top_k=4, tp_rank=0, tp_size=2)
+    k = TritonNvfp4MoEKernel()
+    assert k.unusable_reason(cfg) is None  # resident + TP accepted
+    layout = k.layout(cfg)
+    assert layout["gate_up"].shape == (512, 1024)  # 2*i, H//2
+    assert layout["down"].shape == (2048, 128)      # H, i//2
+    # pack places rank 0's slice of the full pieces
+    E, H, I = 8, 2048, 512
+    pieces = {
+        "gate": torch.arange(I * (H // 2), dtype=torch.int32).reshape(I, H // 2).to(torch.uint8).expand(1, -1, -1),
+        "up": torch.full((1, I, H // 2), 7, dtype=torch.uint8),
+        "gate_scale": torch.ones(1, I, H // 16, dtype=torch.float8_e4m3fn),
+        "up_scale": torch.ones(1, I, H // 16, dtype=torch.float8_e4m3fn),
+        "gate_global": torch.ones(1, 1, dtype=torch.float16),
+        "up_global": torch.ones(1, 1, dtype=torch.float16),
+        "down": torch.arange(H * (I // 2), dtype=torch.int32).reshape(H, I // 2).to(torch.uint8).expand(1, -1, -1),
+        "down_scale": torch.ones(1, H, I // 16, dtype=torch.float8_e4m3fn),
+        "down_global": torch.ones(1, 1, dtype=torch.float16),
+    }
+    out = {r: torch.zeros(E, *s.shape, dtype=s.dtype) for r, s in layout.items()}
+    k.pack(pieces, cfg, {r: out[r][0:1] for r in out})
+    assert torch.equal(out["gate_up"][0, :256], pieces["gate"][0, :256])
+    assert torch.equal(out["gate_up"][0, 256:], pieces["up"][0, :256])
+    assert torch.equal(out["down"][0], pieces["down"][0, :, :128])

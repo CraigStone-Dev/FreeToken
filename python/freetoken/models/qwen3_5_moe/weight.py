@@ -512,6 +512,10 @@ def iter_weights(
     assert not nvfp4_shared_buf, f"Incomplete NVFP4 shared-expert merges: {list(nvfp4_shared_buf.keys())}"
     assert not fuse_buf, f"Incomplete projection fusions: {list(fuse_buf.keys())}"
 
+    if include_moe_experts and config.is_moe and config.expert_quant == "nvfp4":
+        # Resident (fused) NVFP4 experts: TP-sharded native banks (the offload path loads
+        # these into the expert cache instead; include_moe_experts is False there).
+        yield from _iter_resident_nvfp4_experts(model_path, config)
 
 # ======================================================================================
 # Mixed-precision modelopt checkpoint (per-tensor FP8 attn/GDN + NVFP4 experts/shared/lm_head)
@@ -773,6 +777,10 @@ def _iter_weights_attn_fp8(
     assert not shared_buf, f"Incomplete shared-expert merges: {list(shared_buf.keys())}"
     assert not nvfp4_shared_buf, f"Incomplete NVFP4 shared-expert merges: {list(nvfp4_shared_buf.keys())}"
 
+    if include_moe_experts and config.is_moe and config.expert_quant == "nvfp4":
+        # Resident (fused) NVFP4 experts: TP-sharded native banks. The offload path never
+        # reaches here (include_moe_experts is False; it loads the experts into the cache).
+        yield from _iter_resident_nvfp4_experts(model_path, config)
 
 # ======================================================================================
 # compressed-tensors NVFP4 checkpoint (dense Qwen3.x, e.g. Qwen3.6-27B)
@@ -1078,6 +1086,64 @@ def _resident_fp8_experts(model_path, config):
             for name, tensor in layers.pop(li).items():
                 yield f"{pre}.{name}", tensor
     assert not layers, f"incomplete resident fp8 experts for layers {sorted(layers)}"
+
+
+def _iter_resident_nvfp4_experts(model_path: str, config) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield the resident (fused) TP-sharded NVFP4 expert banks as per-layer state-dict views.
+
+    Called by the dense passes when ``include_moe_experts`` is True (the fused backend). The
+    offload path never calls this -- it loads the routed experts into the offload cache
+    instead. The keys match the MoELayer's resident NVFP4 tensor attributes (``gate_up_packed``
+    / ``gate_up_scale`` / ``gate_up_global`` / ``down_packed`` / ``down_scale`` /
+    ``down_global``) under the ``...mlp.experts`` prefix; the engine moves each to GPU.
+
+    TP-sharded on the intermediate dim (matches Nvfp4MoEMethod.create_weights): gate_up is
+    column-parallel (gate rows [g0:g1) -> local [0:i), up rows [I+g0:I+g1) -> local [i:2i)),
+    down is row-parallel (input cols, packed //2 / scale //16); the down global keeps the full
+    H output rows."""
+    from freetoken.layers.quantization.moe.base import global_rows
+    from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
+
+    tp = get_tp_info()
+    L, E, H, I, dense = _moe_dims(config)
+    i = I // tp.size
+    assert i % 16 == 0, (
+        f"per-rank intermediate {i} not a multiple of 16 (NVFP4 per-16 block scale must "
+        f"not straddle a rank boundary)"
+    )
+    fp8 = torch.float8_e4m3fn
+    specs = {
+        "gate_up_packed": ((E, 2 * i, H // 2), torch.uint8),
+        "gate_up_scale": ((E, 2 * i, H // 16), fp8),
+        "gate_up_global": ((E, 2 * i), torch.float16),
+        "down_packed": ((E, H, i // 2), torch.uint8),
+        "down_scale": ((E, H, i // 16), fp8),
+        "down_global": ((E, H), torch.float16),
+    }
+    g0, g1 = tp.rank * i, (tp.rank + 1) * i
+    layers: dict[int, dict[str, torch.Tensor]] = {}
+    placed = [0] * L
+    for li, e0, e1, piece in iter_nvfp4_expert_pieces(
+        model_path, config, _NVFP4_SOURCE_SPEC, parallel=None
+    ):
+        stack = layers.setdefault(li, {n: torch.empty(shape, dtype=dt) for n, (shape, dt) in specs.items()})
+        # gate_up: column-parallel on the (unpacked) output rows
+        stack["gate_up_packed"][e0:e1, :i] = piece["gate"][:, g0:g1]
+        stack["gate_up_packed"][e0:e1, i:] = piece["up"][:, g0:g1]
+        stack["gate_up_scale"][e0:e1, :i] = piece["gate_scale"][:, g0:g1]
+        stack["gate_up_scale"][e0:e1, i:] = piece["up_scale"][:, g0:g1]
+        stack["gate_up_global"][e0:e1, :i] = global_rows(piece["gate_global"], i)
+        stack["gate_up_global"][e0:e1, i:] = global_rows(piece["up_global"], i)
+        # down: row-parallel on the input cols (packed //2, per-16 scale //16); global full H
+        stack["down_packed"][e0:e1] = piece["down"][:, :, g0 // 2:g1 // 2]
+        stack["down_scale"][e0:e1] = piece["down_scale"][:, :, g0 // 16:g1 // 16]
+        stack["down_global"][e0:e1] = global_rows(piece["down_global"], H)
+        placed[li] += e1 - e0
+        if placed[li] == E:
+            pre = f"model.layers.{dense + li}.mlp.experts"
+            for name, tensor in layers.pop(li).items():
+                yield f"{pre}.{name}", tensor
+    assert not layers, f"incomplete resident nvfp4 experts for layers {sorted(layers)}"
 
 
 class _ShardReader:
